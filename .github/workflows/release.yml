@@ -1,10 +1,12 @@
 name: Release
 
-# Pushing a tag such as v0.1.0 builds the MSI, publishes it as a release asset
-# together with the generated winget manifests, and (when the WINGET_TOKEN
-# secret is present) opens the manifest PR against microsoft/winget-pkgs.
+# Pushing a tag such as v0.1.0 builds the Windows MSI and the Linux deb/tarball,
+# publishes all of them as release assets (the MSI together with the generated
+# winget manifests), and (when the WINGET_TOKEN secret is present) opens the
+# manifest PR against microsoft/winget-pkgs.
 #
 # Manual runs use the tag if started from one, otherwise the Cargo.toml version.
+# Pushes to main never run this workflow: only tags and manual runs do.
 on:
   push:
     tags: ["v*"]
@@ -98,3 +100,80 @@ jobs:
           if (-not (Test-Path $wc)) { throw "wingetcreate was not installed" }
           & $wc submit -p "New package: THUnet.THUnet version ${{ steps.version.outputs.version }}" `
             -n dist\winget
+
+  # ------------------------------------------------------------------- Linux
+  # Everything happens inside the pixi `package` environment, so no apt
+  # packages are needed: GTK, zlib, expat, ... come from conda-forge and
+  # `patchelf` strips the absolute rpath conda's linker injects into the
+  # binary (otherwise it would point at this runner and break user installs).
+  linux-packages:
+    name: deb, tarball
+    # Fixed image (not ubuntu-latest) so the build only changes when we change
+    # it. The real glibc floor comes from conda's sysroot, not from the image.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same rule as the Windows job: the tag is the source of truth and
+      # Cargo.toml has to agree with it, because cargo-deb takes the package
+      # version from Cargo.toml.
+      - name: Resolve and check version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            version="${tag#v}"
+          else
+            echo "not a release tag ($tag); falling back to Cargo.toml"
+            version="$cargo_version"
+          fi
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml says $cargo_version but the release is $version; bump Cargo.toml first." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      # frozen: true pins the build to pixi.lock so CI never resolves newer
+      # versions of the GTK/rust packages than the ones tested locally.
+      - uses: prefix-dev/setup-pixi@v0
+        with:
+          environments: package
+          frozen: true
+          cache: true
+
+      # Both tasks depend on `release` (cargo build --release + patchelf
+      # --remove-rpath); `deb` additionally builds cargo-deb into the env.
+      - name: Build deb and tarball
+        run: |
+          pixi run -e package deb
+          pixi run -e package tarball
+
+      - name: Verify artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          deb="dist/thunet_${VERSION}-1_amd64.deb"
+          tarball="dist/thunet-${VERSION}-linux-x64.tar.gz"
+          test -f "$deb" && test -f "$tarball" || { ls -l dist; exit 1; }
+          dpkg-deb -I "$deb"
+          tar -tzf "$tarball"
+          if readelf -d target/release/thunet | grep -qE 'RPATH|RUNPATH'; then
+            echo "rpath was not stripped" >&2
+            exit 1
+          fi
+
+      # Appends to the release the Windows job creates (or creates it when this
+      # job gets there first). No generate_release_notes here: the release body
+      # is owned by the Windows job and two writers would overwrite each other.
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: |
+            dist/thunet_${{ steps.version.outputs.version }}-1_amd64.deb
+            dist/thunet-${{ steps.version.outputs.version }}-linux-x64.tar.gz
