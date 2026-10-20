@@ -25,6 +25,21 @@ vs2026_win-64 = "*"
 
 [feature.dev.target.linux-64.dependencies]
 compilers = "*"
+# GTK development files for building `tray-icon` (it links gtk-rs on Linux).
+# conda's pkg-config needs `scripts/activate_linux.sh` to find these `.pc` files.
+pkg-config = "*"
+gtk3 = "*"
+zlib = "*"
+expat = "*"
+libffi = "*"
+pcre2 = "*"
+libxml2 = "*"
+libpng = "*"
+brotli = "*"
+bzip2 = "*"
+
+[feature.dev.target.linux-64.activation]
+scripts = ["scripts/activate_linux.sh"]
 
 # ------------------------------------------------------------------ packaging
 # `pixi run -e package msi`   -> dist/thunet-<version>-x64.msi      (Windows)
@@ -34,10 +49,14 @@ compilers = "*"
 [feature.package.target.win-64.dependencies]
 dotnet = "8.*"
 
+[feature.package.target.linux-64.dependencies]
+# The GTK/build dependencies live in the `dev` feature, which this environment
+# includes; only the packaging-specific tools are listed here.
+patchelf = ">=0.19.2,<0.20"
+
 [feature.package.tasks]
 # WiX v5 as a project-local .NET tool: no global install, no admin rights.
 wix-tool = "dotnet tool update --tool-path .pixi/wix wix --version 5.0.2"
-release = "cargo build --release"
 # The version always comes from Cargo.toml (scripts read it, nothing is pinned).
 msi = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1", depends-on = [
   "wix-tool",
@@ -46,9 +65,18 @@ msi = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1", depends-on = [
 
 # cargo-deb is not on conda-forge, so it is built into this environment.
 deb-tool = "cargo install --locked --root \"$CONDA_PREFIX\" cargo-deb"
-deb = { cmd = "cargo deb -o dist", depends-on = ["deb-tool"] }
+deb = { cmd = "cargo deb -o dist", depends-on = ["deb-tool", "release"] }
 tarball = { cmd = "bash scripts/build_tarball.sh", depends-on = ["release"] }
 
 # winget manifests for the MSI built above (dist/winget); see README §5.
 winget = { cmd = "pwsh -NoProfile -File scripts/winget_manifest.ps1", depends-on = ["msi"] }
 
+# `release` is platform specific: only Linux needs the rpath fixup.
+[feature.package.target.win-64.tasks]
+release = "cargo build --release"
+
+
+[feature.package.target.linux-64.tasks]
+# The conda linker injects an absolute rpath pointing into this pixi
+# environment; strip it so the tarball/deb use the system GTK at runtime.
+release = "cargo build --release && patchelf --remove-rpath target/release/thunet"
