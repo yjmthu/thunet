@@ -1,0 +1,6 @@
+# Rust 允许任意缩进；rustfmt 默认 4 空格，这里改成 2。
+# 这是 stable 选项，不需要 nightly。
+tab_spaces = 2
+
+# 与 2 空格匹配的常用设定（可选）
+max_width = 100

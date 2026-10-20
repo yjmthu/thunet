@@ -1,0 +1,20 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Cargo build output
+target/
+
+# packaging output (msi / deb / tarball, winget manifests)
+dist/
+
+# local build / probe leftovers
+*.log
+*.pdb
+__pycache__/
+*.pyc
+
+# editor / OS droppings
+.vscode/
+.DS_Store
+Thumbs.db

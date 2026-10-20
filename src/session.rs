@@ -1,0 +1,273 @@
+//! Session state machine: ensure online → keepalive → re-login on failure.
+//!
+//! This is the "auto connect + keep online" behaviour requested from the
+//! shipped client, minus its GUI. It is deliberately UI-free so the same code
+//! runs headless on a router or inside the tray app.
+
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::i18n::{Lang, Texts};
+use crate::srun::{Client, NetEnv};
+
+/// Replace the first `{}` placeholder in a localized template.
+fn fill(tpl: &str, value: &str) -> String {
+  tpl.replacen("{}", value, 1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+  Offline,
+  Authenticating,
+  Online,
+}
+
+pub struct Session {
+  client: Client,
+  cfg: Config,
+  lang: Lang,
+  /// True when `ac_id` was auto-detected (so it must be refreshed per connect).
+  auto_ac: bool,
+  /// Diagnostics produced off the UI thread; drained into the window log.
+  warnings: Vec<String>,
+  pub state: State,
+  pub failures: u32,
+}
+
+fn ecode(v: &serde_json::Value) -> String {
+  v.get("ecode")
+    .and_then(|e| e.as_str())
+    .unwrap_or("no ecode")
+    .to_string()
+}
+
+#[allow(dead_code)] // some accessors are consumed only by the tray/UI layer
+impl Session {
+  pub fn new(mut cfg: Config) -> Self {
+    let client = Client::new(&cfg.host, cfg.https, Duration::from_secs(5));
+    let lang = Lang::from_setting(&cfg.lang);
+    // `auto` must be resolved once: the AC id changes with the network.
+    let auto_ac = cfg.ac_id.is_empty() || cfg.ac_id == "auto";
+    let mut warnings = Vec::new();
+    if auto_ac {
+      match client.detect_ac_id() {
+        Ok((id, confident)) => {
+          if !confident {
+            warnings.push(format!("ac_id={id} may be the default page value"));
+          }
+          cfg.ac_id = id;
+        }
+        Err(e) => {
+          warnings.push(format!("ac_id detect failed ({e}), falling back to 1"));
+          cfg.ac_id = "1".into();
+        }
+      }
+    }
+    Self {
+      client,
+      cfg,
+      lang,
+      auto_ac,
+      warnings,
+      state: State::Offline,
+      failures: 0,
+    }
+  }
+
+  /// Take the pending diagnostic messages (startup + re-detection).
+  pub fn take_warnings(&mut self) -> Vec<String> {
+    std::mem::take(&mut self.warnings)
+  }
+
+  fn t(&self) -> &'static Texts {
+    self.lang.texts()
+  }
+
+  pub fn set_lang(&mut self, lang: Lang) {
+    self.lang = lang;
+  }
+
+  /// Update the credentials used by the next login attempt.
+  pub fn set_credentials(&mut self, username: String, password: String) {
+    self.cfg.username = username;
+    self.cfg.password = password;
+  }
+
+  pub fn client(&self) -> &Client {
+    &self.client
+  }
+
+  pub fn cfg(&self) -> &Config {
+    &self.cfg
+  }
+
+  /// Query the portal and sync the local state with reality.
+  pub fn refresh(&mut self) -> Result<serde_json::Value, String> {
+    let v = self.client.status(&self.cfg.ac_id)?;
+    let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
+    self.state = if online {
+      State::Online
+    } else {
+      State::Offline
+    };
+    if online {
+      self.failures = 0;
+    }
+    Ok(v)
+  }
+
+  /// Cheap pre-check used before connect/disconnect actions.
+  pub fn is_online_now(&self) -> bool {
+    self.client.is_online(&self.cfg.ac_id)
+  }
+
+  /// Is the machine even attached to a network where logging in makes sense?
+  pub fn net_env(&self) -> NetEnv {
+    self.client.net_env()
+  }
+
+  /// Adopt an ac_id found by the caller's probe (only when auto-detecting).
+  pub fn set_ac_id(&mut self, ac_id: String) {
+    if self.auto_ac && self.cfg.ac_id != ac_id {
+      self.cfg.ac_id = ac_id;
+    }
+  }
+
+  /// Build the "portal said no" message: reason + optional hint.
+  fn rejected(&self, v: &serde_json::Value) -> String {
+    let t = self.t();
+    format!(
+      "{}\n{}",
+      fill(&fill(t.login_rejected, &self.cfg.ac_id), &v.to_string()),
+      t.ac_id_hint
+    )
+  }
+
+  /// One full "make sure I am online" step.
+  pub fn ensure_online(&mut self) -> Result<String, String> {
+    self.state = State::Authenticating;
+    if self.client.is_online(&self.cfg.ac_id) {
+      self.state = State::Online;
+      self.failures = 0;
+      return Ok(self.t().already_online_session.into());
+    }
+    let mut attempt = 0;
+    loop {
+      attempt += 1;
+      // We are offline here, so a captive interception page is authoritative:
+      // refresh the AC id on every reconnect (the network may have changed).
+      if self.auto_ac {
+        if let Ok((fresh, true)) = self.client.detect_ac_id() {
+          if fresh != self.cfg.ac_id {
+            self
+              .warnings
+              .push(format!("ac_id {} -> {fresh}", self.cfg.ac_id));
+            self.cfg.ac_id = fresh;
+          }
+        }
+      }
+      let v = self
+        .client
+        .login_logout(
+          &self.cfg.username,
+          Some(&self.cfg.password),
+          &self.cfg.ip,
+          &self.cfg.ac_id,
+          false,
+        )
+        .map_err(|e| {
+          fill(
+            &fill(self.t().request_failed, &self.cfg.host),
+            &e.to_string(),
+          )
+        })?;
+
+      if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
+        self.state = State::Online;
+        self.failures = 0;
+        return Ok(self.t().login_ok.into());
+      }
+      // Some deployments answer with a policy-level error even though the
+      // session was created. Credential errors never resolve.
+      let code = ecode(&v);
+      let policy_like = code.starts_with("E28") || code == "no ecode" || code.is_empty();
+      if !policy_like {
+        self.state = State::Offline;
+        return Err(self.rejected(&v));
+      }
+      // The AC id changes with the network; re-detect once.
+      if attempt == 1 {
+        if let Ok((fresh, true)) = self.client.detect_ac_id() {
+          if fresh != self.cfg.ac_id {
+            self.warnings.push(format!(
+              "ac_id changed {} -> {fresh}, retrying",
+              self.cfg.ac_id
+            ));
+            self.cfg.ac_id = fresh;
+            continue;
+          }
+        }
+      }
+      if self
+        .client
+        .wait_online(&self.cfg.ac_id, Duration::from_secs(20))
+      {
+        self.state = State::Online;
+        self.failures = 0;
+        return Ok(fill(self.t().login_ok_verified, &code));
+      }
+      self.state = State::Offline;
+      return Err(self.rejected(&v));
+    }
+  }
+
+  /// Touch the keepalive target; failure to reach the internet implies the
+  /// session is gone, so the caller should re-authenticate.
+  pub fn keepalive(&mut self) -> Result<(), String> {
+    match self.client.touch(&self.cfg.keepalive_target) {
+      Ok(_) => {
+        self.failures = 0;
+        Ok(())
+      }
+      Err(e) => {
+        self.failures += 1;
+        Err(e)
+      }
+    }
+  }
+
+  pub fn logout(&mut self) -> Result<String, String> {
+    let v = self.client.login_logout(
+      &self.cfg.username,
+      None,
+      &self.cfg.ip,
+      &self.cfg.ac_id,
+      true,
+    )?;
+    self.state = State::Offline;
+    Ok(format!("{v}"))
+  }
+
+  /// Blocking supervisor loop; runs until the process is killed.
+  pub fn run_forever<F: FnMut(&Session, &str)>(&mut self, mut log: F) -> ! {
+    loop {
+      if self.ensure_online().is_err() {
+        std::thread::sleep(Duration::from_secs(self.cfg.reconnect_delay_secs));
+        continue;
+      }
+      log(self, self.t().login_ok);
+      loop {
+        std::thread::sleep(Duration::from_secs(self.cfg.keepalive_interval_secs));
+        match self.keepalive() {
+          Ok(()) => log(self, self.t().status_refreshed),
+          Err(e) => {
+            log(self, &format!("keepalive failed: {e}"));
+            if self.failures >= 2 {
+              let _ = self.ensure_online();
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Per-user MSI for THUnet (see README §7): no elevation, installed to
+  %LOCALAPPDATA%\Programs\thunet\thunet.exe. The application never installs
+  itself, so this package is the only owner of files and shortcuts.
+
+  Build with:  pixi run -e package msi
+  Version is required and comes from Cargo.toml: -d Version=<x.y.z>
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package
+      Name="THUnet"
+      Manufacturer="THUnet contributors"
+      Version="$(var.Version)"
+      UpgradeCode="8F0A6F2E-1F1B-4A0F-9C63-2E7A6F0C91D2"
+      Scope="perUser"
+      Compressed="yes">
+
+    <!-- Uninstalling the old product before installing the new one keeps a
+         single entry in "Installed apps". -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of THUnet is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="assets/thunet.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- The app hides itself on WM_CLOSE (tray behaviour), so util:CloseApplication
+         is not enough: terminate any running copy before files are replaced or
+         removed, otherwise a running exe blocks the operation. -->
+    <CustomAction Id="StopRunningApp" Directory="TARGETDIR"
+                  ExeCommand="taskkill /IM thunet.exe /F"
+                  Execute="immediate" Return="ignore" />
+
+    <!-- Start the app once, right after a manual (UI) install. Silent installs
+         such as `msiexec /qn` or winget keep UILevel = 2 and stay quiet. -->
+    <CustomAction Id="LaunchApp" FileRef="THUnetExe" ExeCommand=""
+                  Execute="immediate" Return="asyncNoWait" />
+
+    <InstallExecuteSequence>
+      <Custom Action="StopRunningApp" Before="InstallValidate" />
+      <Custom Action="LaunchApp" After="InstallFinalize"
+              Condition="NOT Installed AND UILevel &gt;= 4" />
+    </InstallExecuteSequence>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="thunet" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="THUnet" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Main" Title="THUnet" Level="1">
+      <ComponentGroupRef Id="Binaries" />
+    </Feature>
+
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="A0B2A2A3-1B5D-4A6E-8F10-5C1E2D3F4A5B">
+        <File Id="THUnetExe" Source="target/release/thunet.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuLnk" Directory="AppMenuFolder" Name="THUnet"
+                    Description="THUnet campus network client"
+                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+          <Shortcut Id="DesktopLnk" Directory="DesktopFolder" Name="THUnet"
+                    Description="THUnet campus network client"
+                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        </File>
+        <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+
+  </Package>
+</Wix>

@@ -1,0 +1,69 @@
+[package]
+name = "thunet"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal THUnet / SRun3K portal client (login, keepalive, logout, status)"
+license = "MIT"
+authors = ["THUnet contributors"]
+
+[dependencies]
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.37.0", default-features = false, features = [
+  "glow",
+  "default_fonts",
+  "clipboard",
+  "x11",
+  "wayland",
+] }
+tray-icon = "0.26.1"
+auto-launch = "0.6.0"
+sys-locale = "0.3.2"
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Embeds assets/thunet.ico (and the version block) into the Windows executable.
+[build-dependencies]
+winresource = "0.1"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_System_Console",
+  "Win32_System_Registry",
+] }
+
+# `cargo deb` (pixi run -e package deb). The binary, launcher entry and icon are
+# installed system-wide; user settings and autostart stay per user.
+[package.metadata.deb]
+name = "thunet"
+maintainer = "THUnet contributors"
+section = "net"
+priority = "optional"
+depends = "libc6, libgl1, libegl1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libfontconfig1"
+recommends = "libayatana-appindicator3-1"
+extended-description = """\
+Tray client for the Tsinghua University campus network: logs in through the
+SRun portal, keeps the session alive, shows the assigned addresses and traffic,
+and can start with the desktop."""
+assets = [
+  ["target/release/thunet", "usr/bin/", "755"],
+  ["assets/thunet.desktop", "usr/share/applications/", "644"],
+  ["assets/thunet.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["README.md", "usr/share/doc/thunet/README.md", "644"],
+]

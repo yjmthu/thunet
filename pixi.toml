@@ -1,0 +1,54 @@
+[workspace]
+authors = ["THUnet contributors"]
+channels = ["conda-forge"]
+name = "thunet"
+platforms = ["win-64", "linux-64"]
+
+[tasks]
+
+[environments]
+tools = ["tools"]
+dev = ["dev"]
+package = ["package", "dev"]
+
+[dependencies]
+python = "3.14.*"
+
+[feature.tools.dependencies]
+python = "*"
+
+[feature.dev.dependencies]
+rust = "*"
+
+[feature.dev.target.win-64.dependencies]
+vs2026_win-64 = "*"
+
+[feature.dev.target.linux-64.dependencies]
+compilers = "*"
+
+# ------------------------------------------------------------------ packaging
+# `pixi run -e package msi`   -> dist/thunet-<version>-x64.msi      (Windows)
+# `pixi run -e package deb`   -> dist/thunet_<version>-1_amd64.deb (Debian/Ubuntu)
+# `pixi run -e package tarball` -> dist/thunet-<version>-linux-x64.tar.gz
+
+[feature.package.target.win-64.dependencies]
+dotnet = "8.*"
+
+[feature.package.tasks]
+# WiX v5 as a project-local .NET tool: no global install, no admin rights.
+wix-tool = "dotnet tool update --tool-path .pixi/wix wix --version 5.0.2"
+release = "cargo build --release"
+# The version always comes from Cargo.toml (scripts read it, nothing is pinned).
+msi = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1", depends-on = [
+  "wix-tool",
+  "release",
+] }
+
+# cargo-deb is not on conda-forge, so it is built into this environment.
+deb-tool = "cargo install --locked --root \"$CONDA_PREFIX\" cargo-deb"
+deb = { cmd = "cargo deb -o dist", depends-on = ["deb-tool"] }
+tarball = { cmd = "bash scripts/build_tarball.sh", depends-on = ["release"] }
+
+# winget manifests for the MSI built above (dist/winget); see README §5.
+winget = { cmd = "pwsh -NoProfile -File scripts/winget_manifest.ps1", depends-on = ["msi"] }
+

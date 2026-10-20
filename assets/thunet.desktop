@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=THUnet
+GenericName=Campus network login
+Comment=Log in to the Tsinghua campus network and keep the session alive
+Comment[zh_CN]=登录清华校园网并保持连接
+Exec=thunet
+Icon=thunet
+Terminal=false
+Categories=Network;
+Keywords=tsinghua;campus;network;login;srun;
+StartupNotify=false
