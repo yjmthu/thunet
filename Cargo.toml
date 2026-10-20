@@ -56,6 +56,19 @@ windows-sys = { version = "0.61.2", features = [
 [target."cfg(not(windows))".dependencies]
 auto-launch = "0.6.0"
 
+# `tray-icon` builds its Linux menu with gtk-rs, whose constructors panic unless
+# `gtk::init()` ran first. eframe/winit never initialises GTK, so the app has to
+# do it itself before creating the tray (see `ui::init_gtk`).
+[target."cfg(target_os = \"linux\")".dependencies]
+gtk = "0.18"
+# GNOME on Wayland does not draw server-side decorations, and eframe turns off
+# winit's default features, so without this the window has no title bar at all
+# (no close / minimize buttons). Enabling the adwaita client-side decorations
+# is the only way to get a normal window frame there.
+winit = { version = "0.30", default-features = false, features = [
+  "wayland-csd-adwaita",
+] }
+
 # `cargo deb` (pixi run -e package deb). The binary, launcher entry and icon are
 # installed system-wide; user settings and autostart stay per user.
 [package.metadata.deb]
@@ -63,8 +76,11 @@ name = "thunet"
 maintainer = "THUnet contributors"
 section = "net"
 priority = "optional"
-depends = "libc6, libgl1, libegl1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libfontconfig1"
-recommends = "libayatana-appindicator3-1"
+# libgtk-3 drives the tray; libappindicator is dlopen()ed at startup and
+# panics when absent, so both are hard dependencies. Alternatives cover
+# Debian <= 12 (libgtk-3-0 / libappindicator3-1) and Ubuntu >= 24.04
+# (libgtk-3-0t64 / libayatana-appindicator3-1).
+depends = "libc6, libgl1, libegl1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libfontconfig1, libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1"
 extended-description = """\
 Tray client for the Tsinghua University campus network: logs in through the
 SRun portal, keeps the session alive, shows the assigned addresses and traffic,

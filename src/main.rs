@@ -216,7 +216,10 @@ fn run(cli: Cli) -> Result<(), String> {
     let Some(_instance) = single::acquire() else {
       return Ok(());
     };
-    let minimized = cli.minimized;
+    // `--minimized` (the autostart entry passes it) and the saved setting are
+    // equivalent: a launch without the flag still starts in the tray when the
+    // user asked for that in the settings page.
+    let minimized = cli.minimized || cfg.start_minimized;
     return ui::run(cfg, minimized);
   };
 
@@ -272,12 +275,27 @@ fn run(cli: Cli) -> Result<(), String> {
     cmd @ (Cmd::Login { .. } | Cmd::Logout) => {
       let logout = matches!(cmd, Cmd::Logout);
       let force = matches!(cmd, Cmd::Login { force: true });
-      let username = cfg.username.clone();
+      let (mut ac_id, _) = resolve_ac_id(&client, &cfg.ac_id);
+      let was_online = client.is_online(&ac_id);
+      // `logout` must also work for a session this profile did not create, and
+      // the account the portal reports for this address wins over the saved one
+      // (they differ on a shared machine).
+      let online = if logout {
+        client.online_identity(&cfg.ip)
+      } else {
+        None
+      };
+      let username = match &online {
+        Some((user, _)) => user.clone(),
+        None => cfg.username.clone(),
+      };
       if username.is_empty() {
         return Err("missing --username / saved credential / config".into());
       }
-      let (mut ac_id, _) = resolve_ac_id(&client, &cfg.ac_id);
-      let was_online = client.is_online(&ac_id);
+      let ip = match &online {
+        Some((_, addr)) => addr.clone(),
+        None => cfg.ip.clone(),
+      };
       if !logout && !force && was_online {
         println!("already online (use `login --force` to re-authenticate)");
         return Ok(());
@@ -294,7 +312,7 @@ fn run(cli: Cli) -> Result<(), String> {
       let mut attempt = 0;
       loop {
         attempt += 1;
-        let v = client.login_logout(&username, password.as_deref(), &cfg.ip, &ac_id, logout)?;
+        let v = client.login_logout(&username, password.as_deref(), &ip, &ac_id, logout)?;
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
           return Ok(());

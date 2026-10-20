@@ -97,6 +97,9 @@ pub struct Texts {
   pub login_failed: &'static str,
   pub connect_ok: &'static str,
   pub connect_failed: &'static str,
+  /// The portal rejected the account/password pair (see
+  /// `srun::is_credentials_error`). The raw JSON goes to the log instead.
+  pub invalid_credentials: &'static str,
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
   pub autostart_failed: &'static str,
@@ -159,6 +162,7 @@ static ZH: Texts = Texts {
   login_failed: "登录失败",
   connect_ok: "连接成功",
   connect_failed: "连接失败",
+  invalid_credentials: "用户名或密码错误",
   refresh_failed: "刷新失败",
   disconnect_failed: "断开失败",
   autostart_failed: "自启设置失败",
@@ -220,6 +224,7 @@ static EN: Texts = Texts {
   login_failed: "Login failed",
   connect_ok: "Connected",
   connect_failed: "Connection failed",
+  invalid_credentials: "Wrong username or password",
   refresh_failed: "Refresh failed",
   disconnect_failed: "Disconnect failed",
   autostart_failed: "Failed to change autostart",

@@ -167,63 +167,38 @@ fn level_color(level: Level, visuals: &egui::Visuals) -> egui::Color32 {
   }
 }
 
-fn make_icon(rgb: [u8; 3]) -> Icon {
-  const S: u32 = 32;
-  let mut rgba = vec![0u8; (S * S * 4) as usize];
-  let c = (S as f32 - 1.0) / 2.0;
-  for y in 0..S {
-    for x in 0..S {
-      let dx = x as f32 - c;
-      let dy = y as f32 - c;
-      let d = (dx * dx + dy * dy).sqrt();
-      let a = if d <= 12.0 {
-        255
-      } else if d <= 14.5 {
-        (((14.5 - d) / 2.5) * 255.0) as u8
-      } else {
-        0
-      };
-      let i = ((y * S + x) * 4) as usize;
-      rgba[i] = rgb[0];
-      rgba[i + 1] = rgb[1];
-      rgba[i + 2] = rgb[2];
-      rgba[i + 3] = a;
-    }
-  }
-  Icon::from_rgba(rgba, S, S).expect("valid rgba")
-}
-
-/// Window / taskbar icon: the packaged app icon (green disc with a white "T"),
-/// drawn in code so the binary stays asset-free. The tray keeps its
-/// state-coloured dot from `make_icon`.
-fn app_icon() -> egui::IconData {
-  const S: usize = 64;
-  let mut rgba = vec![0u8; S * S * 4];
-  let c = (S as f32 - 1.0) / 2.0;
-  let radius = S as f32 * 0.47;
-  for y in 0..S {
-    for x in 0..S {
+/// Disc with a white "T": the app icon, drawn in code so the binary stays
+/// asset-free. `fill` lets the tray reuse the same artwork with the state colour
+/// (green online, amber authenticating, grey offline) instead of a plain dot.
+fn disc_rgba(size: usize, fill: [u8; 3]) -> Vec<u8> {
+  let mut rgba = vec![0u8; size * size * 4];
+  let s = size as f32;
+  let c = (s - 1.0) / 2.0;
+  let radius = s * 0.47;
+  let u = s / 64.0;
+  for y in 0..size {
+    for x in 0..size {
       let dx = x as f32 - c;
       let dy = y as f32 - c;
       let d = (dx * dx + dy * dy).sqrt();
       let alpha = if d <= radius {
         1.0
-      } else if d <= radius + 1.5 {
-        (radius + 1.5 - d) / 1.5
+      } else if d <= radius + 1.5 * u {
+        (radius + 1.5 * u - d) / (1.5 * u)
       } else {
         0.0
       };
       if alpha <= 0.0 {
         continue;
       }
-      // Letter "T": a horizontal bar plus a centred stem.
-      let bar = dx.abs() <= 11.0 && dy >= -13.0 && dy <= -5.5;
-      let stem = dx.abs() <= 4.0 && dy >= -13.0 && dy <= 15.0;
-      let i = (y * S + x) * 4;
+      // Letter "T": a horizontal bar plus a centred stem (metrics for 64 px).
+      let bar = dx.abs() <= 11.0 * u && dy >= -13.0 * u && dy <= -5.5 * u;
+      let stem = dx.abs() <= 4.0 * u && dy >= -13.0 * u && dy <= 15.0 * u;
+      let i = (y * size + x) * 4;
       let (r, g, b) = if bar || stem {
         (255, 255, 255)
       } else {
-        (46, 160, 67)
+        (fill[0], fill[1], fill[2])
       };
       rgba[i] = r;
       rgba[i + 1] = g;
@@ -231,8 +206,19 @@ fn app_icon() -> egui::IconData {
       rgba[i + 3] = (alpha * 255.0) as u8;
     }
   }
+  rgba
+}
+
+fn make_icon(rgb: [u8; 3]) -> Icon {
+  const S: usize = 64;
+  Icon::from_rgba(disc_rgba(S, rgb), S as u32, S as u32).expect("valid rgba")
+}
+
+/// Window / taskbar icon: the packaged app icon (green disc with a white "T").
+fn app_icon() -> egui::IconData {
+  const S: usize = 64;
   egui::IconData {
-    rgba,
+    rgba: disc_rgba(S, [46, 160, 67]),
     width: S as u32,
     height: S as u32,
   }
@@ -540,7 +526,17 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
           // 5s, 10s, 20s, 40s, ... capped at two minutes.
           let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
           next_attempt = Instant::now() + Duration::from_secs_f64(backoff.min(120.0));
-          tx.send(Ev::Error(Some(e.clone()))).ok();
+          let bad_credentials =
+            session.failure == crate::session::FailureKind::Credentials;
+          // A credential rejection carries a long JSON blob that only helps when
+          // debugging, so it goes to the log pane while the red banner and the
+          // toast carry the one thing the user can act on.
+          tx.send(Ev::Error(if bad_credentials {
+            None
+          } else {
+            Some(e.clone())
+          }))
+          .ok();
           tx.send(Ev::Log(Line::error(format!(
             "{e} (retry in {}s)",
             backoff.min(120.0) as u64
@@ -550,7 +546,12 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
           if e != last_failure {
             last_failure = e;
             tx.send(Ev::Notify {
-              msg: t.connect_failed.into(),
+              msg: if bad_credentials {
+                t.invalid_credentials
+              } else {
+                t.connect_failed
+              }
+              .into(),
               kind: ToastKind::Err,
             })
             .ok();
@@ -654,6 +655,9 @@ pub struct App {
   /// area, e.g. inside a validation sandbox). The app then stays window-only:
   /// closing quits instead of hiding, and a hidden start is not attempted.
   tray: Option<TrayIcon>,
+  /// Colour of the icon currently installed in the tray; `set_icon` rewrites a
+  /// temp PNG and re-announces the indicator, so it must only run on a change.
+  tray_rgb: Option<[u8; 3]>,
   connect_item: MenuItem,
   disconnect_item: MenuItem,
   autostart_item: CheckMenuItem,
@@ -712,7 +716,7 @@ impl App {
       // The menu lives on the right button; a left click brings the window back.
       .with_menu_on_left_click(false)
       .with_tooltip("THUnet")
-      .with_icon(make_icon([140, 140, 140]))
+      .with_icon(make_icon(color_for(State::Offline)))
       .build()
       .ok();
     // Without a tray icon there is no way back into a hidden window, so an
@@ -776,6 +780,7 @@ impl App {
       autostart,
       autostart_on,
       tray,
+      tray_rgb: Some(color_for(State::Offline)),
       connect_item,
       disconnect_item,
       autostart_item,
@@ -1854,6 +1859,14 @@ mod tests {
 
 impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // GTK delivers the appindicator menu callbacks through its own event loop,
+    // but eframe owns the main loop here. Pump GTK every pass, otherwise menu
+    // clicks are queued forever and never reach `handle_menu`.
+    #[cfg(target_os = "linux")]
+    while gtk::events_pending() {
+      gtk::main_iteration_do(false);
+    }
+
     if !self.started {
       self.started = true;
       // Started visible: make sure the window is not left behind the app that
@@ -1934,8 +1947,11 @@ impl eframe::App for App {
 
     // Keep ticking while hidden so tray clicks are still processed.
     let rgb = color_for(self.state);
-    if let Some(tray) = &self.tray {
-      let _ = tray.set_icon(Some(make_icon(rgb)));
+    if self.tray_rgb != Some(rgb) {
+      self.tray_rgb = Some(rgb);
+      if let Some(tray) = &self.tray {
+        let _ = tray.set_icon(Some(make_icon(rgb)));
+      }
     }
     let t = self.t();
     let tip = match self.state {
@@ -2301,8 +2317,24 @@ fn renderer_name(renderer: &eframe::Renderer) -> &'static str {
   }
 }
 
+/// Linux only: initialise GTK before `tray-icon` creates its menu.
+///
+/// `tray-icon` builds the appindicator menu with gtk-rs, and every gtk-rs
+/// constructor asserts that `gtk::init()` already ran on the main thread.
+/// eframe uses winit only and never touches GTK, so without this the app
+/// panicked at startup with "GTK has not been initialized".
+#[cfg(target_os = "linux")]
+fn init_gtk() -> Result<(), String> {
+  gtk::init().map_err(|e| format!("gtk: {e}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn init_gtk() -> Result<(), String> {
+  Ok(())
+}
+
 fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<(), String> {
-  let options = eframe::NativeOptions {
+  let mut options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])
       .with_resizable(false)
@@ -2315,10 +2347,32 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
     renderer,
     ..Default::default()
   };
+
+  // Wayland cannot hide a toplevel: winit's `set_visible` is a no-op there
+  // ("Not possible on Wayland"), so *Hide window* and closing the window to the
+  // tray would leave it on screen, and only minimise-to-taskbar works. XWayland
+  // supports both, and GNOME draws its normal server-side title bar for X11
+  // clients. Prefer it whenever a display is available; a pure Wayland session
+  // still falls back to the adwaita client-side decorations.
+  // `THUNET_UNIX_BACKEND=wayland` opts out.
+  #[cfg(target_os = "linux")]
+  {
+    let have_x11 = std::env::var_os("DISPLAY").is_some();
+    let force_wayland = std::env::var("THUNET_UNIX_BACKEND").is_ok_and(|v| v == "wayland");
+    if have_x11 && !force_wayland {
+      options.event_loop_builder = Some(Box::new(|builder| {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+      }));
+    }
+  }
+
   eframe::run_native(
     "THUnet",
     options,
     Box::new(move |cc| {
+      // Must happen before `App::new`, which builds the tray menu.
+      init_gtk().map_err(std::io::Error::other)?;
       let font = install_fonts(&cc.egui_ctx);
       install_tray_events(&cc.egui_ctx);
       cc.egui_ctx.add_plugin(LogCopyClick::default());

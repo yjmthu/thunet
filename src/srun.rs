@@ -246,6 +246,42 @@ impl Client {
     let url = self.url("/cgi-bin/srun_portal", &refs);
     Self::jsonp(&self.get(&url)?)
   }
+
+  /// Account name and address of the live session on `ip` (empty = this host).
+  ///
+  /// `logout` signs the request with the account that owns the session, which
+  /// need not be the one saved in the config (shared machine, or a session
+  /// started by another client). `get_challenge` also rejects an empty
+  /// `username` with `missing_required_parameters_error`, so this is how a
+  /// client without stored credentials finds out who to log out.
+  pub fn online_identity(&self, ip: &str) -> Option<(String, String)> {
+    let url = self.url("/cgi-bin/rad_user_info", &[("ip", ip)]);
+    let body = self.get(&url).ok()?;
+    let v = Self::jsonp(&body).ok()?;
+    if v.get("error").and_then(Value::as_str) != Some("ok") {
+      return None;
+    }
+    let user = v.get("user_name").and_then(Value::as_str)?;
+    if user.is_empty() {
+      return None;
+    }
+    let addr = v
+      .get("online_ip")
+      .and_then(Value::as_str)
+      .unwrap_or(ip)
+      .to_string();
+    Some((user.to_string(), addr))
+  }
+}
+
+/// Portal codes meaning "this account/password pair is wrong".
+///
+/// Retrying cannot fix them, and the JSON that carries them is far too long for
+/// a toast, so the UI shows a one-line message and keeps the detail in the log.
+/// E2901 is what THU answers for a bad password (`ldap_first_entry error`);
+/// E2531/E2532/E2553 are the generic SRun3K variants.
+pub fn is_credentials_error(code: &str) -> bool {
+  matches!(code, "E2531" | "E2532" | "E2553" | "E2901")
 }
 
 /// Percent-encode for a query string (RFC 3986 unreserved kept).

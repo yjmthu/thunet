@@ -125,6 +125,18 @@ Logout uses the same endpoint with `action=logout`; `password` is dropped from
 both the query and the `info` blob, and the checksum loses the
 `token + md5_password` term.
 
+`username` is still mandatory: `get_challenge` answers
+`missing_required_parameters_error` when it is empty, so a client that did not
+create the session reads `user_name` (and `online_ip`) from
+`/cgi-bin/rad_user_info` first. The portal's own page instead sends an unsigned
+`action=logout&username=..&ip=..&ac_id=..`, but that form returns
+`no_username_error` without an account name as well.
+
+The account reported by `rad_user_info` therefore takes precedence over any
+saved credential: on a shared machine the session may belong to a different
+account than the one stored, and it is that account which has to be signed out.
+The saved name is only used when the portal reports no session.
+
 A successful answer looks like
 `{"error":"ok","error_msg":"","suc_msg":"login_ok",...}`.
 

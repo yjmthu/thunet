@@ -17,6 +17,16 @@ pub enum State {
   Online,
 }
 
+/// Why the last login attempt failed, so the caller can decide how much of the
+/// portal's answer to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureKind {
+  #[default]
+  Other,
+  /// Wrong account or password: retrying cannot help, and the raw JSON is noise.
+  Credentials,
+}
+
 pub struct Session {
   client: Client,
   cfg: Config,
@@ -26,6 +36,8 @@ pub struct Session {
   warnings: Vec<Line>,
   pub state: State,
   pub failures: u32,
+  /// Set by `ensure_online`; read by the UI right after an `Err`.
+  pub failure: FailureKind,
 }
 
 fn ecode(v: &serde_json::Value) -> String {
@@ -67,6 +79,7 @@ impl Session {
       warnings,
       state: State::Offline,
       failures: 0,
+      failure: FailureKind::Other,
     }
   }
 
@@ -133,6 +146,7 @@ impl Session {
   /// One full "make sure I am online" step.
   pub fn ensure_online(&mut self) -> Result<String, String> {
     self.state = State::Authenticating;
+    self.failure = FailureKind::Other;
     if self.client.is_online(&self.cfg.ac_id) {
       self.state = State::Online;
       self.failures = 0;
@@ -171,6 +185,11 @@ impl Session {
       // Some deployments answer with a policy-level error even though the
       // session was created. Credential errors never resolve.
       let code = ecode(&v);
+      if crate::srun::is_credentials_error(&code) {
+        self.failure = FailureKind::Credentials;
+        self.state = State::Offline;
+        return Err(self.rejected(&v));
+      }
       let policy_like = code.starts_with("E28") || code == "no ecode" || code.is_empty();
       if !policy_like {
         self.state = State::Offline;
@@ -218,13 +237,36 @@ impl Session {
   }
 
   pub fn logout(&mut self) -> Result<String, String> {
-    let v = self.client.login_logout(
-      &self.cfg.username,
-      None,
-      &self.cfg.ip,
-      &self.cfg.ac_id,
-      true,
-    )?;
+    // The portal knows which account owns the session on this address, and that
+    // account wins: the saved one may belong to somebody else (shared machine)
+    // or be missing entirely. `get_challenge` also rejects an empty username.
+    let mut ip = self.cfg.ip.trim().to_string();
+    let mut username = String::new();
+    if let Some((user, addr)) = self.client.online_identity(&ip) {
+      username = user;
+      if ip.is_empty() {
+        ip = addr;
+      }
+    }
+    let saved = self.cfg.username.trim().to_string();
+    if username.is_empty() {
+      username = saved;
+    } else if !saved.is_empty() && saved != username {
+      self.warnings.push(Line::warn(format!(
+        "logout: the portal reports {username}, but {saved} is saved; logging out {username}"
+      )));
+    }
+    if username.is_empty() {
+      return Err(
+        "no account to log out: none is saved and the portal reports no session".into(),
+      );
+    }
+    let v = self
+      .client
+      .login_logout(&username, None, &ip, &self.cfg.ac_id, true)?;
+    if v.get("error").and_then(|e| e.as_str()) != Some("ok") {
+      return Err(format!("logout rejected: {v}"));
+    }
     self.state = State::Offline;
     Ok(format!("{v}"))
   }
