@@ -1,5 +1,7 @@
 # THUnet
 
+**English** | [简体中文](README.zh-CN.md)
+
 A small cross-platform tray app that logs you into the Tsinghua University
 campus network (`auth4.tsinghua.edu.cn`, SRun3K portal) and keeps the connection
 alive.
@@ -77,6 +79,10 @@ back, and closing the window only hides it in the tray.
 The window has exactly two pages, switched with the button in the top-right
 corner.
 
+![The THUnet status page](docs/images/en-status.png)
+
+*Status page, with the account name, addresses and user name redacted.*
+
 ### Status page
 
 | Element | Meaning |
@@ -109,6 +115,10 @@ clipboard. With nothing selected, right-click opens a small menu with
 **Copy line** and **Copy all** (both copy only what the current level shows).
 
 ### Settings page
+
+![The THUnet settings page](docs/images/en-settings.png)
+
+*Settings page, with the account and password fields redacted.*
 
 | Setting | Effect |
 | --- | --- |
