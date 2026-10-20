@@ -1,0 +1,9 @@
+# Ship a single self-contained executable.
+#
+# With the default MSVC toolchain thunet.exe imports VCRUNTIME140.dll, which is
+# part of the Visual C++ 2015-2022 redistributable. That redistributable is not
+# present on a clean Windows install, so the process dies at load time with
+# STATUS_DLL_NOT_FOUND (0xC0000135) — the winget repository validation machine
+# is exactly such an environment and reported it as `Validation-Executable-Error`.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
