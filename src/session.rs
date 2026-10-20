@@ -7,13 +7,8 @@
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::i18n::{Lang, Texts};
+use crate::logline::Line;
 use crate::srun::{Client, NetEnv};
-
-/// Replace the first `{}` placeholder in a localized template.
-fn fill(tpl: &str, value: &str) -> String {
-  tpl.replacen("{}", value, 1)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -25,11 +20,10 @@ pub enum State {
 pub struct Session {
   client: Client,
   cfg: Config,
-  lang: Lang,
   /// True when `ac_id` was auto-detected (so it must be refreshed per connect).
   auto_ac: bool,
   /// Diagnostics produced off the UI thread; drained into the window log.
-  warnings: Vec<String>,
+  warnings: Vec<Line>,
   pub state: State,
   pub failures: u32,
 }
@@ -45,7 +39,6 @@ fn ecode(v: &serde_json::Value) -> String {
 impl Session {
   pub fn new(mut cfg: Config) -> Self {
     let client = Client::new(&cfg.host, cfg.https, Duration::from_secs(5));
-    let lang = Lang::from_setting(&cfg.lang);
     // `auto` must be resolved once: the AC id changes with the network.
     let auto_ac = cfg.ac_id.is_empty() || cfg.ac_id == "auto";
     let mut warnings = Vec::new();
@@ -53,12 +46,16 @@ impl Session {
       match client.detect_ac_id() {
         Ok((id, confident)) => {
           if !confident {
-            warnings.push(format!("ac_id={id} may be the default page value"));
+            warnings.push(Line::debug(format!(
+              "ac_id={id} may be the default page value"
+            )));
           }
           cfg.ac_id = id;
         }
         Err(e) => {
-          warnings.push(format!("ac_id detect failed ({e}), falling back to 1"));
+          warnings.push(Line::warn(format!(
+            "ac_id detect failed ({e}), falling back to 1"
+          )));
           cfg.ac_id = "1".into();
         }
       }
@@ -66,7 +63,6 @@ impl Session {
     Self {
       client,
       cfg,
-      lang,
       auto_ac,
       warnings,
       state: State::Offline,
@@ -74,17 +70,9 @@ impl Session {
     }
   }
 
-  /// Take the pending diagnostic messages (startup + re-detection).
-  pub fn take_warnings(&mut self) -> Vec<String> {
+  /// Take the pending diagnostic lines (startup + re-detection).
+  pub fn take_warnings(&mut self) -> Vec<Line> {
     std::mem::take(&mut self.warnings)
-  }
-
-  fn t(&self) -> &'static Texts {
-    self.lang.texts()
-  }
-
-  pub fn set_lang(&mut self, lang: Lang) {
-    self.lang = lang;
   }
 
   /// Update the credentials used by the next login attempt.
@@ -135,11 +123,10 @@ impl Session {
 
   /// Build the "portal said no" message: reason + optional hint.
   fn rejected(&self, v: &serde_json::Value) -> String {
-    let t = self.t();
     format!(
-      "{}\n{}",
-      fill(&fill(t.login_rejected, &self.cfg.ac_id), &v.to_string()),
-      t.ac_id_hint
+      "login rejected (ac_id={}): {v}\n\
+       hint: ac_id can change with the network; pass --ac-id to override",
+      self.cfg.ac_id
     )
   }
 
@@ -149,7 +136,7 @@ impl Session {
     if self.client.is_online(&self.cfg.ac_id) {
       self.state = State::Online;
       self.failures = 0;
-      return Ok(self.t().already_online_session.into());
+      return Ok("already online".into());
     }
     let mut attempt = 0;
     loop {
@@ -159,9 +146,8 @@ impl Session {
       if self.auto_ac {
         if let Ok((fresh, true)) = self.client.detect_ac_id() {
           if fresh != self.cfg.ac_id {
-            self
-              .warnings
-              .push(format!("ac_id {} -> {fresh}", self.cfg.ac_id));
+            let msg = format!("ac_id {} -> {fresh}", self.cfg.ac_id);
+            self.warnings.push(Line::debug(msg));
             self.cfg.ac_id = fresh;
           }
         }
@@ -175,17 +161,12 @@ impl Session {
           &self.cfg.ac_id,
           false,
         )
-        .map_err(|e| {
-          fill(
-            &fill(self.t().request_failed, &self.cfg.host),
-            &e.to_string(),
-          )
-        })?;
+        .map_err(|e| format!("request to {} failed: {e}", self.cfg.host))?;
 
       if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
         self.state = State::Online;
         self.failures = 0;
-        return Ok(self.t().login_ok.into());
+        return Ok("login ok".into());
       }
       // Some deployments answer with a policy-level error even though the
       // session was created. Credential errors never resolve.
@@ -199,10 +180,8 @@ impl Session {
       if attempt == 1 {
         if let Ok((fresh, true)) = self.client.detect_ac_id() {
           if fresh != self.cfg.ac_id {
-            self.warnings.push(format!(
-              "ac_id changed {} -> {fresh}, retrying",
-              self.cfg.ac_id
-            ));
+            let msg = format!("ac_id changed {} -> {fresh}, retrying", self.cfg.ac_id);
+            self.warnings.push(Line::debug(msg));
             self.cfg.ac_id = fresh;
             continue;
           }
@@ -214,7 +193,9 @@ impl Session {
       {
         self.state = State::Online;
         self.failures = 0;
-        return Ok(fill(self.t().login_ok_verified, &code));
+        return Ok(format!(
+          "login ok (server reported {code}, verified online)"
+        ));
       }
       self.state = State::Offline;
       return Err(self.rejected(&v));
@@ -255,11 +236,11 @@ impl Session {
         std::thread::sleep(Duration::from_secs(self.cfg.reconnect_delay_secs));
         continue;
       }
-      log(self, self.t().login_ok);
+      log(self, "login ok");
       loop {
         std::thread::sleep(Duration::from_secs(self.cfg.keepalive_interval_secs));
         match self.keepalive() {
-          Ok(()) => log(self, self.t().status_refreshed),
+          Ok(()) => log(self, "status refreshed"),
           Err(e) => {
             log(self, &format!("keepalive failed: {e}"));
             if self.failures >= 2 {

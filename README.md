@@ -54,7 +54,7 @@ Linux and macOS, and speaks Chinese or English.
 3. **Open Settings.** Click the button in the top-right corner of the window.
 4. **Enter your credentials.** Type your TUNET account (for example
    `1234567890`) and your password, tick **Remember password**, then click
-   **Save**. On Windows the password is handed to Credential Manager — it never
+   **Apply**. On Windows the password is handed to Credential Manager — it never
    ends up in the settings file.
 5. **Connect.** Go back to the Status page and click **Connect** (or just wait a
    few seconds if *Auto connect* is already enabled). The dot in the header turns
@@ -95,9 +95,18 @@ Log lines look like this:
 [2026-10-20 12:56:41] [DEBUG] portal: auth4.tsinghua.edu.cn
 ```
 
-Each level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) has its own colour. The
-strip shows the newest few lines and scrolls; right-click a line to copy it, or
-to copy the whole log.
+Each level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) has its own colour. Log
+text is always English — it is developer-facing diagnostics, so it does not
+follow the *Language* setting; everything else in the window does. The strip
+shows the newest lines and scrolls.
+
+*Settings → Log level* hides lines below the chosen level (`DEBUG` shows
+everything, then `INFO`, `WARN`, `ERROR`). Hiding is display-only: the lines are
+still kept, so lowering the level again brings them back.
+
+Right-click on selected log text copies the selection straight to the
+clipboard. With nothing selected, right-click opens a small menu with
+**Copy line** and **Copy all** (both copy only what the current level shows).
 
 ### Settings page
 
@@ -106,13 +115,54 @@ to copy the whole log.
 | Start with the system | Adds or removes the autostart entry for your user |
 | Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round |
 | Auto connect | Log in as soon as a usable network appears |
-| Account / Password / Remember password / Save | Stores the login; the password goes to the OS credential store, never to the JSON file |
+| Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
+| Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying hands the password to the OS credential store (never to the JSON file) and passes it to the running session immediately; *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
 | Language | Follow system (default), 中文, English |
+| Log level | `DEBUG` / `INFO` / `WARN` / `ERROR`: the lowest level shown in the log page (`INFO` by default, stored in `config.json`) |
+| Version | Version on the left, build time on the right (local clock to the second, with its UTC offset) |
+
+The three switches confirm the state they just moved to in a toast
+(*Start with system: On*), because nothing else on the page changes when one of
+them is flipped.
+
+**Connect** uses the password the background worker holds: at launch that is what
+Credential Manager has (only if *Remember password* was saved), and afterwards
+whatever was last applied — text typed into the fields does nothing until
+**Apply**, which is what the *Unsaved* marker warns about. Unticking *Remember
+password* and applying deletes the stored entry, yet the password you just typed
+keeps working until the app exits. With no password anywhere, **Connect** reports
+it instead of sending an empty login to the portal.
+
+Having no saved password is not the same as being offline: the client keeps
+asking the portal for the session state either way, so an existing session
+(today's, or one another device on this network created) still shows up as
+online with its account, addresses and traffic.
+
+The build stamp shows the version on the left and, on the right, the local time
+of the compile that produced this binary with its UTC offset
+(`Built at 2026-10-20 19:23:23 +08:00`). Both are embedded at build time
+(`build.rs`), so the stamp always matches the running executable — handy when
+you are not sure whether the update actually took. The wall clock is rendered in
+the timezone of whoever is looking, so the same binary reads differently on a
+machine set to another zone; the offset says which one you are seeing.
+
+**Connect is greyed out off-campus.** A login can only succeed behind the campus
+portal, so the client probes the network every few seconds and disables the
+button — with the reason on hover — when the machine is on an 802.1X network
+such as `Tsinghua-Secure`, has no link at all, sits behind someone else's captive
+portal, or already reaches the internet without a portal. **Refresh** stays
+available in every case, and **Disconnect** follows the session state alone, so
+an existing session can always be ended.
 
 ### Tray icon
 
-Right-click the tray icon for `Show window`, `Connect`, `Disconnect`,
-`Autostart`, `Desktop shortcut` and `Quit`.
+**Left-click the tray icon** to show the window (or to bring an existing one
+back to the front); **double-click** it to hide the window again. Telling the
+two apart takes a fixed 300 ms, so a single click acts once that delay has
+passed.
+
+**Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect`,
+`Autostart` and `Quit`.
 
 Closing the window hides it — the app keeps working. Only `Quit` really exits.
 
@@ -120,7 +170,8 @@ Closing the window hides it — the app keeps working. Only `Quit` really exits.
 
 Every action answers with a coloured strip at the bottom of the window: **green**
 for success, **red** for failure, **blue** for information such as "already
-online", "saved" or "copied". Nothing succeeds silently.
+online", "copied", or the state a switch just moved to
+("Start with system: On"). Nothing succeeds silently.
 
 ## 3. Everyday tasks
 
@@ -146,12 +197,14 @@ file and applies immediately.
 
 | Symptom | What to do |
 | --- | --- |
-| Log says `login rejected` / `E2901` | Wrong password. Re-enter it in Settings and tick *Remember password* again. |
+| Log says `login rejected` / `E2901` | Wrong password. Re-enter it in Settings, tick *Remember password* again and click **Apply**. |
 | Log says `E2808 Control policy not found` | The portal reported an unexpected access-controller id. The client normally detects it automatically; on a captive Wi-Fi it can only guess. Reconnect to the campus Wi-Fi and click **Refresh**. |
 | Log says `E2553` | The account is already online elsewhere (phone, another laptop). Log out there first. |
 | Internet works but no session appears | You are on `Tsinghua-Secure` or another 802.1X network, where no portal login is needed — the client stays idle by design. |
 | Nothing happens after clicking **Connect** | Read the log strip. When the machine has no link at all, the client waits 30 s before retrying. |
-| The window disappeared | It is in the tray. Use `Show window` in the tray menu. |
+| **Connect** is greyed out | The client does not think a login can work here (802.1X Wi-Fi such as `Tsinghua-Secure`, no link, another operator's portal, or the internet already works). Hover the button for the exact reason; **Refresh** still polls the portal. |
+| **Connect** says `No account or password saved` | Nothing is available to log in with: type the password in Settings and click **Apply**. The client does not send an empty login to the portal. |
+| The window disappeared | It is in the tray. Click the tray icon (or use `Show window` in its menu). |
 | The app crashed | Read `crash.log` next to `config.json` (see [Where your data lives](#6-where-your-data-lives)). The app has no console, so that file is the only record. |
 | A command prints nothing in PowerShell | The binary has no console and PowerShell does not wait for it. Use `cmd /c thunet status` or `Start-Process -Wait thunet`. |
 
@@ -234,24 +287,36 @@ Uninstalling while THUnet is running is safe: the MSI terminates the running cop
 first (`taskkill /IM thunet.exe /F` before `InstallValidate`), then removes the
 files, the shortcuts, the Start Menu folder and the install directory.
 
+Because that `taskkill` also runs for upgrades and repairs, every interactive
+install (UILevel ≥ 4) starts the app again once the transaction is finished; a
+silent install (`msiexec /qn`, winget) does not, so it never hijacks a desktop.
+Double-clicking the package while it is already installed therefore ends with
+the app running rather than with a killed copy.
+
 Autostart is **not** part of the package — it is a user preference stored by the
 app:
 
 | OS | Autostart entry |
 | --- | --- |
-| Windows | `HKCU\...\CurrentVersion\Run\thunet` = `"…\thunet.exe" --minimized` (the flag is only added when *Start minimised* is on) |
-| Linux | `~/.config/autostart/thunet.desktop` |
+| Windows | A per-user Task Scheduler logon task named `thunet` (`schtasks /Create /XML`, no delay, least privilege) that runs `thunet.exe` (plus `--minimized` when *Start minimised* is on). The Task Scheduler service fires it before `explorer.exe` processes `Run` keys, so the app comes up earlier than a `Run` entry would. |
+| Linux | `~/.config/autostart/thunet.desktop`, started by the desktop session itself (XDG autostart). A systemd user unit could be launched slightly earlier, but it would race the tray host and the display socket, so the `.desktop` entry is both the standard and the reliable choice. |
 | macOS | LaunchAgent managed by the `auto-launch` crate |
 
-The only self-service action left is the desktop shortcut: `Desktop shortcut`
-in the tray menu, or `thunet shortcut`, which puts a launcher for the running
-executable on your desktop (on Linux it also marks the `.desktop` file as
-trusted so GNOME will launch it).
+Releases before this one wrote `HKCU\...\CurrentVersion\Run\thunet` on Windows;
+the first start of a newer build moves that value into the logon task (keeping
+the executable it recorded) and deletes it, so the app never starts twice.
+
+The only self-service action left is the desktop shortcut: **Create desktop
+shortcut** on the Settings page, or `thunet shortcut`, which puts a launcher for
+the running executable on your desktop (on Linux it also marks the `.desktop`
+file as trusted so GNOME will launch it).
 
 To remove THUnet: *Settings → Apps → THUnet → Uninstall* on Windows, or
 `sudo apt remove thunet` on Debian/Ubuntu. Your settings in `%APPDATA%\thunet`
 are left alone; delete that directory (and the Credential Manager entry) if you
-want a clean slate.
+want a clean slate. Turn *Start with the system* off before uninstalling if you
+do not want the leftover autostart entry (on Windows that is the `thunet` task
+in Task Scheduler) to point at a missing executable.
 
 ## 8. Installing with winget
 
@@ -312,11 +377,23 @@ HTTPS, the SHA256 must match, the package must install **and** uninstall
 silently (`/qn` — the MSI does), and `Publisher` / `PackageName` should match
 what the installer writes to *Installed apps* (`THUnet contributors` / `THUnet`).
 
+Two details exist only for the installation-validation step, and removing them
+brings back the `Validation-Executable-Error` label:
+
+- `packaging/thunet.wxs` sets `ARPINSTALLLOCATION` so *Installed apps* records
+  an `InstallLocation`; MSI never writes one on its own, and without it nothing
+  can locate the installed executable.
+- `scripts/winget_manifest.ps1` declares `thunet.exe` as the `InstallationMetadata`
+  `launch` file with `InvocationParameter: --version`. THUnet is a tray client:
+  started without arguments it stays resident until the user quits, which reads
+  as a hung/failed program for anything that executes installed binaries.
+  `--version` prints the version and exits 0 in well under a second.
+
 > A package cannot be published for a version whose artifact is not reachable
 > yet, so upload the release **before** opening the pull request.
 
 Steps 1–3 are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml):
-push a tag that matches `Cargo.toml` (`git tag v0.1.0 && git push origin v0.1.0`)
+push a tag that matches `Cargo.toml` (`git tag v0.1.1 && git push origin v0.1.1`)
 and the workflow builds the MSI, publishes it with the generated manifests, and
 opens the `winget-pkgs` pull request when a `WINGET_TOKEN` secret (classic PAT
 with `public_repo`) is configured.

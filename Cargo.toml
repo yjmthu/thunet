@@ -1,6 +1,6 @@
 [package]
 name = "thunet"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Minimal THUnet / SRun3K portal client (login, keepalive, logout, status)"
 license = "MIT"
@@ -25,7 +25,6 @@ eframe = { version = "0.37.0", default-features = false, features = [
   "wayland",
 ] }
 tray-icon = "0.26.1"
-auto-launch = "0.6.0"
 sys-locale = "0.3.2"
 
 [profile.release]
@@ -42,11 +41,19 @@ winresource = "0.1"
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
   "Win32_Security",
   "Win32_Security_Credentials",
   "Win32_System_Console",
   "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Autostart on Linux (XDG entry) and macOS (LaunchAgent); Windows uses a
+# Task Scheduler logon task in `src/autostart.rs` instead.
+[target."cfg(not(windows))".dependencies]
+auto-launch = "0.6.0"
 
 # `cargo deb` (pixi run -e package deb). The binary, launcher entry and icon are
 # installed system-wide; user settings and autostart stay per user.

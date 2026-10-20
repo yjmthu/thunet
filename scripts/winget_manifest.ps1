@@ -35,8 +35,29 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$manifestVersion = "1.10.0"
+$manifestVersion = "1.12.0"
 $identifier = "THUnet.THUnet"
+
+# ARP correlation and the launch entry both come from the MSI itself: the
+# ProductCode changes with every build, and the repository validation runs the
+# file marked `FileType: launch` (see $installerYaml below), so the two must not
+# be copied by hand.
+function Get-MsiProperty {
+  param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Name)
+  $installer = New-Object -ComObject WindowsInstaller.Installer
+  $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+  $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$Name'"))
+  [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+  $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+  [void]$view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null)
+  if (-not $record) { throw "MSI property $Name is missing from $Path" }
+  $value = $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
+  # The Property table returns the value padded to the column width; the GUIDs
+  # are the only thing needed here.
+  $match = [regex]::Match($value, '\{[0-9A-Fa-f-]{36}\}')
+  if (-not $match.Success) { return $value.Trim() }
+  $match.Value
+}
 
 $cargo = Get-Content (Join-Path $root "Cargo.toml") -Raw
 $match = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"')
@@ -49,6 +70,8 @@ if (-not (Test-Path $Msi)) {
 }
 $fileName = Split-Path -Leaf $Msi
 $hash = (Get-FileHash -Path $Msi -Algorithm SHA256).Hash
+$productCode = Get-MsiProperty -Path (Resolve-Path $Msi) -Name "ProductCode"
+$upgradeCode = Get-MsiProperty -Path (Resolve-Path $Msi) -Name "UpgradeCode"
 
 if (-not $BaseUrl) {
   $BaseUrl = "https://github.com/OWNER/thunet/releases/download/v$version"
@@ -94,6 +117,22 @@ Installers:
   InstallerSwitches:
     Silent: /qn
     SilentWithProgress: /qb
+  AppsAndFeaturesEntries:
+  - DisplayName: THUnet
+    Publisher: THUnet contributors
+    ProductCode: '$productCode'
+    UpgradeCode: '$upgradeCode'
+  # The application is a tray client: launched with no arguments it stays
+  # resident until the user quits from the tray menu, which reads as a failure
+  # for anything that executes the installed binary. `--version` is a
+  # non-interactive invocation that prints the version and exits 0.
+  InstallationMetadata:
+    DefaultInstallLocation: '%LOCALAPPDATA%\Programs\thunet'
+    Files:
+    - RelativeFilePath: thunet.exe
+      FileType: launch
+      InvocationParameter: --version
+      DisplayName: THUnet
 ManifestType: installer
 ManifestVersion: $manifestVersion
 "@

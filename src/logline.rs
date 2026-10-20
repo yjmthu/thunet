@@ -22,6 +22,9 @@ pub enum Level {
 }
 
 impl Level {
+  /// Levels offered in the settings page, quietest last.
+  pub const CHOICES: [Level; 4] = [Level::Debug, Level::Info, Level::Warn, Level::Error];
+
   pub fn tag(self) -> &'static str {
     match self {
       Level::Debug => "DEBUG",
@@ -29,6 +32,27 @@ impl Level {
       Level::Warn => "WARN",
       Level::Error => "ERROR",
       Level::Fatal => "FATAL",
+    }
+  }
+
+  /// Parse the stored `log_level` setting. Anything unrecognised means "show
+  /// everything" rather than silently hiding diagnostics.
+  pub fn from_setting(setting: &str) -> Self {
+    match setting.trim().to_ascii_lowercase().as_str() {
+      "info" => Level::Info,
+      "warn" | "warning" => Level::Warn,
+      "error" => Level::Error,
+      _ => Level::Debug,
+    }
+  }
+
+  /// Inverse of [`Level::from_setting`], for the config file.
+  pub fn setting(self) -> &'static str {
+    match self {
+      Level::Debug => "debug",
+      Level::Info => "info",
+      Level::Warn => "warn",
+      Level::Error | Level::Fatal => "error",
     }
   }
 }
@@ -110,5 +134,16 @@ mod tests {
     assert!(Level::Error < Level::Fatal);
     assert_eq!(Level::Warn.tag(), "WARN");
     assert!(Line::error("boom").render().contains("[ERROR] boom"));
+  }
+
+  #[test]
+  fn log_level_setting_roundtrips() {
+    for level in Level::CHOICES {
+      assert_eq!(Level::from_setting(level.setting()), level);
+    }
+    // Unknown values keep every line visible.
+    assert_eq!(Level::from_setting(""), Level::Debug);
+    assert_eq!(Level::from_setting("noise"), Level::Debug);
+    assert_eq!(Level::from_setting("WARN"), Level::Warn);
   }
 }

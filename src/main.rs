@@ -2,6 +2,7 @@
 // CLI subcommands re-attach to the launching terminal (see `attach_parent_console`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
 mod config;
 mod crypto;
 mod i18n;
@@ -25,22 +26,53 @@ use clap::{Parser, Subcommand};
 #[cfg(windows)]
 fn attach_parent_console() {
   use std::os::windows::io::AsRawHandle as _;
+  use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
   use windows_sys::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    SetStdHandle,
   };
+
+  /// A handle the launcher already set up (console, pipe or redirected file)
+  /// must win over `CONOUT$`: replacing it makes `thunet --version > file`
+  /// write to the console and leave the file empty.
+  fn inherited(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    !handle.is_null() && handle != INVALID_HANDLE_VALUE
+  }
 
   // SAFETY: plain Win32 calls; the opened handle is leaked on purpose so that
   // stdout/stderr stay valid for the rest of the process.
   unsafe {
+    // Read the handles *before* attaching: `AttachConsole` may replace the
+    // standard handles with the console's, which would undo a redirection.
+    let out_before = GetStdHandle(STD_OUTPUT_HANDLE);
+    let err_before = GetStdHandle(STD_ERROR_HANDLE);
+
     if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
       return;
     }
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-      let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-      SetStdHandle(STD_OUTPUT_HANDLE, handle);
-      SetStdHandle(STD_ERROR_HANDLE, handle);
-      std::mem::forget(file);
+
+    // Put back whatever the launcher provided (console, pipe or file).
+    if inherited(out_before) {
+      SetStdHandle(STD_OUTPUT_HANDLE, out_before);
     }
+    if inherited(err_before) {
+      SetStdHandle(STD_ERROR_HANDLE, err_before);
+    }
+    if inherited(out_before) && inherited(err_before) {
+      return;
+    }
+
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") else {
+      return;
+    };
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    if !inherited(out_before) {
+      SetStdHandle(STD_OUTPUT_HANDLE, handle);
+    }
+    if !inherited(err_before) {
+      SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+    std::mem::forget(file);
   }
 }
 
@@ -176,17 +208,19 @@ fn run(cli: Cli) -> Result<(), String> {
     cfg.ip = cli.ip.clone();
   }
 
-  let client = srun::Client::new(&cfg.host, cfg.https, Duration::from_secs(cli.timeout));
-
-  // No subcommand -> run the tray/window app.
+  // No subcommand -> run the tray/window app. The HTTP agent is only built for
+  // the CLI subcommands below, so launching the GUI does no network setup on
+  // the startup path (the worker thread owns its own client).
   let Some(cmd) = cli.cmd else {
     // A second launch only asks the running copy to show its window.
     let Some(_instance) = single::acquire() else {
       return Ok(());
     };
-    let minimized = cli.minimized || cfg.start_minimized;
+    let minimized = cli.minimized;
     return ui::run(cfg, minimized);
   };
+
+  let client = srun::Client::new(&cfg.host, cfg.https, Duration::from_secs(cli.timeout));
 
   match cmd {
     Cmd::Selftest => {

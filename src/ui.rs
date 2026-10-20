@@ -9,12 +9,12 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use auto_launch::{AutoLaunch, AutoLaunchBuilder, WindowsEnableMode};
 use eframe::egui;
 use serde_json::Value;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use crate::autostart::Autostart;
 use crate::config::Config;
 use crate::i18n::{Lang, Texts};
 use crate::logline::{Level, Line};
@@ -42,7 +42,63 @@ pub enum Ev {
     msg: String,
     kind: ToastKind,
   },
+  /// What the worker's network probe last saw; drives *Connect* availability.
+  Env(LoginEnv),
 }
+
+/// Where the machine sits, as far as logging in is concerned. The worker probes
+/// this and the UI greys *Connect* out when an attempt could not possibly work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginEnv {
+  /// A campus portal answered: logging in makes sense.
+  Campus,
+  /// The OS authenticates this Wi-Fi at layer 2 (802.1X); no portal involved.
+  EnterpriseWifi(String),
+  /// Nothing answered: no cable, no Wi-Fi, no route, DNS broken.
+  NoNetwork,
+  /// A captive portal that is not the campus one (hotel, airport, ...).
+  OtherPortal,
+  /// The internet works directly, so there is nothing to log in to.
+  NoPortal,
+}
+
+impl LoginEnv {
+  /// Is a login attempt possible here at all?
+  fn allows_login(&self) -> bool {
+    matches!(self, LoginEnv::Campus)
+  }
+
+  /// Why *Connect* is unavailable, or `None` on a campus network.
+  fn blocked_reason(&self, t: &Texts) -> Option<String> {
+    match self {
+      LoginEnv::Campus => None,
+      LoginEnv::EnterpriseWifi(ssid) => Some(t.secure_wifi.replacen("{}", ssid, 1)),
+      LoginEnv::NoNetwork => Some(t.network_unavailable.to_string()),
+      LoginEnv::OtherPortal => Some(t.not_campus_network.to_string()),
+      LoginEnv::NoPortal => Some(t.no_login_needed.to_string()),
+    }
+  }
+}
+
+/// Probe what the machine is attached to, plus the `ac_id` when a campus portal
+/// answered. The SSID check comes first: on an 802.1X network no portal request
+/// is worth making.
+fn probe_env(session: &Session) -> (LoginEnv, Option<String>) {
+  if let Some(ssid) = crate::wifi::no_portal_wifi() {
+    return (LoginEnv::EnterpriseWifi(ssid), None);
+  }
+  match session.net_env() {
+    NetEnv::Campus { ac_id } => (LoginEnv::Campus, Some(ac_id)),
+    NetEnv::Unreachable => (LoginEnv::NoNetwork, None),
+    NetEnv::OtherPortal => (LoginEnv::OtherPortal, None),
+    NetEnv::DirectInternet => (LoginEnv::NoPortal, None),
+  }
+}
+
+/// How often the network is re-probed while offline. A missing network makes
+/// every probe wait for its timeout, so that case backs off much further.
+const ENV_PROBE_MS: u64 = 15_000;
+const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
 
 #[derive(Default, Clone)]
 struct Info {
@@ -196,8 +252,10 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
   let has_creds = !session.cfg().username.is_empty() && !session.cfg().password.is_empty();
   let mut want_online = session.cfg().auto_connect && has_creds;
   if session.cfg().auto_connect && !has_creds {
-    tx.send(Ev::Log(Line::warn(lang.texts().need_credentials)))
-      .ok();
+    tx.send(Ev::Log(Line::warn(
+      "auto connect is on, but no account and password are saved",
+    )))
+    .ok();
   }
   let mut last_ka = Instant::now();
   let mut last_status = Instant::now() - Duration::from_secs(60);
@@ -214,9 +272,13 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
   // waiting out a backoff, which makes login start ~1 s after Wi-Fi connects.
   let mut next_link_check = Instant::now();
   let mut link_ready = false;
+  // What the last network probe saw, and when the next one is due. The attempt
+  // below reuses this verdict instead of probing again.
+  let mut last_env = LoginEnv::Campus;
+  let mut next_env_probe = Instant::now();
 
   for w in session.take_warnings() {
-    tx.send(Ev::Log(Line::info(w))).ok();
+    tx.send(Ev::Log(w)).ok();
   }
 
   loop {
@@ -231,7 +293,7 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
             }
             tx.send(Ev::State(session.state)).ok();
             tx.send(Ev::Error(None)).ok();
-            tx.send(Ev::Log(Line::info(t.already_online))).ok();
+            tx.send(Ev::Log(Line::info("already online"))).ok();
             tx.send(Ev::Notify {
               msg: t.already_online.into(),
               kind: ToastKind::Info,
@@ -253,7 +315,7 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
               tx.send(Ev::Info(v)).ok();
             }
             tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Log(Line::info(t.not_connected))).ok();
+            tx.send(Ev::Log(Line::info("not connected"))).ok();
             tx.send(Ev::Notify {
               msg: t.not_connected.into(),
               kind: ToastKind::Info,
@@ -262,7 +324,7 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
           } else {
             match session.logout() {
               Ok(m) => {
-                tx.send(Ev::Log(Line::info(format!("{}: {m}", t.disconnected))))
+                tx.send(Ev::Log(Line::info(format!("logged out: {m}"))))
                   .ok();
                 tx.send(Ev::Notify {
                   msg: t.disconnected.into(),
@@ -288,7 +350,7 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
             tx.send(Ev::Info(v)).ok();
             tx.send(Ev::State(session.state)).ok();
             tx.send(Ev::Error(None)).ok();
-            tx.send(Ev::Log(Line::info(t.status_refreshed))).ok();
+            tx.send(Ev::Log(Line::info("status refreshed"))).ok();
             tx.send(Ev::Notify {
               msg: t.status_refreshed.into(),
               kind: ToastKind::Ok,
@@ -307,7 +369,6 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
         },
         Cmd::SetLang(l) => {
           lang = l;
-          session.set_lang(l);
         }
         Cmd::SetCredentials { username, password } => {
           let ready = !username.is_empty() && !password.is_empty();
@@ -331,80 +392,127 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
       }
     }
 
+    // Probe the network on a timer, online or not: the answer is what greys out
+    // *Connect* off-campus, and it must not be 15 s stale after a Wi-Fi change.
+    if session.state != State::Online && Instant::now() >= next_env_probe {
+      let (env, ac_id) = probe_env(&session);
+      if let Some(ac_id) = ac_id {
+        session.set_ac_id(ac_id);
+      }
+      let wait = if env == LoginEnv::NoNetwork {
+        ENV_PROBE_OFFLINE_MS
+      } else {
+        ENV_PROBE_MS
+      };
+      next_env_probe = Instant::now() + Duration::from_millis(wait);
+      if env != last_env {
+        tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
+          .ok();
+      }
+      last_env = env.clone();
+      tx.send(Ev::Env(env)).ok();
+    }
+
+    // A login attempt without credentials can only be rejected, so say what is
+    // missing instead of POSTing an empty password to the portal. The attempt
+    // below is gated on the same flag, so nothing can reach the portal either
+    // way; this branch only decides what the user is told.
+    let missing_creds = session.cfg().username.is_empty() || session.cfg().password.is_empty();
+    if want_online && session.state != State::Online && missing_creds {
+      let log = "skipped: no account or password to log in with";
+      if last_failure != log {
+        last_failure = log.to_string();
+        tx.send(Ev::Log(Line::warn(log))).ok();
+        if user_connect {
+          tx.send(Ev::Notify {
+            msg: t.no_credentials.into(),
+            kind: ToastKind::Info,
+          })
+          .ok();
+          user_connect = false;
+        }
+      }
+    }
+
     // Fast link watch: retry the moment a usable route appears.
-    if want_online && session.state != State::Online && Instant::now() >= next_link_check {
+    if !missing_creds
+      && want_online
+      && session.state != State::Online
+      && Instant::now() >= next_link_check
+    {
       next_link_check = Instant::now() + Duration::from_secs(1);
       let up = crate::srun::link_up();
       if up && !link_ready {
         next_attempt = Instant::now();
         failures = 0;
         last_failure.clear();
+        // The network just changed: re-probe before the attempt below so the
+        // skip decision (and the Connect button) matches the new link.
+        next_env_probe = Instant::now();
       }
       link_ready = up;
     }
 
-    if want_online && session.state != State::Online && link_ready && Instant::now() >= next_attempt
+    if !missing_creds
+      && want_online
+      && session.state != State::Online
+      && link_ready
+      && Instant::now() >= next_attempt
     {
       // Never spray login attempts at a network where logging in cannot work:
       // enterprise Wi-Fi (802.1X), no cable/Wi-Fi, a network that already
-      // reaches the internet, or some other operator's captive portal.
-      let mut skip: Option<(String, Duration, ToastKind)> = None;
-      if let Some(ssid) = crate::wifi::no_portal_wifi() {
-        let text = t.secure_wifi.replacen("{}", &ssid, 1);
-        skip = Some((text, Duration::from_secs(60), ToastKind::Info));
-      }
-
-      let env = match skip {
-        Some(_) => None,
-        None => Some(session.net_env()),
-      };
-      if let Some(env) = env {
-        match env {
-          NetEnv::Campus { ac_id } => {
-            session.set_ac_id(ac_id);
-          }
-          NetEnv::Unreachable => {
+      // reaches the internet, or some other operator's captive portal. The probe
+      // at the top of the loop already decided which case this is.
+      let mut skip: Option<(String, String, Duration, ToastKind)> = None;
+      match last_env.clone() {
+        LoginEnv::Campus => {}
+        LoginEnv::EnterpriseWifi(ssid) => {
+          let text = t.secure_wifi.replacen("{}", &ssid, 1);
+          let log = format!("skipped: {ssid} authenticates at the OS level (802.1X)");
+          skip = Some((text, log, Duration::from_secs(60), ToastKind::Info));
+        }
+        LoginEnv::NoNetwork => {
+          skip = Some((
+            t.network_unavailable.to_string(),
+            "skipped: no network connection".to_string(),
+            Duration::from_secs(30),
+            ToastKind::Info,
+          ))
+        }
+        LoginEnv::OtherPortal => {
+          skip = Some((
+            t.not_campus_network.to_string(),
+            "skipped: this is not the campus portal".to_string(),
+            Duration::from_secs(60),
+            ToastKind::Info,
+          ))
+        }
+        LoginEnv::NoPortal => {
+          // The internet works without interception. Either the campus session
+          // is already authenticated, or this is a network that has no portal
+          // at all (another operator), in which case logging in is wrong.
+          let online = session
+            .refresh()
+            .map(|_| session.state)
+            .unwrap_or(State::Offline);
+          if online != State::Online {
             skip = Some((
-              t.network_unavailable.to_string(),
-              Duration::from_secs(30),
-              ToastKind::Info,
-            ))
-          }
-          NetEnv::OtherPortal => {
-            skip = Some((
-              t.not_campus_network.to_string(),
+              t.no_login_needed.to_string(),
+              "skipped: internet is reachable without a portal login".to_string(),
               Duration::from_secs(60),
               ToastKind::Info,
-            ))
-          }
-          NetEnv::DirectInternet => {
-            // The internet works without interception. Either the campus
-            // session is already authenticated, or this is a network that has
-            // no portal at all (another operator, or WPA-Enterprise Wi-Fi such
-            // as Tsinghua-Secure which the OS authenticates itself) - in which
-            // case logging in is wrong.
-            let online = session
-              .refresh()
-              .map(|_| session.state)
-              .unwrap_or(State::Offline);
-            if online != State::Online {
-              skip = Some((
-                t.no_login_needed.to_string(),
-                Duration::from_secs(60),
-                ToastKind::Info,
-              ));
-            }
+            ));
           }
         }
       }
 
-      if let Some((msg, delay, kind)) = skip {
+      if let Some((msg, log, delay, kind)) = skip {
         next_attempt = Instant::now() + delay;
         failures = 0;
         // Log (and toast) only when the reason changes, not on every retry.
-        if last_failure != msg {
-          last_failure = msg.clone();
-          tx.send(Ev::Log(Line::warn(&msg))).ok();
+        if last_failure != log {
+          last_failure = log.clone();
+          tx.send(Ev::Log(Line::warn(&log))).ok();
           if user_connect {
             tx.send(Ev::Notify { msg, kind }).ok();
             user_connect = false;
@@ -451,13 +559,25 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
       };
     }
 
-    if session.state == State::Online && last_status.elapsed() >= Duration::from_secs(15) {
+    // Ask the portal what is actually going on, online or not: the session may
+    // have been created elsewhere, and "no password saved" is not "offline".
+    let poll_every = if session.state == State::Online {
+      15
+    } else {
+      10
+    };
+    if last_status.elapsed() >= Duration::from_secs(poll_every) {
       if let Ok(v) = session.client().status(&session.cfg().ac_id) {
         let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
-        if !online {
+        if online && session.state != State::Online {
+          session.state = State::Online;
+          failures = 0;
+          tx.send(Ev::Log(Line::info("already online"))).ok();
+        } else if !online && session.state == State::Online {
           // Session ended outside our control (timeout / kicked / unplugged).
           session.state = State::Offline;
-          tx.send(Ev::Log(Line::warn(t.detected_offline))).ok();
+          tx.send(Ev::Log(Line::warn("session ended, now offline")))
+            .ok();
         }
         tx.send(Ev::Info(v)).ok();
       }
@@ -465,7 +585,9 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
     }
 
     if session.state == State::Online && last_ka.elapsed() >= keepalive {
-      if session.keepalive().is_err() {
+      // Without credentials there is nothing a failing keepalive could trigger
+      // but an empty-password login, so only report the state poll above.
+      if session.keepalive().is_err() && !missing_creds {
         let _ = session.ensure_online();
       }
       last_ka = Instant::now();
@@ -479,7 +601,7 @@ fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
     }
 
     for w in session.take_warnings() {
-      tx.send(Ev::Log(Line::info(w))).ok();
+      tx.send(Ev::Log(w)).ok();
     }
 
     std::thread::sleep(Duration::from_millis(400));
@@ -516,80 +638,118 @@ pub struct App {
   last_error: Option<String>,
   cfg: Config,
   lang: Lang,
-  autostart: Option<AutoLaunch>,
+  /// Lowest level rendered in the log pane; older lines are kept and simply
+  /// hidden, so raising the threshold again brings them back.
+  min_level: Level,
+  autostart: Option<Autostart>,
   autostart_on: bool,
   user_edit: String,
   pass_edit: String,
   remember: bool,
+  /// Last network verdict from the worker; decides whether *Connect* is usable.
+  env: LoginEnv,
   page: Page,
   toast: Option<Toast>,
-  tray: TrayIcon,
+  /// `None` when the platform refused to create a tray icon (no notification
+  /// area, e.g. inside a validation sandbox). The app then stays window-only:
+  /// closing quits instead of hiding, and a hidden start is not attempted.
+  tray: Option<TrayIcon>,
   connect_item: MenuItem,
   disconnect_item: MenuItem,
   autostart_item: CheckMenuItem,
-  desktop_item: MenuItem,
+  show_item: MenuItem,
+  hide_item: MenuItem,
+  quit_item: MenuItem,
   started: bool,
+  /// `--minimized`/`start_minimized`: the first painted frame must not be
+  /// left on screen (eframe shows the root window after it unconditionally).
+  hide_at_start: bool,
+  /// The root window is DWM-cloaked until the first real "show" request, so
+  /// eframe's forced first show never reaches the compositor.
+  cloaked: bool,
+  /// Mirrors the window state we asked the platform for. eframe does not track
+  /// visibility, so the app keeps its own idea of whether the window is up.
+  shown: bool,
   quitting: bool,
   quit_at: Option<Instant>,
 }
 
 /// Build the auto-launch entry; `--minimized` is only passed when the user
 /// asked the app to start hidden.
-fn autostart_entry(minimized: bool) -> Option<AutoLaunch> {
-  let exe = std::env::current_exe().ok()?;
-  let args: &[&str] = if minimized { &["--minimized"] } else { &[] };
-  AutoLaunchBuilder::new()
-    .set_app_name("thunet")
-    .set_app_path(&exe.to_string_lossy())
-    .set_args(args)
-    .set_windows_enable_mode(WindowsEnableMode::CurrentUser)
-    .build()
-    .ok()
+fn autostart_entry(minimized: bool) -> Option<Autostart> {
+  Autostart::new(minimized)
 }
 
 impl App {
   pub fn new(cfg: Config, minimized: bool, font: Option<&'static str>) -> Self {
+    // The root window already exists at this point (eframe creates it before
+    // calling the app creator) but has not been shown yet, so cloaking it here
+    // means the forced show after the first painted frame stays invisible.
+    if minimized {
+      cloak::set(true);
+    }
+
     let (tx, rx) = spawn_worker(cfg.clone());
     let lang = Lang::from_setting(&cfg.lang);
+    let min_level = Level::from_setting(&cfg.log_level);
     let t = lang.texts();
 
     let connect_item = MenuItem::with_id("connect", t.connect, true, None);
     let disconnect_item = MenuItem::with_id("disconnect", t.disconnect, true, None);
     let show_item = MenuItem::with_id("show", t.show_window, true, None);
+    let hide_item = MenuItem::with_id("hide", t.hide_window, true, None);
     let autostart_item = CheckMenuItem::with_id("autostart", t.autostart, true, false, None);
-    let desktop_item = MenuItem::with_id("desktop", t.desktop_shortcut, true, None);
     let quit_item = MenuItem::with_id("quit", t.quit, true, None);
     let menu = Menu::new();
     let _ = menu.append_items(&[&connect_item, &disconnect_item]);
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append_items(&[&show_item, &autostart_item]);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&desktop_item);
+    let _ = menu.append_items(&[&show_item, &hide_item, &autostart_item]);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit_item);
 
     let tray = TrayIconBuilder::new()
       .with_menu(Box::new(menu.clone()))
-      .with_tooltip(if minimized { "THUnet" } else { "THUnet" })
+      // The menu lives on the right button; a left click brings the window back.
+      .with_menu_on_left_click(false)
+      .with_tooltip("THUnet")
       .with_icon(make_icon([140, 140, 140]))
       .build()
-      .expect("tray icon");
+      .ok();
+    // Without a tray icon there is no way back into a hidden window, so an
+    // invisible start has to be cancelled and the window left on screen.
+    let start_hidden = minimized && tray.is_some();
+    if minimized && tray.is_none() {
+      cloak::set(false);
+    }
 
     let autostart = autostart_entry(cfg.start_minimized);
     let autostart_on = autostart
       .as_ref()
-      .and_then(|a| a.is_enabled().ok())
+      .map(Autostart::is_enabled)
       .unwrap_or(false);
     autostart_item.set_checked(autostart_on);
 
     // Surface where settings live; also proves the file exists on first run.
     let mut logs = vec![Line::info(format!(
-      "{}: {}",
-      t.config_path,
+      "config: {}",
       crate::config::path().display()
     ))];
+    // An entry written by an older release is rewritten once (on Windows this
+    // moves the `Run` value to a logon task, which fires earlier).
+    if autostart_on {
+      match autostart.as_ref().map(Autostart::migrate) {
+        Some(Ok(true)) => logs.push(Line::debug("autostart: moved to a logon task")),
+        Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
+        _ => {}
+      }
+    }
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
+    if tray.is_none() {
+      logs.push(Line::warn(
+        "tray: unavailable, the window stays visible and closing quits",
+      ));
+    }
     match font {
       Some(path) => logs.push(Line::debug(format!("CJK font: {path}"))),
       None => logs.push(Line::warn("no CJK font found; text may render as boxes")),
@@ -605,18 +765,27 @@ impl App {
       user_edit: cfg.username.clone(),
       pass_edit: cfg.password.clone(),
       remember: cfg.remember_password,
+      // Until the worker's first probe lands, assume a login is possible: a
+      // wrongly disabled button is worse than a click that reports why not.
+      env: LoginEnv::Campus,
       page: Page::Status,
       toast: None,
       cfg,
       lang,
+      min_level,
       autostart,
       autostart_on,
       tray,
       connect_item,
       disconnect_item,
       autostart_item,
-      desktop_item,
+      show_item,
+      hide_item,
+      quit_item,
       started: false,
+      hide_at_start: start_hidden,
+      cloaked: start_hidden,
+      shown: !start_hidden,
       quitting: false,
       quit_at: None,
     }
@@ -643,7 +812,9 @@ impl App {
     self.connect_item.set_text(t.connect);
     self.disconnect_item.set_text(t.disconnect);
     self.autostart_item.set_text(t.autostart);
-    self.desktop_item.set_text(t.desktop_shortcut);
+    self.show_item.set_text(t.show_window);
+    self.hide_item.set_text(t.hide_window);
+    self.quit_item.set_text(t.quit);
     self.tx.send(Cmd::SetLang(self.lang)).ok();
     if let Err(e) = self.cfg.save() {
       self.logs.push(Line::error(format!("config: {e}")));
@@ -657,7 +828,10 @@ impl App {
     self.cfg.remember_password = self.remember;
     match self.cfg.save() {
       Ok(()) => {
-        self.toast_ok(self.t().saved.to_string());
+        // Say what actually happened: unticking the checkbox deletes the stored
+        // credential instead of writing one.
+        let (msg, kind) = self.credentials_toast();
+        self.set_toast(msg.to_string(), kind);
         self
           .tx
           .send(Cmd::SetCredentials {
@@ -672,20 +846,47 @@ impl App {
     }
   }
 
-  fn toast_ok(&mut self, msg: String) {
+  /// Throw away the edits and go back to what is stored, which is what *Revert*
+  /// next to *Apply* does.
+  fn revert_credentials(&mut self) {
+    self.user_edit = self.cfg.username.clone();
+    self.pass_edit = self.cfg.password.clone();
+    self.remember = self.cfg.remember_password;
+    self.toast = None;
+  }
+
+  fn credentials_toast(&self) -> (&'static str, ToastKind) {
+    let t = self.t();
+    if !self.cfg.remember_password {
+      (t.password_cleared, ToastKind::Info)
+    } else if self.cfg.password.is_empty() {
+      (t.password_missing, ToastKind::Info)
+    } else {
+      (t.password_saved, ToastKind::Ok)
+    }
+  }
+
+  fn set_toast(&mut self, msg: String, kind: ToastKind) {
     self.toast = Some(Toast {
       msg,
       at: Instant::now(),
-      kind: ToastKind::Ok,
+      kind,
     });
   }
 
+  fn toast_ok(&mut self, msg: String) {
+    self.set_toast(msg, ToastKind::Ok);
+  }
+
   fn toast_err(&mut self, msg: String) {
-    self.toast = Some(Toast {
-      msg,
-      at: Instant::now(),
-      kind: ToastKind::Err,
-    });
+    self.set_toast(msg, ToastKind::Err);
+  }
+
+  /// Every switch in Settings reports the state it just moved to: nothing else
+  /// on screen changes, so a silent flip looks like it did nothing.
+  fn toast_toggle(&mut self, label: &'static str, on: bool) {
+    let state = if on { self.t().on } else { self.t().off };
+    self.set_toast(format!("{label}: {state}"), ToastKind::Info);
   }
 
   /// "Start minimised" and "start with the system" are independent settings,
@@ -708,13 +909,23 @@ impl App {
     }
     match failure {
       Some(msg) => self.toast_err(msg),
-      None => self.toast_ok(self.t().saved.to_string()),
+      None => self.toast_toggle(self.t().start_minimized, on),
     }
   }
 
-  fn show_window(&self, ctx: &egui::Context) {
+  fn show_window(&mut self, ctx: &egui::Context) {
+    if self.cloaked {
+      cloak::set(false);
+      self.cloaked = false;
+    }
+    self.shown = true;
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+  }
+
+  fn hide_window(&mut self, ctx: &egui::Context) {
+    self.shown = false;
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
   }
 
   fn handle_menu(&mut self, ctx: &egui::Context) {
@@ -737,19 +948,13 @@ impl App {
           }
           self.autostart_item.set_checked(self.autostart_on);
         }
-        "desktop" => match crate::shortcut::create_desktop_shortcut() {
-          Ok(()) => self.toast_ok(self.t().done.to_string()),
-          Err(e) => {
-            self.push_log(Line::error(&e));
-            self.toast_err(e);
-          }
-        },
         "quit" => {
           self.tx.send(Cmd::Quit).ok();
           self.quitting = true;
           self.quit_at = Some(Instant::now());
         }
         "show" => self.show_window(ctx),
+        "hide" => self.hide_window(ctx),
         _ => {}
       }
     }
@@ -769,11 +974,22 @@ impl App {
             kind,
           })
         }
+        Ev::Env(env) => self.env = env,
       }
     }
   }
 
   fn paint(&mut self, ui: &mut egui::Ui) {
+    // Only the frame that actually paints the log pane may claim it, so a right
+    // click on another page never looks like one on the log.
+    LogCopyClick::set_log_rect(ui.ctx(), egui::Rect::NOTHING);
+    // A right click on a log selection was redirected into a copy before the
+    // press could reach the labels (see `LogCopyClick`); the labels only pick
+    // the copy up while they are laid out, so inject it here.
+    if LogCopyClick::take_copy(ui.ctx()) {
+      ui.ctx().input_mut(|i| i.events.push(egui::Event::Copy));
+      self.toast_ok(self.t().copied.to_string());
+    }
     let t = self.t();
     let (label, rgb) = match self.state {
       State::Online => (t.online, color_for(State::Online)),
@@ -878,10 +1094,17 @@ impl App {
           ui.add_space(10.0);
           ui.horizontal(|ui| {
             let online = self.state == State::Online;
-            if ui
-              .add_enabled(!online, egui::Button::new(t.connect))
-              .clicked()
-            {
+            // Off-campus (or with no link at all) a login attempt can only be
+            // rejected, so the button is greyed out and says why on hover.
+            let blocked = self.env.blocked_reason(t);
+            let can_connect = !online && blocked.is_none();
+            let mut connect = ui.add_enabled(can_connect, egui::Button::new(t.connect));
+            // Only explain the greyed-out state when the network is the reason;
+            // while online the button is off for an obvious reason already.
+            if let (false, Some(why)) = (online, &blocked) {
+              connect = connect.on_disabled_hover_text(why);
+            }
+            if connect.clicked() {
               self.tx.send(Cmd::Connect).ok();
             }
             if ui
@@ -897,64 +1120,18 @@ impl App {
         } else {
           // Denser spacing: the settings page has to fit the fixed window.
           ui.spacing_mut().item_spacing.y = 4.0;
-          let mut auto = self.autostart_on;
-          if ui.checkbox(&mut auto, t.autostart).changed() {
-            self.autostart_on = auto;
-            if let Some(a) = &self.autostart {
-              if let Err(e) = if auto { a.enable() } else { a.disable() } {
-                self
-                  .logs
-                  .push(Line::error(format!("{}: {e}", t.autostart_failed)));
-              }
-            }
-          }
 
-          let mut start_min = self.cfg.start_minimized;
-          if ui.checkbox(&mut start_min, t.start_minimized).changed() {
-            self.apply_start_minimized(start_min);
-          }
-
-          let mut auto_conn = self.cfg.auto_connect;
-          if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
-            self.cfg.auto_connect = auto_conn;
-            self.tx.send(Cmd::SetAutoConnect(auto_conn)).ok();
-            let _ = self.cfg.save();
-          }
-
-          ui.add_space(2.0);
-          ui.separator();
-          ui.horizontal(|ui| {
-            ui.label(t.account);
-            ui.add(egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0));
-          });
-          ui.horizontal(|ui| {
-            ui.label(t.password);
-            ui.add(
-              egui::TextEdit::singleline(&mut self.pass_edit)
-                .password(true)
-                .desired_width(190.0),
-            );
-          });
-          ui.horizontal(|ui| {
-            if ui
-              .checkbox(&mut self.remember, t.remember_password)
-              .on_hover_text(t.remember_password_hint)
-              .changed()
-            {
-              self.toast = None;
-            }
-            if ui.button(t.save).clicked() {
-              self.apply_credentials();
-            }
-          });
-
-          ui.add_space(2.0);
+          // Language and log level lead the page: they are the two settings
+          // people look for first.
           let mut choice = match self.cfg.lang.as_str() {
             "zh" => 1,
             "en" => 2,
             _ => 0,
           };
-          let before = choice;
+          let before_lang = choice;
+          let before_level = self.min_level;
+          // Both combos share a row: the settings page has to fit the fixed
+          // window height.
           ui.horizontal(|ui| {
             ui.label(t.language);
             egui::ComboBox::from_id_salt("lang")
@@ -968,8 +1145,17 @@ impl App {
                 ui.selectable_value(&mut choice, 1, t.lang_zh);
                 ui.selectable_value(&mut choice, 2, t.lang_en);
               });
+            ui.add_space(10.0);
+            ui.label(t.log_level);
+            egui::ComboBox::from_id_salt("log-level")
+              .selected_text(self.min_level.tag())
+              .show_ui(ui, |ui| {
+                for level in Level::CHOICES {
+                  ui.selectable_value(&mut self.min_level, level, level.tag());
+                }
+              });
           });
-          if choice != before {
+          if choice != before_lang {
             let setting = match choice {
               1 => "zh",
               2 => "en",
@@ -977,15 +1163,126 @@ impl App {
             };
             self.apply_lang_setting(setting);
           }
-        }
+          if self.min_level != before_level {
+            self.cfg.log_level = self.min_level.setting().to_string();
+            let _ = self.cfg.save();
+          }
 
-        if self.page == Page::Status && !self.logs.is_empty() {
+          ui.add_space(2.0);
+          let mut auto = self.autostart_on;
+          if ui.checkbox(&mut auto, t.autostart).changed() {
+            self.autostart_on = auto;
+            let failure = match &self.autostart {
+              Some(a) => (if auto { a.enable() } else { a.disable() })
+                .err()
+                .map(|e| format!("{}: {e}", t.autostart_failed)),
+              None => Some(t.autostart_failed.to_string()),
+            };
+            match failure {
+              Some(msg) => {
+                self.push_log(Line::error(&msg));
+                self.toast_err(msg);
+              }
+              None => self.toast_toggle(t.autostart, auto),
+            }
+          }
+
+          let mut start_min = self.cfg.start_minimized;
+          if ui.checkbox(&mut start_min, t.start_minimized).changed() {
+            self.apply_start_minimized(start_min);
+          }
+
+          let mut auto_conn = self.cfg.auto_connect;
+          if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
+            self.cfg.auto_connect = auto_conn;
+            self.tx.send(Cmd::SetAutoConnect(auto_conn)).ok();
+            match self.cfg.save() {
+              Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
+              Err(e) => self.toast_err(e),
+            }
+          }
+
+          ui.add_space(2.0);
+          if ui.button(t.desktop_shortcut).clicked() {
+            match crate::shortcut::create_desktop_shortcut() {
+              Ok(()) => self.toast_ok(t.done.to_string()),
+              Err(e) => {
+                self.push_log(Line::error(&e));
+                self.toast_err(e);
+              }
+            }
+          }
+
+          ui.add_space(2.0);
+          ui.separator();
+          // Comment on each field separately: the marker belongs next to the
+          // input that actually differs from what is stored.
+          let stored =
+            CredentialEdits::new(&self.user_edit, &self.pass_edit, self.remember, &self.cfg);
+          ui.horizontal(|ui| {
+            ui.label(t.account);
+            ui.add(egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0));
+            if stored.username {
+              unsaved_marker(ui, t);
+            }
+          });
+          ui.horizontal(|ui| {
+            ui.label(t.password);
+            ui.add(
+              egui::TextEdit::singleline(&mut self.pass_edit)
+                .password(true)
+                .desired_width(190.0),
+            );
+            if stored.password {
+              unsaved_marker(ui, t);
+            }
+          });
+          ui.horizontal(|ui| {
+            if ui
+              .checkbox(&mut self.remember, t.remember_password)
+              .on_hover_text(if cfg!(windows) {
+                t.remember_password_hint
+              } else {
+                t.remember_password_hint_file
+              })
+              .changed()
+            {
+              self.toast = None;
+            }
+            // This row is the only one that does not save as you type, so the
+            // button shows when there is anything left to apply.
+            let mut apply = egui::Button::new(t.apply);
+            if stored.any() {
+              apply = apply.fill(ui.visuals().selection.bg_fill);
+            }
+            if ui.add(apply).clicked() {
+              self.apply_credentials();
+            }
+            // Cancelling an edit only makes sense while a password is actually
+            // remembered: without one there is nothing to restore.
+            if ui
+              .add_enabled(self.remember, egui::Button::new(t.revert))
+              .on_hover_text(t.revert_hint)
+              .clicked()
+            {
+              self.revert_credentials();
+            }
+            if stored.remember {
+              unsaved_marker(ui, t);
+            }
+          });
+        }
+        let visible: Vec<&Line> = self
+          .logs
+          .iter()
+          .filter(|l| l.level >= self.min_level)
+          .collect();
+        if self.page == Page::Status && !visible.is_empty() {
           ui.add_space(8.0);
           ui.separator();
-          let everything = self
-            .logs
+          let everything = visible
             .iter()
-            .map(Line::render)
+            .map(|l| l.render())
             .collect::<Vec<_>>()
             .join("\n");
           // The context menu cannot call back into `self`, so record the
@@ -995,7 +1292,7 @@ impl App {
           // the only elastic element, so no empty band is left underneath it.
           let pane_w = ui.available_width();
           let pane_h = ui.available_height().max(60.0);
-          ui.allocate_ui_with_layout(
+          let pane = ui.allocate_ui_with_layout(
             egui::vec2(pane_w, pane_h),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
@@ -1003,12 +1300,15 @@ impl App {
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                  for line in &self.logs {
+                  for line in &visible {
                     let color = {
                       let visuals = ui.visuals();
                       level_color(line.level, visuals)
                     };
                     let resp = ui.add(log_entry(ui, line.render(), color));
+                    // A right click on a selection is turned into a copy before
+                    // egui sees it (`LogCopyClick`), so this menu only shows up
+                    // when nothing is selected.
                     resp.context_menu(|ui| {
                       if ui.button(t.copy_line).clicked() {
                         copy_request = Some(line.render());
@@ -1023,12 +1323,31 @@ impl App {
                 });
             },
           );
+          LogCopyClick::set_log_rect(ui.ctx(), pane.response.rect);
           if let Some(text) = copy_request {
             ui.ctx().copy_text(text);
             self.toast_ok(self.t().copied.to_string());
           }
         }
 
+        // The settings page ends with a build stamp pinned to the bottom edge:
+        // laying it out bottom-up puts it at the panel edge without having to
+        // guess its height.
+        if self.page == Page::Settings {
+          ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(2.0);
+            // Version on the left, build time on the right: they answer
+            // different questions, so the two ends of the strip read better
+            // than one run-on line.
+            ui.horizontal(|ui| {
+              ui.label(egui::RichText::new(build_version()).small().weak());
+              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(build_time_label(t)).small().weak());
+              });
+            });
+            ui.separator();
+          });
+        }
         // Consume the leftover vertical space so the frame background reaches
         // the bottom edge instead of leaving an unpainted band.
         let rest = ui.available_height();
@@ -1044,6 +1363,129 @@ fn dash(s: &str) -> String {
     "-".to_string()
   } else {
     s.to_string()
+  }
+}
+
+/// Which part of the account row differs from what is stored. The other
+/// settings save as they change; this row only commits on *Apply*, and each
+/// field carries its own marker so the reader can see what is unsaved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CredentialEdits {
+  username: bool,
+  password: bool,
+  remember: bool,
+}
+
+impl CredentialEdits {
+  fn new(user_edit: &str, pass_edit: &str, remember: bool, cfg: &Config) -> Self {
+    Self {
+      // Applying trims the account, so a stray space is not a change.
+      username: user_edit.trim() != cfg.username,
+      password: pass_edit != cfg.password,
+      remember: remember != cfg.remember_password,
+    }
+  }
+
+  fn any(self) -> bool {
+    self.username || self.password || self.remember
+  }
+}
+
+/// Small "Unsaved" hint placed next to the input it belongs to.
+fn unsaved_marker(ui: &mut egui::Ui, t: &Texts) {
+  ui.label(
+    egui::RichText::new(t.unsaved)
+      .small()
+      .color(ui.visuals().warn_fg_color),
+  );
+}
+
+/// Is any label text selected in this viewport? egui keeps label selections in
+/// a context plugin; the selected characters are only assembled while the
+/// labels are laid out, which is why a copy is queued as an event.
+fn has_label_selection(ctx: &egui::Context) -> bool {
+  ctx
+    .plugin_opt::<egui::text_selection::LabelSelectionState>()
+    .is_some_and(|plugin| plugin.lock().has_selection())
+}
+
+/// Turns a right click on a log selection into a copy.
+///
+/// egui cannot do this by itself: any mouse press over a selectable label
+/// collapses the selection to a caret (`ViewportLabelSelectionState::on_label`,
+/// which reacts to `pointer.any_pressed()`, not just the primary button), and
+/// `selected_text` treats such an empty range as "the whole label" — which is
+/// why a right click used to copy the entire line instead of the selection.
+///
+/// The press is therefore removed from the raw input before egui processes it,
+/// and the frame that follows injects `Event::Copy`, so the labels copy the
+/// selection while it is still intact. The selection also stays visible.
+struct LogCopyClick {
+  /// A right click was redirected; the next painted frame injects the copy.
+  copy_pending: bool,
+  /// The release belonging to a swallowed press still has to be dropped.
+  swallow_release: bool,
+  /// The log pane in global coordinates, as laid out by the previous frame.
+  log_rect: egui::Rect,
+}
+
+impl Default for LogCopyClick {
+  fn default() -> Self {
+    Self {
+      copy_pending: false,
+      swallow_release: false,
+      log_rect: egui::Rect::NOTHING,
+    }
+  }
+}
+
+impl LogCopyClick {
+  /// Consume a redirected right click.
+  fn take_copy(ctx: &egui::Context) -> bool {
+    ctx
+      .plugin_opt::<Self>()
+      .is_some_and(|plugin| std::mem::take(&mut plugin.lock().copy_pending))
+  }
+
+  fn set_log_rect(ctx: &egui::Context, rect: egui::Rect) {
+    if let Some(plugin) = ctx.plugin_opt::<Self>() {
+      plugin.lock().log_rect = rect;
+    }
+  }
+}
+
+impl egui::plugin::Plugin for LogCopyClick {
+  fn debug_name(&self) -> &'static str {
+    "LogCopyClick"
+  }
+
+  fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+    if !has_label_selection(ctx) {
+      self.swallow_release = false;
+      return;
+    }
+    input.events.retain(|event| {
+      let egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        ..
+      } = event
+      else {
+        return true;
+      };
+      if !pressed {
+        // Only the release of a press taken above is dropped; without a
+        // matching press it cannot become a secondary click anyway.
+        return !std::mem::take(&mut self.swallow_release);
+      }
+      if self.log_rect.contains(*pos) {
+        self.copy_pending = true;
+        self.swallow_release = true;
+        return false;
+      }
+      true
+    });
   }
 }
 
@@ -1076,6 +1518,310 @@ fn log_entry(ui: &egui::Ui, text: String, color: egui::Color32) -> egui::Label {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Right-clicking a log selection relies on egui copying label selections
+  /// when a `Copy` event is present while it lays the labels out. This pins
+  /// that behaviour (and the fact that a right-click keeps the selection).
+  #[test]
+  fn copy_event_copies_the_label_selection() {
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    let ctx = egui::Context::default();
+    let run = |ctx: &egui::Context, events: Vec<Event>| {
+      let input = RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(240.0, 120.0))),
+        events,
+        ..Default::default()
+      };
+      let mut out = ctx.run_ui(input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
+          ui.add(egui::Label::new("hello selection").selectable(true));
+        });
+      });
+      // Nothing here uploads textures; dropping them unapplied would panic.
+      out.textures_delta.clear();
+      out
+    };
+    let press = |pressed, pos: Pos2| Event::PointerButton {
+      pos,
+      button: PointerButton::Primary,
+      pressed,
+      modifiers: Default::default(),
+    };
+
+    // Lay out once, then drag over the text to select it.
+    let _ = run(&ctx, vec![]);
+    let start = pos2(12.0, 12.0);
+    let end = pos2(70.0, 12.0);
+    let _ = run(&ctx, vec![Event::PointerMoved(start)]);
+    let _ = run(&ctx, vec![press(true, start)]);
+    let _ = run(&ctx, vec![Event::PointerMoved(end)]);
+    let _ = run(&ctx, vec![press(false, end)]);
+    assert!(
+      has_label_selection(&ctx),
+      "drag should select the label text"
+    );
+
+    // A right-click keeps the selection (that is what makes the log menu skippable) ...
+    let _ = run(
+      &ctx,
+      vec![Event::PointerButton {
+        pos: end,
+        button: PointerButton::Secondary,
+        pressed: true,
+        modifiers: Default::default(),
+      }],
+    );
+    assert!(
+      has_label_selection(&ctx),
+      "a right-click must not clear the selection"
+    );
+
+    // ... and the queued copy event then yields the selected text.
+    let out = run(&ctx, vec![Event::Copy]);
+    let copied = out
+      .platform_output
+      .commands
+      .iter()
+      .find_map(|cmd| match cmd {
+        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+        _ => None,
+      });
+    let copied = copied.expect("a Copy event should produce clipboard output");
+    assert!(
+      copied.contains("hello"),
+      "copied text should be the selection, got {copied:?}"
+    );
+  }
+
+  #[test]
+  fn tray_click_bursts_map_to_show_and_hide() {
+    // A lone click waits for the deadline before it shows anything.
+    assert_eq!(click_outcome(1, 0, 500), None);
+    assert_eq!(click_outcome(1, 499, 500), None);
+    assert_eq!(click_outcome(1, 500, 500), Some(true));
+    // A second click inside the deadline hides the window.
+    assert_eq!(click_outcome(2, 0, 500), Some(false));
+    assert_eq!(click_outcome(2, 499, 500), Some(false));
+    // Nothing pending.
+    assert_eq!(click_outcome(0, 900, 500), None);
+    // `0` means "no previous click", so the first click is never a double one.
+    assert!(!is_double_click(0, 10, 500));
+    assert!(is_double_click(10, 510, 500));
+    assert!(!is_double_click(10, 511, 500));
+  }
+
+  /// Right-clicking a log selection must copy only the selection. egui collapses
+  /// a label selection as soon as any button is pressed over it, so `LogCopyClick`
+  /// removes that press from the raw input and lets the labels copy the intact
+  /// range — this pins that end-to-end behaviour.
+  #[test]
+  fn right_click_copies_only_the_selection() {
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    let ctx = egui::Context::default();
+    ctx.add_plugin(LogCopyClick::default());
+    let run = |ctx: &egui::Context, events: Vec<Event>| {
+      let input = RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(240.0, 120.0))),
+        events,
+        ..Default::default()
+      };
+      let mut out = ctx.run_ui(input, |ui| {
+        let pane = egui::CentralPanel::default().show(ui, |ui| {
+          ui.add(log_entry(
+            ui,
+            "abcd efgh ijkl".to_string(),
+            egui::Color32::WHITE,
+          ));
+          ui.add(log_entry(
+            ui,
+            "second line here".to_string(),
+            egui::Color32::WHITE,
+          ));
+        });
+        LogCopyClick::set_log_rect(ui.ctx(), pane.response.rect);
+      });
+      out.textures_delta.clear();
+      out
+    };
+    let button = |pressed, button, pos: Pos2| Event::PointerButton {
+      pos,
+      button,
+      pressed,
+      modifiers: Default::default(),
+    };
+    let copied = |out: &egui::FullOutput| {
+      out
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|cmd| match cmd {
+          egui::OutputCommand::CopyText(t) => Some(t.clone()),
+          _ => None,
+        })
+    };
+
+    let _ = run(&ctx, vec![]);
+    let start = pos2(9.0, 10.0);
+    let end = pos2(24.0, 10.0);
+    let _ = run(&ctx, vec![Event::PointerMoved(start)]);
+    let _ = run(&ctx, vec![button(true, PointerButton::Primary, start)]);
+    let _ = run(&ctx, vec![Event::PointerMoved(end)]);
+    let _ = run(&ctx, vec![button(false, PointerButton::Primary, end)]);
+    assert!(has_label_selection(&ctx), "drag should select some text");
+
+    // The right click is redirected into a copy, and the press never reaches egui.
+    let _ = run(&ctx, vec![button(true, PointerButton::Secondary, end)]);
+    assert!(
+      LogCopyClick::take_copy(&ctx),
+      "the right click should request a copy"
+    );
+    let _ = run(&ctx, vec![button(false, PointerButton::Secondary, end)]);
+
+    let out = run(&ctx, vec![Event::Copy]);
+    let copied = copied(&out).expect("the copy event should reach the clipboard");
+    assert_eq!(
+      copied, "abc",
+      "only the selected characters may be copied, not the whole line"
+    );
+    assert!(
+      has_label_selection(&ctx),
+      "the selection should stay visible after the copy"
+    );
+  }
+
+  #[test]
+  fn credential_edits_flag_the_field_that_changed() {
+    let cfg = Config {
+      username: "alice".into(),
+      password: "pw".into(),
+      remember_password: true,
+      ..Config::default()
+    };
+    let same = CredentialEdits::new("alice", "pw", true, &cfg);
+    assert_eq!(same, CredentialEdits::default(), "unchanged");
+    assert!(!same.any());
+    // A stray space is trimmed away when applying, so it is not a change.
+    assert!(!CredentialEdits::new("  alice  ", "pw", true, &cfg).username);
+
+    let user = CredentialEdits::new("other", "pw", true, &cfg);
+    assert!(user.username && !user.password && !user.remember);
+    let pass = CredentialEdits::new("alice", "pw2", true, &cfg);
+    assert!(!pass.username && pass.password && !pass.remember);
+    let remember = CredentialEdits::new("alice", "pw", false, &cfg);
+    assert!(!remember.username && !remember.password && remember.remember);
+    assert!(remember.any());
+  }
+
+  /// Toasts used to break over two lines because the area is sized from the
+  /// previous frame; a short message must stay on one line, a long one may wrap
+  /// but has to stay inside the window.
+  #[test]
+  fn toast_wraps_only_when_it_has_to() {
+    fn area_of(msg: &str) -> egui::Rect {
+      let ctx = egui::Context::default();
+      let frame = |ctx: &egui::Context| {
+        let input = egui::RawInput {
+          screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(420.0, 300.0),
+          )),
+          ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+          let toast = Toast {
+            msg: msg.to_owned(),
+            at: Instant::now(),
+            kind: ToastKind::Ok,
+          };
+          paint_toast(ui.ctx(), Some(&toast));
+        });
+        out.textures_delta.clear();
+      };
+      // The second pass uses the size measured by the first one.
+      frame(&ctx);
+      frame(&ctx);
+      ctx
+        .memory(|m| m.area_rect(egui::Id::unique("thunet_toast")))
+        .expect("the toast area should exist")
+    }
+
+    let short = area_of("Password saved");
+    assert!(short.height() < 40.0, "must stay on one line: {short:?}");
+    assert!(short.width() < 200.0, "must hug the text: {short:?}");
+
+    let long = area_of("No network connection (cable unplugged / Wi-Fi down), not logging in");
+    assert!(long.width() <= 420.0, "must stay in the window: {long:?}");
+    assert!(long.height() > short.height(), "must wrap: {long:?}");
+  }
+
+  /// The footer is the only place the build date shows, so pin its shape:
+  /// `THUnet <version>` on the left, `Built at YYYY-MM-DD HH:MM:SS +HH:MM` right.
+  #[test]
+  fn build_stamp_ends_with_a_seconds_precision_local_time() {
+    let version = build_version();
+    assert_eq!(
+      version,
+      format!(
+        "{} {}",
+        crate::shortcut::APP_TITLE,
+        env!("CARGO_PKG_VERSION")
+      ),
+      "the left half is name plus version"
+    );
+
+    let label = build_time_label(crate::i18n::Lang::En.texts());
+    let rest = label.strip_prefix("Built at ").expect(&label);
+    let (date, rest) = rest.split_once(' ').expect("date first: {rest}");
+    let (clock, offset) = rest.split_once(' ').expect("offset last: {rest}");
+    assert_eq!(date.len(), 10, "{label}");
+    assert_eq!(clock.len(), 8, "seconds are part of the stamp: {label}");
+    assert_eq!(offset.len(), 6, "numeric UTC offset: {label}");
+    assert!(
+      offset.starts_with(['+', '-']) && offset.as_bytes()[3] == b':',
+      "{label}"
+    );
+
+    let shaped = |s: &str, sep: char, seps: &[usize]| {
+      s.chars().enumerate().all(|(i, c)| {
+        if seps.contains(&i) {
+          c == sep
+        } else {
+          c.is_ascii_digit()
+        }
+      })
+    };
+    assert!(shaped(date, '-', &[4, 7]), "{label}");
+    assert!(shaped(clock, ':', &[2, 5]), "{label}");
+    assert!(shaped(&offset[1..], ':', &[2]), "{label}");
+  }
+
+  /// Off-campus networks must leave *Connect* disabled with an explanation;
+  /// only a campus portal makes a login attempt possible.
+  #[test]
+  fn only_a_campus_network_allows_connect() {
+    let t = crate::i18n::Lang::En.texts();
+    assert!(LoginEnv::Campus.allows_login());
+    assert_eq!(LoginEnv::Campus.blocked_reason(t), None);
+
+    let blocked = [
+      LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
+      LoginEnv::NoNetwork,
+      LoginEnv::OtherPortal,
+      LoginEnv::NoPortal,
+    ];
+    for env in &blocked {
+      assert!(!env.allows_login(), "{env:?}");
+      let why = env.blocked_reason(t).expect("a reason has to be shown");
+      assert!(!why.trim().is_empty(), "{env:?}");
+    }
+
+    // The SSID is named in the hint instead of leaving its placeholder behind.
+    let hint = blocked[0].blocked_reason(t).unwrap_or_default();
+    assert!(hint.contains("Tsinghua-Secure"), "{hint}");
+    assert!(!hint.contains("{}"), "{hint}");
+  }
 
   #[test]
   fn placeholder_addresses_are_empty() {
@@ -1110,7 +1856,42 @@ impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     if !self.started {
       self.started = true;
+      // Started visible: make sure the window is not left behind the app that
+      // was on screen (the usual case when an installer launches it).
+      if self.shown {
+        foreground::raise(crate::shortcut::APP_TITLE);
+      }
       // The worker reads `auto_connect` itself on startup.
+      if let Some(start) = STARTED.get() {
+        self.push_log(Line::debug(format!(
+          "startup: {} ms to tray",
+          start.elapsed().as_millis()
+        )));
+      }
+    }
+
+    // eframe always calls `Window::set_visible(true)` after the first painted
+    // frame, ignoring `ViewportBuilder::with_visible(false)` (its viewport info
+    // does not track visibility). So when the app was asked to start in the
+    // tray, hide the window again in the same event-loop pass: the commands
+    // sent from `logic` are applied *after* that forced show, before the
+    // desktop compositor gets a chance to put the window on screen.
+    if self.hide_at_start {
+      self.hide_at_start = false;
+      self.hide_window(ctx);
+    }
+
+    // A second launch rings the doorbell instead of calling `ShowWindow` on
+    // our window (which would desynchronise winit's cached visibility).
+    if crate::single::show_requested() {
+      self.show_window(ctx);
+    }
+
+    // A left click on the tray icon shows the window, a double click hides it.
+    match tray_click() {
+      Some(true) => self.show_window(ctx),
+      Some(false) => self.hide_window(ctx),
+      None => {}
     }
 
     self.handle_menu(ctx);
@@ -1128,10 +1909,15 @@ impl eframe::App for App {
     if ctx.input(|i| i.viewport().close_requested()) {
       if self.quitting {
         // Programmatic close from the tray "Quit" item: let it through.
-      } else {
+      } else if self.tray.is_some() {
         // Closing the window only hides it to the tray.
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hide_window(ctx);
+      } else {
+        // No tray icon: hiding would leave the app unreachable, so close quits.
+        self.tx.send(Cmd::Quit).ok();
+        self.quitting = true;
+        self.quit_at = Some(Instant::now());
       }
     }
     if self.quitting {
@@ -1148,20 +1934,28 @@ impl eframe::App for App {
 
     // Keep ticking while hidden so tray clicks are still processed.
     let rgb = color_for(self.state);
-    let _ = self.tray.set_icon(Some(make_icon(rgb)));
+    if let Some(tray) = &self.tray {
+      let _ = tray.set_icon(Some(make_icon(rgb)));
+    }
     let t = self.t();
     let tip = match self.state {
       State::Online => format!("THUnet · {} · {}", t.online, dash(&self.info.ip4)),
       State::Authenticating => format!("THUnet · {}", t.authenticating),
       State::Offline => format!("THUnet · {}", t.offline),
     };
-    let _ = self.tray.set_tooltip(Some(&tip));
-    self.connect_item.set_enabled(self.state != State::Online);
+    if let Some(tray) = &self.tray {
+      let _ = tray.set_tooltip(Some(&tip));
+    }
+    self
+      .connect_item
+      .set_enabled(self.state != State::Online && self.env.allows_login());
     self
       .disconnect_item
       .set_enabled(self.state == State::Online);
 
-    ctx.request_repaint_after(Duration::from_millis(500));
+    // When hidden, wake up often enough to pick up a second launch quickly.
+    let tick = if self.shown { 500 } else { 200 };
+    ctx.request_repaint_after(Duration::from_millis(tick));
   }
 
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1171,9 +1965,37 @@ impl eframe::App for App {
 }
 
 const DEFAULT_WIDTH: f32 = 420.0;
-/// Fixed client height: tall enough for the denser settings page, tight enough
-/// that the status page has no dead space.
+/// Fixed client height: tall enough for the denser settings page (including
+/// its log-level row and the build stamp), tight enough that the status page
+/// has no dead space.
 const WINDOW_HEIGHT: f32 = 300.0;
+
+/// Local time of the compile that produced this binary, to the second, with the
+/// numeric UTC offset so "local" needs no further qualification. `build.rs`
+/// stamps the epoch; the conversion happens here, in the timezone of whoever is
+/// looking at the window.
+fn build_time() -> String {
+  use chrono::TimeZone;
+  let epoch = env!("THUNET_BUILD_EPOCH").parse::<i64>().unwrap_or(0);
+  match chrono::Local.timestamp_opt(epoch, 0).single() {
+    Some(t) => t.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
+    None => "unknown".to_string(),
+  }
+}
+
+/// Left half of the settings footer: name plus version.
+fn build_version() -> String {
+  format!(
+    "{} {}",
+    crate::shortcut::APP_TITLE,
+    env!("CARGO_PKG_VERSION")
+  )
+}
+
+/// Right half of the settings footer: what the build time actually is.
+fn build_time_label(t: &Texts) -> String {
+  format!("{} {}", t.built, build_time())
+}
 
 /// Floating feedback strip so both "copied" and "saved" are visible
 /// regardless of where the triggering widget sits.
@@ -1196,15 +2018,24 @@ fn paint_toast(ctx: &egui::Context, toast: Option<&Toast>) {
       egui::Color32::from_rgb(30, 62, 105),
     ),
   };
+  // An area wraps its content at the width it had in the previous frame; the
+  // default is narrow enough that even a two-word toast broke over two lines.
+  // Give it the window width (minus a margin) so short messages stay on one
+  // line and only genuinely long ones wrap or get clipped at the edge.
+  let max_w = (ctx.content_rect().width() - 32.0).max(120.0);
   egui::Area::new(egui::Id::unique("thunet_toast"))
     .order(egui::Order::Foreground)
     .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
+    .default_width(max_w)
     .show(ctx, |ui| {
       egui::Frame::new()
         .fill(bg)
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
+          // The area sizes itself from the previous frame, so the label has to
+          // be told how wide it may become or a short message breaks in two.
+          ui.set_max_width(max_w);
           ui.label(egui::RichText::new(&tst.msg).color(fg));
         });
     });
@@ -1248,7 +2079,199 @@ fn install_fonts(ctx: &egui::Context) -> Option<&'static str> {
   None
 }
 
+/// Keeps the window out of the compositor while the app is supposed to live in
+/// the tray only.
+///
+/// eframe shows the root window right after painting its first frame (its
+/// viewport info never tracks visibility), and only then applies the
+/// `Visible(false)` command sent from `logic`. Skipping that show entirely is
+/// not possible through egui, so on Windows the window is cloaked instead:
+/// it can still be "shown", but the desktop compositor never draws it.
+#[cfg(windows)]
+mod cloak {
+  use windows_sys::Win32::Foundation::HWND;
+  use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+  use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+  use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+
+  fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+  }
+
+  /// Our own top-level window (there is only one per process).
+  fn hwnd() -> Option<HWND> {
+    let title = wide("THUnet");
+    // SAFETY: plain Win32 queries on a title we own.
+    unsafe {
+      let h = FindWindowW(std::ptr::null(), title.as_ptr());
+      if h.is_null() {
+        return None;
+      }
+      let mut pid = 0u32;
+      GetWindowThreadProcessId(h, &mut pid);
+      (pid == GetCurrentProcessId()).then_some(h)
+    }
+  }
+
+  pub fn set(cloaked: bool) {
+    let Some(h) = hwnd() else { return };
+    let value: i32 = i32::from(cloaked);
+    // SAFETY: `value` is a BOOL, which is what DWMWA_CLOAK expects.
+    unsafe {
+      DwmSetWindowAttribute(
+        h,
+        DWMWA_CLOAK as u32,
+        (&value as *const i32).cast(),
+        size_of::<i32>() as u32,
+      );
+    }
+  }
+}
+
+#[cfg(not(windows))]
+mod cloak {
+  pub fn set(_cloaked: bool) {}
+}
+
+/// Windows keeps the foreground with the process that owns the last input
+/// event, so a copy started by an installer (or by another program) opens
+/// behind whatever is on screen and can look like it never started. Raise the
+/// window once; when Windows still refuses, flash the taskbar button.
+#[cfg(windows)]
+mod foreground {
+  use std::mem::size_of;
+
+  use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+  use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FindWindowW, FlashWindowEx, GetWindowThreadProcessId,
+    SetForegroundWindow,
+  };
+
+  fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+  }
+
+  pub fn raise(title: &str) {
+    let title = wide(title);
+    // SAFETY: plain Win32 calls on a window whose pid is checked below.
+    unsafe {
+      let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+      if hwnd.is_null() {
+        return;
+      }
+      let mut pid = 0u32;
+      GetWindowThreadProcessId(hwnd, &mut pid);
+      if pid != GetCurrentProcessId() {
+        return;
+      }
+      if SetForegroundWindow(hwnd) != 0 {
+        return;
+      }
+      let flash = FLASHWINFO {
+        cbSize: size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+        uCount: 3,
+        dwTimeout: 0,
+      };
+      FlashWindowEx(&flash);
+    }
+  }
+}
+
+#[cfg(not(windows))]
+mod foreground {
+  pub fn raise(_title: &str) {}
+}
+
+/// Entry time of `run`, for the "startup: N ms to tray" log line.
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Left clicks counted in the current burst: 0 = nothing pending, 1 = one click
+/// waiting for the double-click deadline, 2 = a double click.
+static CLICKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// When the latest left click arrived, in ms since `STARTED`; 0 = no click yet.
+static LAST_CLICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+  // 0 is the "no click yet" sentinel, so the clock starts at 1.
+  STARTED
+    .get()
+    .map_or(0, |s| s.elapsed().as_millis() as u64 + 1)
+}
+
+/// A second left click inside this window counts as a double click. 300 ms is
+/// snappier than the 500 ms most desktops use; the delay is a compromise, since
+/// a single click can only be acted on once no second click can follow.
+const DOUBLE_CLICK_MS: u64 = 300;
+
+/// Does the click at `now` follow `previous` closely enough to be the second
+/// half of a double click? `previous == 0` means there was no click.
+fn is_double_click(previous: u64, now: u64, deadline: u64) -> bool {
+  previous != 0 && now.saturating_sub(previous) <= deadline
+}
+
+/// What a pending click burst means: `None` waits for the deadline to pass,
+/// `Some(true)` shows the window, `Some(false)` hides it.
+fn click_outcome(clicks: u8, since_last: u64, deadline: u64) -> Option<bool> {
+  match clicks {
+    2 => Some(false),
+    1 if since_last >= deadline => Some(true),
+    _ => None,
+  }
+}
+
+/// Consume the pending left click, if it can be resolved already.
+fn tray_click() -> Option<bool> {
+  use std::sync::atomic::Ordering;
+
+  let since_last = now_ms().saturating_sub(LAST_CLICK.load(Ordering::Relaxed));
+  let outcome = click_outcome(CLICKS.load(Ordering::Relaxed), since_last, DOUBLE_CLICK_MS);
+  if outcome.is_some() {
+    CLICKS.store(0, Ordering::Relaxed);
+  }
+  outcome
+}
+
+/// Tray callbacks arrive on another thread. Without a handler every event waits
+/// for the next tick of the (deliberately slow) repaint loop, which makes a
+/// click on the icon feel dead; the handler records the click and wakes egui.
+/// It must be registered before the icon exists, because the crate ignores a
+/// late registration once an event has gone through the default channel.
+fn install_tray_events(ctx: &egui::Context) {
+  use std::sync::atomic::Ordering;
+
+  let ctx = ctx.clone();
+  TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+    if !matches!(
+      event,
+      TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+      }
+    ) {
+      return;
+    }
+    // `TrayIconEvent::DoubleClick` never arrives: tray-icon registers its window
+    // class without `CS_DBLCLKS`, so Windows never posts `WM_LBUTTONDBLCLK`.
+    // Count the clicks here instead.
+    let now = now_ms();
+    let previous = LAST_CLICK.swap(now, Ordering::Relaxed);
+    let deadline = DOUBLE_CLICK_MS;
+    let double = is_double_click(previous, now, deadline);
+    CLICKS.store(if double { 2 } else { 1 }, Ordering::Relaxed);
+    // A single click is only acted on once the deadline has passed: acting at
+    // once would show the window on the first click of a double click and hide
+    // it again on the second, which looks like a flash.
+    ctx.request_repaint_after(Duration::from_millis(deadline));
+    ctx.request_repaint();
+  }));
+}
+
 pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
+  STARTED.get_or_init(Instant::now);
   let options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])
@@ -1266,6 +2289,8 @@ pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
     options,
     Box::new(move |cc| {
       let font = install_fonts(&cc.egui_ctx);
+      install_tray_events(&cc.egui_ctx);
+      cc.egui_ctx.add_plugin(LogCopyClick::default());
       Ok(Box::new(App::new(cfg, minimized, font)))
     }),
   )

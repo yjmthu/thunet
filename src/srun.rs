@@ -65,7 +65,9 @@ impl Client {
   }
 
   /// Cheap reachability probe with a short timeout so the worker thread is not
-  /// blocked for long when the machine has no network at all.
+  /// blocked for long when the machine has no network at all. It runs on a timer
+  /// even when nobody asked to log in (it decides whether *Connect* is usable),
+  /// so the timeout is deliberately shorter than a normal request.
   pub fn net_env(&self) -> NetEnv {
     const PROBES: [&str; 3] = [
       "http://connect.rom.miui.com/generate_204",
@@ -73,7 +75,7 @@ impl Client {
       "http://www.baidu.com/",
     ];
     let agent: ureq::Agent = ureq::Agent::config_builder()
-      .timeout_global(Some(Duration::from_secs(3)))
+      .timeout_global(Some(Duration::from_secs(2)))
       .build()
       .into();
     for url in PROBES {

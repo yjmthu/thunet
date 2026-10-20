@@ -19,13 +19,32 @@ pub fn acquire() -> Option<Guard> {
   imp::acquire()
 }
 
+/// Consume a pending "show the window" request from a second launch.
+///
+/// The running instance performs the actual `ShowWindow` through its own event
+/// loop. Doing it from the second process would bypass winit's cached
+/// visibility flag, after which the app could no longer hide its own window
+/// (clicking the close button would appear to do nothing).
+pub fn show_requested() -> bool {
+  imp::show_requested()
+}
+
 #[cfg(windows)]
 mod imp {
-  use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-  use windows_sys::Win32::System::Threading::CreateMutexW;
+  use std::sync::atomic::{AtomicIsize, Ordering};
+
+  use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, WAIT_OBJECT_0,
+  };
+  use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
+  };
   use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
   };
+
+  /// Auto-reset event a second launch signals; owned by the primary instance.
+  static SHOW: AtomicIsize = AtomicIsize::new(0);
 
   fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -42,12 +61,30 @@ mod imp {
     }
     let taken = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if !taken {
+      // Created before the guard is returned, so a second launch can only ever
+      // find it once this process is the running instance.
+      let ev = wide(r"Local\thunet-show-window");
+      let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, ev.as_ptr()) };
+      SHOW.store(ev as isize, Ordering::Relaxed); // 0 = unavailable
       return Some(super::Guard {
         handle: handle as isize,
       });
     }
 
-    // Ask the running copy to come back from the tray.
+    // Ring the doorbell instead of touching the other process's window: its
+    // own `logic()` turns this into a normal viewport command.
+    let ev = wide(r"Local\thunet-show-window");
+    let ev = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, ev.as_ptr()) };
+    if !ev.is_null() {
+      // SAFETY: the handle came from OpenEventW with EVENT_MODIFY_STATE.
+      unsafe {
+        SetEvent(ev);
+        CloseHandle(ev);
+      }
+      return None;
+    }
+
+    // Fallback for a running build that predates the doorbell.
     let title = wide("THUnet");
     // SAFETY: both calls take NUL-terminated strings/handles owned above.
     unsafe {
@@ -59,6 +96,12 @@ mod imp {
       }
     }
     None
+  }
+
+  pub fn show_requested() -> bool {
+    let handle = SHOW.load(Ordering::Relaxed);
+    // SAFETY: the handle is a live auto-reset event (0 is checked above).
+    handle != 0 && unsafe { WaitForSingleObject(handle as _, 0) == WAIT_OBJECT_0 }
   }
 }
 
@@ -74,6 +117,10 @@ mod imp {
     base.join("thunet.lock")
   }
 
+  fn show_path() -> PathBuf {
+    lock_path().with_extension("show")
+  }
+
   /// A lock file whose contents are the owner's pid. A leftover file from a
   /// crashed run is reaped when that pid no longer exists.
   pub fn acquire() -> Option<super::Guard> {
@@ -86,6 +133,7 @@ mod imp {
       {
         Ok(mut file) => {
           let _ = writeln!(file, "{}", std::process::id());
+          let _ = std::fs::remove_file(show_path());
           return Some(super::Guard { path });
         }
         Err(_) => {
@@ -98,11 +146,22 @@ mod imp {
             let _ = std::fs::remove_file(&path);
             continue;
           }
+          // The running instance polls this marker and shows its window.
+          let _ = std::fs::write(show_path(), b"");
           return None;
         }
       }
     }
     None
+  }
+
+  pub fn show_requested() -> bool {
+    let flag = show_path();
+    if flag.exists() {
+      let _ = std::fs::remove_file(&flag);
+      return true;
+    }
+    false
   }
 }
 

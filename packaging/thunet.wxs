@@ -18,13 +18,22 @@
       Compressed="yes">
 
     <!-- Uninstalling the old product before installing the new one keeps a
-         single entry in "Installed apps". -->
-    <MajorUpgrade DowngradeErrorMessage="A newer version of THUnet is already installed." />
+         single entry in "Installed apps". Same-version upgrades are allowed so
+         a rebuilt package can replace the installed one. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of THUnet is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="AppIcon" SourceFile="assets/thunet.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- ARP values are copied verbatim from the Property table, so a literal
+         `[INSTALLFOLDER]` would end up in the registry unexpanded. Format it at
+         CostFinalize instead: winget (and the repository validation) locate the
+         installed application through this `InstallLocation` value. -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]"
+                 After="CostFinalize" Sequence="both" />
 
     <!-- The app hides itself on WM_CLOSE (tray behaviour), so util:CloseApplication
          is not enough: terminate any running copy before files are replaced or
@@ -33,15 +42,22 @@
                   ExeCommand="taskkill /IM thunet.exe /F"
                   Execute="immediate" Return="ignore" />
 
-    <!-- Start the app once, right after a manual (UI) install. Silent installs
-         such as `msiexec /qn` or winget keep UILevel = 2 and stay quiet. -->
+    <!-- Start the app once the (interactive) transaction is over: a first
+         install, an upgrade or a repair all end with a killed copy because of
+         `StopRunningApp`, so the condition must not be limited to
+         `NOT Installed` - otherwise double-clicking the package again silently
+         leaves no app running. Silent installs such as `msiexec /qn` or winget
+         keep UILevel = 2 and stay quiet. -->
     <CustomAction Id="LaunchApp" FileRef="THUnetExe" ExeCommand=""
                   Execute="immediate" Return="asyncNoWait" />
 
     <InstallExecuteSequence>
-      <Custom Action="StopRunningApp" Before="InstallValidate" />
-      <Custom Action="LaunchApp" After="InstallFinalize"
-              Condition="NOT Installed AND UILevel &gt;= 4" />
+      <!-- Only a previous installation can still be running: on a clean install
+           there is nothing to stop, and an unconditional `taskkill` would just
+           spawn a process that fails in every validation sandbox. -->
+      <Custom Action="StopRunningApp" Before="InstallValidate"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="LaunchApp" After="InstallFinalize" Condition="UILevel &gt;= 4" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="LocalAppDataFolder">

@@ -25,13 +25,17 @@ pub struct Config {
   /// Empty lets the portal infer the caller address.
   pub ip: String,
   pub auto_connect: bool,
-  /// Only hide to the tray on launch; independent of `autostart`.
+  /// Whether the autostart entry starts the app hidden. Manual launches (Start
+  /// Menu, desktop shortcut, installer) open the window regardless.
   pub start_minimized: bool,
   pub keepalive_target: String,
   pub keepalive_interval_secs: u64,
   pub reconnect_delay_secs: u64,
   /// "auto" (follow OS) | "zh" | "en"
   pub lang: String,
+  /// Minimum level shown in the window log: "debug" | "info" | "warn" | "error".
+  /// Defaults to `info`, so only diagnostics the user asked for show up.
+  pub log_level: String,
 }
 
 impl Default for Config {
@@ -50,6 +54,7 @@ impl Default for Config {
       keepalive_interval_secs: 300,
       reconnect_delay_secs: 5,
       lang: "auto".into(),
+      log_level: "info".into(),
     }
   }
 }
@@ -148,5 +153,6 @@ mod tests {
     let cfg = Config::default();
     assert!(!cfg.start_minimized, "start-minimized is opt-in");
     assert!(cfg.password.is_empty());
+    assert_eq!(cfg.log_level, "info", "debug output is opt-in");
   }
 }

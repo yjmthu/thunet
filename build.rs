@@ -4,6 +4,15 @@
 
 fn main() {
   println!("cargo:rerun-if-changed=assets/thunet.ico");
+  // The stamp printed in Settings must match the binary around it, so refresh
+  // it whenever a rebuild can happen; otherwise cargo reuses the cached epoch.
+  println!("cargo:rerun-if-changed=src");
+  println!("cargo:rerun-if-changed=Cargo.toml");
+  let epoch = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs())
+    .unwrap_or(0);
+  println!("cargo:rustc-env=THUNET_BUILD_EPOCH={epoch}");
 
   #[cfg(windows)]
   {
