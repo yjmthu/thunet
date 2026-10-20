@@ -2270,8 +2270,38 @@ fn install_tray_events(ctx: &egui::Context) {
   }));
 }
 
+/// OpenGL first (smallest footprint), then wgpu. Virtual machines and RDP
+/// sessions often expose only OpenGL 1.1, where `egui_glow` refuses to start and
+/// the process used to die with exit code 1 before any window appeared;
+/// `THUNET_RENDERER=wgpu` skips straight to the fallback.
 pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
   STARTED.get_or_init(Instant::now);
+  let force_wgpu = std::env::var("THUNET_RENDERER")
+    .map(|v| v.eq_ignore_ascii_case("wgpu"))
+    .unwrap_or(false);
+  let attempts: &[eframe::Renderer] = if force_wgpu {
+    &[eframe::Renderer::Wgpu]
+  } else {
+    &[eframe::Renderer::Glow, eframe::Renderer::Wgpu]
+  };
+  let mut last = String::from("no renderer available");
+  for renderer in attempts {
+    match run_with(cfg.clone(), minimized, *renderer) {
+      Ok(()) => return Ok(()),
+      Err(e) => last = format!("{}: {e}", renderer_name(renderer)),
+    }
+  }
+  Err(last)
+}
+
+fn renderer_name(renderer: &eframe::Renderer) -> &'static str {
+  match renderer {
+    eframe::Renderer::Glow => "glow",
+    eframe::Renderer::Wgpu => "wgpu",
+  }
+}
+
+fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<(), String> {
   let options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])
@@ -2282,6 +2312,7 @@ pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
     // The window size is fixed by the layout, so a stale persisted size (or a
     // previous position off-screen) must not override it on the next launch.
     persist_window: false,
+    renderer,
     ..Default::default()
   };
   eframe::run_native(

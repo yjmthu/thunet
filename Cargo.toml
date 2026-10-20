@@ -1,6 +1,6 @@
 [package]
 name = "thunet"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Minimal THUnet / SRun3K portal client (login, keepalive, logout, status)"
 license = "MIT"
@@ -19,6 +19,7 @@ chrono = { version = "0.4", default-features = false, features = [
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.37.0", default-features = false, features = [
   "glow",
+  "wgpu",
   "default_fonts",
   "clipboard",
   "x11",
