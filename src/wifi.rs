@@ -24,6 +24,7 @@ pub fn is_no_portal_ssid(ssid: &str) -> bool {
 ///
 /// The `SSID` label itself is not localized, but `BSSID` also starts with it,
 /// hence the `:` right after the key.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn parse_ssid(text: &str) -> Option<String> {
   for line in text.lines() {
     let line = line.trim();

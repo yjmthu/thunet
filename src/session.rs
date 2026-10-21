@@ -6,11 +6,13 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::Config;
 use crate::logline::Line;
 use crate::srun::{Client, NetEnv};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
   Offline,
   Authenticating,
@@ -55,22 +57,12 @@ impl Session {
     let auto_ac = cfg.ac_id.is_empty() || cfg.ac_id == "auto";
     let mut warnings = Vec::new();
     if auto_ac {
-      match client.detect_ac_id() {
-        Ok((id, confident)) => {
-          if !confident {
-            warnings.push(Line::debug(format!(
-              "ac_id={id} may be the default page value"
-            )));
-          }
-          cfg.ac_id = id;
-        }
-        Err(e) => {
-          warnings.push(Line::warn(format!(
-            "ac_id detect failed ({e}), falling back to 1"
-          )));
-          cfg.ac_id = "1".into();
-        }
-      }
+      // Detection needs the network, and this constructor also runs on the
+      // core's startup path, which may be before the link is up (systemd unit
+      // or logon task). Leave a placeholder; the first probe — or the retry
+      // inside `ensure_online` — replaces it with what the portal reports.
+      cfg.ac_id = "1".into();
+      warnings.push(Line::debug("ac_id: auto, probing on the first connect"));
     }
     Self {
       client,
@@ -257,9 +249,7 @@ impl Session {
       )));
     }
     if username.is_empty() {
-      return Err(
-        "no account to log out: none is saved and the portal reports no session".into(),
-      );
+      return Err("no account to log out: none is saved and the portal reports no session".into());
     }
     let v = self
       .client
@@ -269,28 +259,5 @@ impl Session {
     }
     self.state = State::Offline;
     Ok(format!("{v}"))
-  }
-
-  /// Blocking supervisor loop; runs until the process is killed.
-  pub fn run_forever<F: FnMut(&Session, &str)>(&mut self, mut log: F) -> ! {
-    loop {
-      if self.ensure_online().is_err() {
-        std::thread::sleep(Duration::from_secs(self.cfg.reconnect_delay_secs));
-        continue;
-      }
-      log(self, "login ok");
-      loop {
-        std::thread::sleep(Duration::from_secs(self.cfg.keepalive_interval_secs));
-        match self.keepalive() {
-          Ok(()) => log(self, "status refreshed"),
-          Err(e) => {
-            log(self, &format!("keepalive failed: {e}"));
-            if self.failures >= 2 {
-              let _ = self.ensure_online();
-            }
-          }
-        }
-      }
-    }
   }
 }

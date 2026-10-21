@@ -4,9 +4,12 @@
 
 mod autostart;
 mod config;
+mod core;
 mod crypto;
 mod i18n;
+mod ipc;
 mod logline;
+mod proto;
 mod secret;
 mod session;
 mod shortcut;
@@ -16,9 +19,11 @@ mod ui;
 mod wifi;
 
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+
+use proto::{Cmd as CoreCmd, Ev as CoreEv, ToastKind};
 
 /// GUI-subsystem processes own no console. When started from a terminal we
 /// attach to it so the CLI subcommands can still print; when started from
@@ -120,7 +125,7 @@ struct Cli {
   /// TUNET account (overrides the saved one).
   #[arg(short, long, global = true)]
   username: Option<String>,
-  /// Password (otherwise read from Windows Credential Manager, or prompted).
+  /// Password (otherwise read from the saved credential, or prompted).
   #[arg(short, long, global = true)]
   password: Option<String>,
   /// Local IP to authenticate; empty lets the portal infer it.
@@ -141,32 +146,26 @@ struct Cli {
 enum Cmd {
   /// Offline protocol self-test (see `cargo test`).
   Selftest,
-  /// Print the campus ac_id.
+  /// Print the portal ac_id the running service is using.
   AcId,
   /// Show portal session / traffic information.
   Status,
-  /// Authenticate once (no-op when the portal already reports a session).
-  Login {
-    /// Re-authenticate even if a session already exists.
-    #[arg(long)]
-    force: bool,
-  },
-  /// De-authenticate.
+  /// Ask the running service to authenticate now.
+  Login,
+  /// Ask the running service to de-authenticate.
   Logout,
-  /// Touch a URL periodically to keep the session alive.
-  Keepalive {
-    #[arg(long, default_value = "https://www.tsinghua.edu.cn/")]
-    target: String,
-    #[arg(long, default_value_t = 30)]
-    interval: u64,
-    #[arg(long, default_value_t = 1)]
-    count: u64,
-  },
-  /// Auto-connect and stay online using the config file (headless).
-  Run {
-    /// Do a single ensure-online step and exit.
-    #[arg(long)]
-    once: bool,
+  /// Run the background service (no window, no tray).
+  ///
+  /// Normally started by the systemd user unit or the Windows logon task; the
+  /// tray starts it on demand when it is not running yet.
+  Core,
+  /// Install or control the background service.
+  ///
+  /// Wraps `systemctl --user` on Linux and `schtasks` on Windows, so the same
+  /// verbs work everywhere.
+  Service {
+    #[arg(value_enum)]
+    action: autostart::ServiceAction,
   },
   /// Print the config path and effective settings.
   Config,
@@ -220,10 +219,13 @@ fn run(cli: Cli) -> Result<(), String> {
     // equivalent: a launch without the flag still starts in the tray when the
     // user asked for that in the settings page.
     let minimized = cli.minimized || cfg.start_minimized;
+    // Make sure a core exists before the window starts looking for one. The
+    // window also retries, so failing here only means the log says why later.
+    if let Err(e) = ipc::ensure_core() {
+      eprintln!("warning: {e}");
+    }
     return ui::run(cfg, minimized);
   };
-
-  let client = srun::Client::new(&cfg.host, cfg.https, Duration::from_secs(cli.timeout));
 
   match cmd {
     Cmd::Selftest => {
@@ -245,171 +247,142 @@ fn run(cli: Cli) -> Result<(), String> {
       Ok(())
     }
     Cmd::AcId => {
-      println!("{}", client.ac_id()?);
-      Ok(())
+      let link = with_core()?;
+      link.send(CoreCmd::AcId);
+      match wait_for(&link, Duration::from_secs(10), |ev| {
+        matches!(ev, CoreEv::AcId(_) | CoreEv::Error(Some(_)))
+      })? {
+        CoreEv::AcId(id) => {
+          println!("{id}");
+          Ok(())
+        }
+        CoreEv::Error(Some(e)) => Err(e),
+        _ => Ok(()),
+      }
     }
     Cmd::Status => {
-      let (ac_id, _) = resolve_ac_id(&client, &cfg.ac_id);
-      println!(
-        "{}",
-        serde_json::to_string_pretty(&client.status(&ac_id)?).unwrap()
-      );
-      Ok(())
-    }
-    Cmd::Keepalive {
-      target,
-      interval,
-      count,
-    } => {
-      for i in 1..=count {
-        match client.touch(&target) {
-          Ok(n) => println!("[{i}/{count}] keepalive ok {target} ({n} bytes)"),
-          Err(e) => println!("[{i}/{count}] keepalive failed: {e}"),
-        }
-        if i < count {
-          std::thread::sleep(Duration::from_secs(interval));
-        }
-      }
-      Ok(())
-    }
-    cmd @ (Cmd::Login { .. } | Cmd::Logout) => {
-      let logout = matches!(cmd, Cmd::Logout);
-      let force = matches!(cmd, Cmd::Login { force: true });
-      let (mut ac_id, _) = resolve_ac_id(&client, &cfg.ac_id);
-      let was_online = client.is_online(&ac_id);
-      // `logout` must also work for a session this profile did not create, and
-      // the account the portal reports for this address wins over the saved one
-      // (they differ on a shared machine).
-      let online = if logout {
-        client.online_identity(&cfg.ip)
-      } else {
-        None
-      };
-      let username = match &online {
-        Some((user, _)) => user.clone(),
-        None => cfg.username.clone(),
-      };
-      if username.is_empty() {
-        return Err("missing --username / saved credential / config".into());
-      }
-      let ip = match &online {
-        Some((_, addr)) => addr.clone(),
-        None => cfg.ip.clone(),
-      };
-      if !logout && !force && was_online {
-        println!("already online (use `login --force` to re-authenticate)");
-        return Ok(());
-      }
-      let password = if logout {
-        None
-      } else {
-        Some(if cfg.password.is_empty() {
-          prompt_password()?
-        } else {
-          cfg.password.clone()
-        })
-      };
-      let mut attempt = 0;
-      loop {
-        attempt += 1;
-        let v = client.login_logout(&username, password.as_deref(), &ip, &ac_id, logout)?;
-        println!("{}", serde_json::to_string_pretty(&v).unwrap());
-        if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
-          return Ok(());
-        }
-        if logout {
-          return Err(format!("portal rejected logout: {v}"));
-        }
-        // Only policy-family errors may still resolve into a session; a
-        // credential failure (E2531/E2553/E2901) will never do so.
-        let ecode = v.get("ecode").and_then(|e| e.as_str()).unwrap_or("?");
-        let policy_like = ecode.starts_with("E28") || ecode == "?" || ecode.is_empty();
-        if was_online || !policy_like {
-          return Err(format!("portal rejected: {v}"));
-        }
-        // The campus network may have moved us to another AC: re-detect
-        // and retry once when the authoritative id actually changed.
-        if attempt < 2 {
-          if let Ok((fresh, true)) = client.detect_ac_id() {
-            if fresh != ac_id {
-              eprintln!("ac_id changed {ac_id} -> {fresh}, retrying");
-              ac_id = fresh;
-              continue;
-            }
+      let link = with_core()?;
+      link.send(CoreCmd::Status);
+      match wait_for(&link, Duration::from_secs(15), |ev| {
+        matches!(ev, CoreEv::Status(_) | CoreEv::Error(Some(_)))
+      })? {
+        CoreEv::Status(v) => {
+          println!("{}", serde_json::to_string_pretty(&v).unwrap());
+          // The core part is always there; only the portal half can fail.
+          match v.get("portal_error").and_then(|e| e.as_str()) {
+            Some(e) => Err(e.to_string()),
+            None => Ok(()),
           }
         }
-        eprintln!("note: server reported {ecode}; waiting up to 20s for the session to come up...");
-        if client.wait_online(&ac_id, Duration::from_secs(20)) {
-          println!(
-            "note: server reported {ecode}, but the session is active (treating as success)"
-          );
-          return Ok(());
-        }
-        return Err(format!("portal rejected: {v}"));
+        CoreEv::Error(Some(e)) => Err(e),
+        _ => Ok(()),
       }
     }
-    Cmd::Run { once } => {
-      if cfg.username.is_empty() || cfg.password.is_empty() {
-        return Err(format!(
-          "config incomplete: fill username/password in {}",
-          config::path().display()
-        ));
+    Cmd::Login => {
+      let link = with_core()?;
+      // Credentials on the command line still win, but they are handed to the
+      // core (in memory only) instead of being used behind its back.
+      if cli.username.is_some() || cli.password.is_some() {
+        link.send(CoreCmd::SetCredentials {
+          username: cfg.username.clone(),
+          password: cfg.password.clone(),
+        });
       }
-      let mut session = session::Session::new(cfg.clone());
-      if once {
-        println!("{}", session.ensure_online()?);
-        return Ok(());
-      }
-      session.run_forever(|s, msg| {
-        let state = match s.state {
-          session::State::Online => "online",
-          session::State::Offline => "offline",
-          session::State::Authenticating => "authing",
-        };
-        println!("[{}] {state}: {msg}", now_hms());
-      });
+      link.send(CoreCmd::Connect);
+      settled(&link, Duration::from_secs(40))
     }
-  }
-}
-
-fn resolve_ac_id(client: &srun::Client, configured: &str) -> (String, bool) {
-  if !configured.is_empty() && configured != "auto" {
-    return (configured.to_string(), true);
-  }
-  match client.detect_ac_id() {
-    Ok((id, confident)) => {
-      if confident {
-        println!("ac_id={id} (captive portal)");
-      } else {
-        eprintln!(
-          "warning: ac_id={id} came from the default page and may be wrong; \
-                     pass --ac-id <value> if login fails"
-        );
-      }
-      (id, confident)
+    Cmd::Logout => {
+      let link = with_core()?;
+      link.send(CoreCmd::Disconnect);
+      settled(&link, Duration::from_secs(20))
     }
-    Err(e) => {
-      eprintln!("ac_id detect failed ({e}), falling back to 1");
-      ("1".into(), false)
+    Cmd::Core => match ipc::serve(cfg)? {
+      ipc::Serve::Started => Ok(()),
+      ipc::Serve::AlreadyRunning => {
+        // Nothing to do: whoever owns the endpoint keeps serving the frontends.
+        eprintln!("another core is already running");
+        Ok(())
+      }
+    },
+    Cmd::Service { action } => {
+      println!("{}", autostart::Autostart::service(action, cli.minimized)?);
+      Ok(())
     }
   }
 }
 
-fn now_hms() -> String {
-  let secs = std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_secs())
-    .unwrap_or(0);
-  let t = secs % 86_400;
-  format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
+/// Connect to the running core, or explain how to start it.
+///
+/// Every session command goes through the core; none of them opens its own
+/// connection to the portal, so there is exactly one owner of the session.
+fn with_core() -> Result<ipc::Link, String> {
+  let link = ipc::open().ok_or_else(|| {
+    "the background service is not running (start it with `thunet core`, \
+     or enable autostart with `thunet service enable`)"
+      .to_string()
+  })?;
+  // The core replays its state and log tail on connect; swallow that so the
+  // answer to our command cannot be confused with old news.
+  let mut quiet = Instant::now();
+  while quiet.elapsed() < Duration::from_millis(150) {
+    if link.try_recv().is_some() {
+      quiet = Instant::now();
+    } else {
+      std::thread::sleep(Duration::from_millis(10));
+    }
+  }
+  Ok(link)
 }
 
-fn prompt_password() -> Result<String, String> {
-  eprint!("TUNET password: ");
-  std::io::stderr().flush().ok();
-  let mut buf = String::new();
-  std::io::stdin()
-    .read_line(&mut buf)
-    .map_err(|e| e.to_string())?;
-  Ok(buf.trim_end_matches(['\r', '\n']).to_string())
+/// Wait until an event satisfies `done`, echoing the core's log lines.
+fn wait_for<F>(link: &ipc::Link, timeout: Duration, mut done: F) -> Result<CoreEv, String>
+where
+  F: FnMut(&CoreEv) -> bool,
+{
+  let deadline = Instant::now() + timeout;
+  loop {
+    while let Some(ev) = link.try_recv() {
+      if let CoreEv::Log(line) = &ev {
+        println!("{}", line.render());
+      }
+      if done(&ev) {
+        return Ok(ev);
+      }
+    }
+    if !link.alive() {
+      return Err("the background service closed the connection".into());
+    }
+    if Instant::now() >= deadline {
+      return Err(format!(
+        "no answer from the background service within {}s",
+        timeout.as_secs()
+      ));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
+/// Wait for the outcome of a Connect/Disconnect and print it.
+fn settled(link: &ipc::Link, timeout: Duration) -> Result<(), String> {
+  match wait_for(link, timeout, |ev| {
+    matches!(
+      ev,
+      CoreEv::State(session::State::Online) | CoreEv::Notify { .. } | CoreEv::Error(Some(_))
+    )
+  })? {
+    CoreEv::State(session::State::Online) => {
+      println!("online");
+      Ok(())
+    }
+    CoreEv::Notify {
+      msg,
+      kind: ToastKind::Err,
+    } => Err(msg),
+    CoreEv::Notify { msg, .. } => {
+      println!("{msg}");
+      Ok(())
+    }
+    CoreEv::Error(Some(e)) => Err(e),
+    _ => Ok(()),
+  }
 }

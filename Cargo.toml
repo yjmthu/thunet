@@ -12,9 +12,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md-5 = "0.10"
 sha1 = "0.10"
+sha2 = "0.10"
+# Credential storage: one sealed blob on every platform (see `src/secret.rs`).
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
+  "serde",
 ] }
 clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.37.0", default-features = false, features = [
@@ -27,6 +32,7 @@ eframe = { version = "0.37.0", default-features = false, features = [
 ] }
 tray-icon = "0.26.1"
 sys-locale = "0.3.2"
+interprocess = "2.4.6"
 
 [profile.release]
 lto = true
@@ -43,8 +49,6 @@ winresource = "0.1"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
-  "Win32_Security",
-  "Win32_Security_Credentials",
   "Win32_System_Console",
   "Win32_System_Registry",
   "Win32_System_Threading",

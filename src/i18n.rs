@@ -3,7 +3,11 @@
 //! `Config::lang` stores `"auto" | "zh" | "en"`; `"auto"` resolves through the
 //! OS locale, so the app follows the system language by default.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+/// The resolved language. It travels over the IPC link so the core can word the
+/// messages it generates itself (skip reasons, toasts) in the same language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lang {
   Zh,
   En,
@@ -46,14 +50,16 @@ pub struct Texts {
   pub refresh: &'static str,
   pub copy: &'static str,
   pub autostart: &'static str,
+  /// The three autostart modes: none / background only / background + tray.
+  pub autostart_off: &'static str,
+  pub autostart_core: &'static str,
+  pub autostart_all: &'static str,
   pub start_minimized: &'static str,
   pub auto_connect: &'static str,
   pub password: &'static str,
   pub remember_password: &'static str,
-  /// Windows wording: Windows Credential Manager.
+  /// Where the password ends up; the wording is the same on every platform.
   pub remember_password_hint: &'static str,
-  /// Fallback wording for macOS/Linux, where `credential.json` is used instead.
-  pub remember_password_hint_file: &'static str,
   pub apply: &'static str,
   /// Shown next to *Apply* while the row differs from what is stored.
   pub unsaved: &'static str,
@@ -93,6 +99,10 @@ pub struct Texts {
   pub ipv4: &'static str,
   pub ipv6: &'static str,
   pub session_traffic: &'static str,
+  /// Status-page row describing the background service process.
+  pub service: &'static str,
+  pub service_running: &'static str,
+  pub service_gone: &'static str,
   // messages
   pub login_failed: &'static str,
   pub connect_ok: &'static str,
@@ -123,12 +133,14 @@ static ZH: Texts = Texts {
   refresh: "刷新",
   copy: "复制",
   autostart: "开机自启",
+  autostart_off: "关闭",
+  autostart_core: "服务",
+  autostart_all: "服务 + 托盘",
   start_minimized: "启动时最小化到托盘",
   auto_connect: "启动时自动连接",
   password: "密码",
   remember_password: "记住密码",
-  remember_password_hint: "保存在 Windows 凭据管理器（thunet/auth4.tsinghua.edu.cn），不会写入配置文件",
-  remember_password_hint_file: "保存在配置目录下的 credential.json（权限 600，仅本人可读），不会写入 config.json",
+  remember_password_hint: "加密后保存到配置目录下的 credential.bin（密钥与本机绑定，换机器需重新输入），不会写入 config.json",
   apply: "应用",
   unsaved: "未保存",
   revert: "还原",
@@ -159,6 +171,9 @@ static ZH: Texts = Texts {
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "本次流量",
+  service: "后台服务",
+  service_running: "运行中",
+  service_gone: "未运行",
   login_failed: "登录失败",
   connect_ok: "连接成功",
   connect_failed: "连接失败",
@@ -185,12 +200,14 @@ static EN: Texts = Texts {
   refresh: "Refresh",
   copy: "Copy",
   autostart: "Start with system",
+  autostart_off: "Off",
+  autostart_core: "Service",
+  autostart_all: "Service + tray",
   start_minimized: "Start minimised to tray",
   auto_connect: "Connect on startup",
   password: "Password",
   remember_password: "Remember password",
-  remember_password_hint: "Stored in Windows Credential Manager (thunet/auth4.tsinghua.edu.cn), never in the config file",
-  remember_password_hint_file: "Stored in credential.json in the config directory (mode 600, readable by you only), never in config.json",
+  remember_password_hint: "Encrypted with a key bound to this machine into credential.bin in the config directory (moving it elsewhere needs the password again), never in config.json",
   apply: "Apply",
   unsaved: "Unsaved",
   revert: "Revert",
@@ -221,6 +238,9 @@ static EN: Texts = Texts {
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "Session traffic",
+  service: "Service",
+  service_running: "running",
+  service_gone: "not running",
   login_failed: "Login failed",
   connect_ok: "Connected",
   connect_failed: "Connection failed",

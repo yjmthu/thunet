@@ -1,12 +1,13 @@
 //! Tray icon + minimal egui window.
 //!
-//! The network work runs in one worker thread owning a `Session`; the UI only
-//! exchanges messages with it, so the window never blocks on HTTP.
+//! The network work runs in the background core (`thunet core`, see
+//! [`crate::core`]); this process only renders the events it publishes. Closing
+//! the window therefore no longer drops the session, and the window never
+//! blocks on HTTP.
 //!
 //! `logic()` handles tray/menu/close events and keeps ticking even while the
 //! window is hidden (that is what eframe calls instead of `ui()` then).
 
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -14,53 +15,13 @@ use serde_json::Value;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::autostart::Autostart;
+use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
 use crate::i18n::{Lang, Texts};
+use crate::ipc::Link;
 use crate::logline::{Level, Line};
-use crate::session::{Session, State};
-use crate::srun::NetEnv;
-
-pub enum Cmd {
-  Connect,
-  Disconnect,
-  Refresh,
-  SetLang(Lang),
-  SetCredentials { username: String, password: String },
-  SetAutoConnect(bool),
-  Quit,
-}
-
-pub enum Ev {
-  State(State),
-  Info(Value),
-  Log(Line),
-  /// `Some` = a failure to surface; `None` = clear the banner.
-  Error(Option<String>),
-  /// Transient bottom-strip feedback for an action's outcome.
-  Notify {
-    msg: String,
-    kind: ToastKind,
-  },
-  /// What the worker's network probe last saw; drives *Connect* availability.
-  Env(LoginEnv),
-}
-
-/// Where the machine sits, as far as logging in is concerned. The worker probes
-/// this and the UI greys *Connect* out when an attempt could not possibly work.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoginEnv {
-  /// A campus portal answered: logging in makes sense.
-  Campus,
-  /// The OS authenticates this Wi-Fi at layer 2 (802.1X); no portal involved.
-  EnterpriseWifi(String),
-  /// Nothing answered: no cable, no Wi-Fi, no route, DNS broken.
-  NoNetwork,
-  /// A captive portal that is not the campus one (hotel, airport, ...).
-  OtherPortal,
-  /// The internet works directly, so there is nothing to log in to.
-  NoPortal,
-}
+use crate::proto::{Cmd, CoreInfo, Ev, LoginEnv, ToastKind};
+use crate::session::State;
 
 impl LoginEnv {
   /// Is a login attempt possible here at all?
@@ -79,26 +40,6 @@ impl LoginEnv {
     }
   }
 }
-
-/// Probe what the machine is attached to, plus the `ac_id` when a campus portal
-/// answered. The SSID check comes first: on an 802.1X network no portal request
-/// is worth making.
-fn probe_env(session: &Session) -> (LoginEnv, Option<String>) {
-  if let Some(ssid) = crate::wifi::no_portal_wifi() {
-    return (LoginEnv::EnterpriseWifi(ssid), None);
-  }
-  match session.net_env() {
-    NetEnv::Campus { ac_id } => (LoginEnv::Campus, Some(ac_id)),
-    NetEnv::Unreachable => (LoginEnv::NoNetwork, None),
-    NetEnv::OtherPortal => (LoginEnv::OtherPortal, None),
-    NetEnv::DirectInternet => (LoginEnv::NoPortal, None),
-  }
-}
-
-/// How often the network is re-probed while offline. A missing network makes
-/// every probe wait for its timeout, so that case backs off much further.
-const ENV_PROBE_MS: u64 = 15_000;
-const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
 
 #[derive(Default, Clone)]
 struct Info {
@@ -154,6 +95,26 @@ fn color_for(state: State) -> [u8; 3] {
     State::Online => [46, 160, 67],
     State::Authenticating => [210, 153, 34],
     State::Offline => [140, 140, 140],
+  }
+}
+
+/// The same palette, as an egui colour.
+fn state_color(state: State) -> egui::Color32 {
+  let c = color_for(state);
+  egui::Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// How long the service has been up, in the coarsest useful unit.
+fn human_uptime(secs: u64) -> String {
+  let days = secs / 86_400;
+  let hours = (secs % 86_400) / 3_600;
+  let minutes = (secs % 3_600) / 60;
+  if days > 0 {
+    format!("{days}d {hours}h")
+  } else if hours > 0 {
+    format!("{hours}h {minutes:02}m")
+  } else {
+    format!("{minutes}m")
   }
 }
 
@@ -224,397 +185,7 @@ fn app_icon() -> egui::IconData {
   }
 }
 
-fn spawn_worker(cfg: Config) -> (Sender<Cmd>, Receiver<Ev>) {
-  let (cmd_tx, cmd_rx) = channel::<Cmd>();
-  let (ev_tx, ev_rx) = channel::<Ev>();
-  std::thread::spawn(move || worker(cfg, cmd_rx, ev_tx));
-  (cmd_tx, ev_rx)
-}
-
-fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sender<Ev>) {
-  let keepalive = Duration::from_secs(cfg.keepalive_interval_secs.max(30));
-  let mut lang = Lang::from_setting(&cfg.lang);
-  let mut session = Session::new(cfg);
-  let has_creds = !session.cfg().username.is_empty() && !session.cfg().password.is_empty();
-  let mut want_online = session.cfg().auto_connect && has_creds;
-  if session.cfg().auto_connect && !has_creds {
-    tx.send(Ev::Log(Line::warn(
-      "auto connect is on, but no account and password are saved",
-    )))
-    .ok();
-  }
-  let mut last_ka = Instant::now();
-  let mut last_status = Instant::now() - Duration::from_secs(60);
-  let mut last_state = State::Offline;
-  // Backoff state so a rejected login does not hammer the portal every tick.
-  let retry_delay = Duration::from_secs(session.cfg().reconnect_delay_secs.max(5));
-  let mut next_attempt = Instant::now();
-  let mut failures = 0u32;
-  let mut last_failure = String::new();
-  // Set when the user pressed "Connect", so a skipped attempt can be reported.
-  let mut user_connect = false;
-  // Link watch: `link_up()` costs a route lookup, so it can run every second.
-  // A rising edge (network just became usable) retries immediately instead of
-  // waiting out a backoff, which makes login start ~1 s after Wi-Fi connects.
-  let mut next_link_check = Instant::now();
-  let mut link_ready = false;
-  // What the last network probe saw, and when the next one is due. The attempt
-  // below reuses this verdict instead of probing again.
-  let mut last_env = LoginEnv::Campus;
-  let mut next_env_probe = Instant::now();
-
-  for w in session.take_warnings() {
-    tx.send(Ev::Log(w)).ok();
-  }
-
-  loop {
-    let t = lang.texts();
-    while let Ok(c) = rx.try_recv() {
-      match c {
-        Cmd::Connect => {
-          // Check the current state first so an existing session is not re-authenticated.
-          if session.is_online_now() {
-            if let Ok(v) = session.refresh() {
-              tx.send(Ev::Info(v)).ok();
-            }
-            tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Error(None)).ok();
-            tx.send(Ev::Log(Line::info("already online"))).ok();
-            tx.send(Ev::Notify {
-              msg: t.already_online.into(),
-              kind: ToastKind::Info,
-            })
-            .ok();
-          } else {
-            want_online = true;
-            user_connect = true;
-            next_attempt = Instant::now();
-            failures = 0;
-            last_failure.clear();
-            last_status = Instant::now() - Duration::from_secs(60);
-          }
-        }
-        Cmd::Disconnect => {
-          // Check the current state first so no useless logout request is sent.
-          if !session.is_online_now() {
-            if let Ok(v) = session.refresh() {
-              tx.send(Ev::Info(v)).ok();
-            }
-            tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Log(Line::info("not connected"))).ok();
-            tx.send(Ev::Notify {
-              msg: t.not_connected.into(),
-              kind: ToastKind::Info,
-            })
-            .ok();
-          } else {
-            match session.logout() {
-              Ok(m) => {
-                tx.send(Ev::Log(Line::info(format!("logged out: {m}"))))
-                  .ok();
-                tx.send(Ev::Notify {
-                  msg: t.disconnected.into(),
-                  kind: ToastKind::Ok,
-                })
-                .ok();
-              }
-              Err(e) => {
-                tx.send(Ev::Error(Some(format!("{}: {e}", t.disconnect_failed))))
-                  .ok();
-                tx.send(Ev::Notify {
-                  msg: t.disconnect_failed.into(),
-                  kind: ToastKind::Err,
-                })
-                .ok();
-              }
-            };
-            want_online = false;
-          }
-        }
-        Cmd::Refresh => match session.refresh() {
-          Ok(v) => {
-            tx.send(Ev::Info(v)).ok();
-            tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Error(None)).ok();
-            tx.send(Ev::Log(Line::info("status refreshed"))).ok();
-            tx.send(Ev::Notify {
-              msg: t.status_refreshed.into(),
-              kind: ToastKind::Ok,
-            })
-            .ok();
-          }
-          Err(e) => {
-            tx.send(Ev::Error(Some(format!("{}: {e}", t.refresh_failed))))
-              .ok();
-            tx.send(Ev::Notify {
-              msg: t.refresh_failed.into(),
-              kind: ToastKind::Err,
-            })
-            .ok();
-          }
-        },
-        Cmd::SetLang(l) => {
-          lang = l;
-        }
-        Cmd::SetCredentials { username, password } => {
-          let ready = !username.is_empty() && !password.is_empty();
-          session.set_credentials(username, password);
-          if ready && session.cfg().auto_connect && session.state != State::Online {
-            want_online = true;
-            last_status = Instant::now() - Duration::from_secs(60);
-          }
-        }
-        Cmd::SetAutoConnect(on) => {
-          want_online = on;
-          if on && session.state != State::Online {
-            next_attempt = Instant::now();
-            last_status = Instant::now() - Duration::from_secs(60);
-          }
-        }
-        Cmd::Quit => {
-          // Quitting the app must not end the network session.
-          return;
-        }
-      }
-    }
-
-    // Probe the network on a timer, online or not: the answer is what greys out
-    // *Connect* off-campus, and it must not be 15 s stale after a Wi-Fi change.
-    if session.state != State::Online && Instant::now() >= next_env_probe {
-      let (env, ac_id) = probe_env(&session);
-      if let Some(ac_id) = ac_id {
-        session.set_ac_id(ac_id);
-      }
-      let wait = if env == LoginEnv::NoNetwork {
-        ENV_PROBE_OFFLINE_MS
-      } else {
-        ENV_PROBE_MS
-      };
-      next_env_probe = Instant::now() + Duration::from_millis(wait);
-      if env != last_env {
-        tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
-          .ok();
-      }
-      last_env = env.clone();
-      tx.send(Ev::Env(env)).ok();
-    }
-
-    // A login attempt without credentials can only be rejected, so say what is
-    // missing instead of POSTing an empty password to the portal. The attempt
-    // below is gated on the same flag, so nothing can reach the portal either
-    // way; this branch only decides what the user is told.
-    let missing_creds = session.cfg().username.is_empty() || session.cfg().password.is_empty();
-    if want_online && session.state != State::Online && missing_creds {
-      let log = "skipped: no account or password to log in with";
-      if last_failure != log {
-        last_failure = log.to_string();
-        tx.send(Ev::Log(Line::warn(log))).ok();
-        if user_connect {
-          tx.send(Ev::Notify {
-            msg: t.no_credentials.into(),
-            kind: ToastKind::Info,
-          })
-          .ok();
-          user_connect = false;
-        }
-      }
-    }
-
-    // Fast link watch: retry the moment a usable route appears.
-    if !missing_creds
-      && want_online
-      && session.state != State::Online
-      && Instant::now() >= next_link_check
-    {
-      next_link_check = Instant::now() + Duration::from_secs(1);
-      let up = crate::srun::link_up();
-      if up && !link_ready {
-        next_attempt = Instant::now();
-        failures = 0;
-        last_failure.clear();
-        // The network just changed: re-probe before the attempt below so the
-        // skip decision (and the Connect button) matches the new link.
-        next_env_probe = Instant::now();
-      }
-      link_ready = up;
-    }
-
-    if !missing_creds
-      && want_online
-      && session.state != State::Online
-      && link_ready
-      && Instant::now() >= next_attempt
-    {
-      // Never spray login attempts at a network where logging in cannot work:
-      // enterprise Wi-Fi (802.1X), no cable/Wi-Fi, a network that already
-      // reaches the internet, or some other operator's captive portal. The probe
-      // at the top of the loop already decided which case this is.
-      let mut skip: Option<(String, String, Duration, ToastKind)> = None;
-      match last_env.clone() {
-        LoginEnv::Campus => {}
-        LoginEnv::EnterpriseWifi(ssid) => {
-          let text = t.secure_wifi.replacen("{}", &ssid, 1);
-          let log = format!("skipped: {ssid} authenticates at the OS level (802.1X)");
-          skip = Some((text, log, Duration::from_secs(60), ToastKind::Info));
-        }
-        LoginEnv::NoNetwork => {
-          skip = Some((
-            t.network_unavailable.to_string(),
-            "skipped: no network connection".to_string(),
-            Duration::from_secs(30),
-            ToastKind::Info,
-          ))
-        }
-        LoginEnv::OtherPortal => {
-          skip = Some((
-            t.not_campus_network.to_string(),
-            "skipped: this is not the campus portal".to_string(),
-            Duration::from_secs(60),
-            ToastKind::Info,
-          ))
-        }
-        LoginEnv::NoPortal => {
-          // The internet works without interception. Either the campus session
-          // is already authenticated, or this is a network that has no portal
-          // at all (another operator), in which case logging in is wrong.
-          let online = session
-            .refresh()
-            .map(|_| session.state)
-            .unwrap_or(State::Offline);
-          if online != State::Online {
-            skip = Some((
-              t.no_login_needed.to_string(),
-              "skipped: internet is reachable without a portal login".to_string(),
-              Duration::from_secs(60),
-              ToastKind::Info,
-            ));
-          }
-        }
-      }
-
-      if let Some((msg, log, delay, kind)) = skip {
-        next_attempt = Instant::now() + delay;
-        failures = 0;
-        // Log (and toast) only when the reason changes, not on every retry.
-        if last_failure != log {
-          last_failure = log.clone();
-          tx.send(Ev::Log(Line::warn(&log))).ok();
-          if user_connect {
-            tx.send(Ev::Notify { msg, kind }).ok();
-            user_connect = false;
-          }
-        }
-        tx.send(Ev::State(session.state)).ok();
-        continue;
-      }
-
-      match session.ensure_online() {
-        Ok(m) => {
-          failures = 0;
-          last_failure.clear();
-          user_connect = false;
-          tx.send(Ev::Error(None)).ok();
-          tx.send(Ev::Log(Line::info(m))).ok();
-          tx.send(Ev::Notify {
-            msg: t.connect_ok.into(),
-            kind: ToastKind::Ok,
-          })
-          .ok();
-        }
-        Err(e) => {
-          failures = failures.saturating_add(1);
-          // 5s, 10s, 20s, 40s, ... capped at two minutes.
-          let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
-          next_attempt = Instant::now() + Duration::from_secs_f64(backoff.min(120.0));
-          let bad_credentials =
-            session.failure == crate::session::FailureKind::Credentials;
-          // A credential rejection carries a long JSON blob that only helps when
-          // debugging, so it goes to the log pane while the red banner and the
-          // toast carry the one thing the user can act on.
-          tx.send(Ev::Error(if bad_credentials {
-            None
-          } else {
-            Some(e.clone())
-          }))
-          .ok();
-          tx.send(Ev::Log(Line::error(format!(
-            "{e} (retry in {}s)",
-            backoff.min(120.0) as u64
-          ))))
-          .ok();
-          // Only buzz once per distinct reason, otherwise retries spam toasts.
-          if e != last_failure {
-            last_failure = e;
-            tx.send(Ev::Notify {
-              msg: if bad_credentials {
-                t.invalid_credentials
-              } else {
-                t.connect_failed
-              }
-              .into(),
-              kind: ToastKind::Err,
-            })
-            .ok();
-          }
-        }
-      };
-    }
-
-    // Ask the portal what is actually going on, online or not: the session may
-    // have been created elsewhere, and "no password saved" is not "offline".
-    let poll_every = if session.state == State::Online {
-      15
-    } else {
-      10
-    };
-    if last_status.elapsed() >= Duration::from_secs(poll_every) {
-      if let Ok(v) = session.client().status(&session.cfg().ac_id) {
-        let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
-        if online && session.state != State::Online {
-          session.state = State::Online;
-          failures = 0;
-          tx.send(Ev::Log(Line::info("already online"))).ok();
-        } else if !online && session.state == State::Online {
-          // Session ended outside our control (timeout / kicked / unplugged).
-          session.state = State::Offline;
-          tx.send(Ev::Log(Line::warn("session ended, now offline")))
-            .ok();
-        }
-        tx.send(Ev::Info(v)).ok();
-      }
-      last_status = Instant::now();
-    }
-
-    if session.state == State::Online && last_ka.elapsed() >= keepalive {
-      // Without credentials there is nothing a failing keepalive could trigger
-      // but an empty-password login, so only report the state poll above.
-      if session.keepalive().is_err() && !missing_creds {
-        let _ = session.ensure_online();
-      }
-      last_ka = Instant::now();
-    }
-
-    if session.state != last_state {
-      tx.send(Ev::State(session.state)).ok();
-      tx.send(Ev::Log(Line::debug(format!("state: {:?}", session.state))))
-        .ok();
-      last_state = session.state;
-    }
-
-    for w in session.take_warnings() {
-      tx.send(Ev::Log(w)).ok();
-    }
-
-    std::thread::sleep(Duration::from_millis(400));
-  }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
-  Ok,
-  Err,
-  Info,
-}
+// (the session loop now lives in `core.rs`)
 
 /// Which pane the window is showing: the everyday status view, or the
 /// rarely changed settings (startup behaviour, credentials, language).
@@ -631,8 +202,14 @@ struct Toast {
 }
 
 pub struct App {
-  tx: Sender<Cmd>,
-  rx: Receiver<Ev>,
+  /// Connection to the background core; `None` until one answers. The app keeps
+  /// retrying, so a core that is restarted does not leave the window deaf.
+  link: Option<Link>,
+  next_link_try: Instant,
+  /// Last reported state of the core itself (version, uptime, pid).
+  core: Option<CoreInfo>,
+  next_core_query: Instant,
+  core_version_warned: bool,
   state: State,
   info: Info,
   logs: Vec<Line>,
@@ -643,7 +220,7 @@ pub struct App {
   /// hidden, so raising the threshold again brings them back.
   min_level: Level,
   autostart: Option<Autostart>,
-  autostart_on: bool,
+  autostart_mode: Mode,
   user_edit: String,
   pass_edit: String,
   remember: bool,
@@ -693,7 +270,9 @@ impl App {
       cloak::set(true);
     }
 
-    let (tx, rx) = spawn_worker(cfg.clone());
+    // `main` normally started a core already; if it did not, `logic()` keeps
+    // retrying (see `ensure_link`).
+    let link = Link::connect();
     let lang = Lang::from_setting(&cfg.lang);
     let min_level = Level::from_setting(&cfg.log_level);
     let t = lang.texts();
@@ -727,11 +306,6 @@ impl App {
     }
 
     let autostart = autostart_entry(cfg.start_minimized);
-    let autostart_on = autostart
-      .as_ref()
-      .map(Autostart::is_enabled)
-      .unwrap_or(false);
-    autostart_item.set_checked(autostart_on);
 
     // Surface where settings live; also proves the file exists on first run.
     let mut logs = vec![Line::info(format!(
@@ -739,14 +313,19 @@ impl App {
       crate::config::path().display()
     ))];
     // An entry written by an older release is rewritten once (on Windows this
-    // moves the `Run` value to a logon task, which fires earlier).
-    if autostart_on {
-      match autostart.as_ref().map(Autostart::migrate) {
-        Some(Ok(true)) => logs.push(Line::debug("autostart: moved to a logon task")),
-        Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
-        _ => {}
-      }
+    // moves the `Run` value to a logon task, which fires earlier), and a
+    // portable install gets the systemd unit so `systemctl --user start`
+    // works without touching the settings page.
+    match autostart.as_ref().map(Autostart::migrate) {
+      Some(Ok(true)) => logs.push(Line::debug("autostart: entry upgraded")),
+      Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
+      _ => {}
     }
+    // Read the mode *after* migrating: an older layout may just have been
+    // renamed, and the radio buttons have to show the result.
+    let autostart_mode = autostart.as_ref().map(Autostart::mode).unwrap_or(Mode::Off);
+    autostart_item.set_checked(autostart_mode != Mode::Off);
+
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
     if tray.is_none() {
@@ -760,8 +339,11 @@ impl App {
     }
 
     Self {
-      tx,
-      rx,
+      link,
+      next_link_try: Instant::now(),
+      core: None,
+      next_core_query: Instant::now(),
+      core_version_warned: false,
       state: State::Offline,
       info: Info::default(),
       logs,
@@ -778,7 +360,7 @@ impl App {
       lang,
       min_level,
       autostart,
-      autostart_on,
+      autostart_mode,
       tray,
       tray_rgb: Some(color_for(State::Offline)),
       connect_item,
@@ -798,6 +380,45 @@ impl App {
 
   fn t(&self) -> &'static Texts {
     self.lang.texts()
+  }
+
+  /// Send a command to the core; ignored when nothing is connected.
+  fn send(&self, cmd: Cmd) {
+    if let Some(link) = &self.link {
+      link.send(cmd);
+    }
+  }
+
+  fn next_event(&self) -> Option<Ev> {
+    self.link.as_ref()?.try_recv()
+  }
+
+  /// Reconnect to the background core, without starting one.
+  ///
+  /// Only `main` starts a core. A window that kept respawning it would make
+  /// `systemctl --user stop` / `schtasks /End` look broken.
+  fn ensure_link(&mut self) {
+    if self.link.as_ref().is_some_and(Link::alive) || Instant::now() < self.next_link_try {
+      return;
+    }
+    self.next_link_try = Instant::now() + Duration::from_secs(2);
+    match crate::ipc::open() {
+      Some(link) => {
+        self.link = Some(link);
+        self.last_error = None;
+        self.push_log(Line::info("connected to the background service"));
+        self.send(Cmd::SetLang(self.lang));
+        // Ask who we are talking to on the next pass.
+        self.next_core_query = Instant::now();
+      }
+      None => {
+        let msg = "the background service is not running".to_string();
+        if self.last_error.as_deref() != Some(msg.as_str()) {
+          self.push_log(Line::warn(&msg));
+          self.last_error = Some(msg);
+        }
+      }
+    }
   }
 
   /// Bounded ring buffer: the log keeps the newest lines only.
@@ -820,7 +441,7 @@ impl App {
     self.show_item.set_text(t.show_window);
     self.hide_item.set_text(t.hide_window);
     self.quit_item.set_text(t.quit);
-    self.tx.send(Cmd::SetLang(self.lang)).ok();
+    self.send(Cmd::SetLang(self.lang));
     if let Err(e) = self.cfg.save() {
       self.logs.push(Line::error(format!("config: {e}")));
     }
@@ -837,13 +458,10 @@ impl App {
         // credential instead of writing one.
         let (msg, kind) = self.credentials_toast();
         self.set_toast(msg.to_string(), kind);
-        self
-          .tx
-          .send(Cmd::SetCredentials {
-            username: self.cfg.username.clone(),
-            password: self.cfg.password.clone(),
-          })
-          .ok();
+        self.send(Cmd::SetCredentials {
+          username: self.cfg.username.clone(),
+          password: self.cfg.password.clone(),
+        });
       }
       Err(e) => {
         self.toast_err(e);
@@ -894,6 +512,32 @@ impl App {
     self.set_toast(format!("{label}: {state}"), ToastKind::Info);
   }
 
+  /// Apply one of the three autostart modes and report the result.
+  fn apply_autostart_mode(&mut self, mode: Mode) {
+    let t = self.t();
+    let result = match &self.autostart {
+      Some(a) => a.set_mode(mode),
+      None => Err(t.autostart_failed.to_string()),
+    };
+    match result {
+      Ok(()) => {
+        self.autostart_mode = mode;
+        self.autostart_item.set_checked(mode != Mode::Off);
+        let label = match mode {
+          Mode::Off => t.autostart_off,
+          Mode::Core => t.autostart_core,
+          Mode::All => t.autostart_all,
+        };
+        self.toast_ok(format!("{}: {label}", t.autostart));
+      }
+      Err(e) => {
+        let msg = format!("{}: {e}", t.autostart_failed);
+        self.push_log(Line::error(&msg));
+        self.toast_err(msg);
+      }
+    }
+  }
+
   /// "Start minimised" and "start with the system" are independent settings,
   /// so changing one rewrites the auto-launch command line.
   fn apply_start_minimized(&mut self, on: bool) {
@@ -902,15 +546,14 @@ impl App {
       self.toast_err(e);
       return;
     }
-    let re_enable = self.autostart_on && self.autostart.is_some();
+    let mode = self.autostart_mode;
     self.autostart = autostart_entry(on);
     let mut failure = None;
-    if re_enable {
-      if let Some(a) = &self.autostart {
-        if let Err(e) = a.enable() {
-          failure = Some(format!("{}: {e}", self.t().autostart_failed));
-        }
-      }
+    if mode != Mode::Off
+      && let Some(a) = &self.autostart
+      && let Err(e) = a.set_mode(mode)
+    {
+      failure = Some(format!("{}: {e}", self.t().autostart_failed));
     }
     match failure {
       Some(msg) => self.toast_err(msg),
@@ -936,25 +579,20 @@ impl App {
   fn handle_menu(&mut self, ctx: &egui::Context) {
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
       match ev.id().0.as_str() {
-        "connect" => {
-          self.tx.send(Cmd::Connect).ok();
-        }
-        "disconnect" => {
-          self.tx.send(Cmd::Disconnect).ok();
-        }
+        "connect" => self.send(Cmd::Connect),
+        "disconnect" => self.send(Cmd::Disconnect),
         "autostart" => {
-          self.autostart_on = !self.autostart_on;
-          if let Some(a) = &self.autostart {
-            let _ = if self.autostart_on {
-              a.enable()
-            } else {
-              a.disable()
-            };
-          }
-          self.autostart_item.set_checked(self.autostart_on);
+          // The menu keeps the binary shortcut; the three-way choice lives in
+          // the settings page.
+          let next = if self.autostart_mode == Mode::Off {
+            Mode::All
+          } else {
+            Mode::Off
+          };
+          self.apply_autostart_mode(next);
         }
         "quit" => {
-          self.tx.send(Cmd::Quit).ok();
+          self.send(Cmd::Quit);
           self.quitting = true;
           self.quit_at = Some(Instant::now());
         }
@@ -966,7 +604,7 @@ impl App {
   }
 
   fn drain_events(&mut self) {
-    while let Ok(ev) = self.rx.try_recv() {
+    while let Some(ev) = self.next_event() {
       match ev {
         Ev::State(s) => self.state = s,
         Ev::Info(v) => self.info = info_from(&v),
@@ -980,6 +618,21 @@ impl App {
           })
         }
         Ev::Env(env) => self.env = env,
+        Ev::Core(info) => {
+          // A half-finished upgrade leaves the old core running next to the new
+          // window; say so once instead of showing mismatched numbers silently.
+          if !self.core_version_warned && info.version != env!("CARGO_PKG_VERSION") {
+            self.core_version_warned = true;
+            self.push_log(Line::warn(format!(
+              "service runs {} but this window runs {}; restart the service after upgrading",
+              info.version,
+              env!("CARGO_PKG_VERSION")
+            )));
+          }
+          self.core = Some(info);
+        }
+        // Answers to the CLI's one-off questions; the window has no use for them.
+        Ev::Status(_) | Ev::AcId(_) => {}
       }
     }
   }
@@ -1094,6 +747,29 @@ impl App {
                 human(self.info.bytes_out)
               ));
               ui.end_row();
+              // The core is a separate process; say whether one is answering and
+              // which version it runs, so a half-finished upgrade is visible.
+              ui.label(t.service);
+              match &self.core {
+                Some(core) => {
+                  ui.horizontal(|ui| {
+                    ui.label(
+                      egui::RichText::new(t.service_running).color(state_color(State::Online)),
+                    );
+                    let version = format!("v{} · {}", core.version, human_uptime(core.uptime_secs));
+                    let text = egui::RichText::new(version).monospace();
+                    ui.label(if core.version == env!("CARGO_PKG_VERSION") {
+                      text.weak()
+                    } else {
+                      text.color(state_color(State::Authenticating))
+                    });
+                  });
+                }
+                None => {
+                  ui.label(egui::RichText::new(t.service_gone).color(state_color(State::Offline)));
+                }
+              }
+              ui.end_row();
             });
 
           ui.add_space(10.0);
@@ -1110,16 +786,16 @@ impl App {
               connect = connect.on_disabled_hover_text(why);
             }
             if connect.clicked() {
-              self.tx.send(Cmd::Connect).ok();
+              self.send(Cmd::Connect);
             }
             if ui
               .add_enabled(online, egui::Button::new(t.disconnect))
               .clicked()
             {
-              self.tx.send(Cmd::Disconnect).ok();
+              self.send(Cmd::Disconnect);
             }
             if ui.button(t.refresh).clicked() {
-              self.tx.send(Cmd::Refresh).ok();
+              self.send(Cmd::Refresh);
             }
           });
         } else {
@@ -1174,33 +850,42 @@ impl App {
           }
 
           ui.add_space(2.0);
-          let mut auto = self.autostart_on;
-          if ui.checkbox(&mut auto, t.autostart).changed() {
-            self.autostart_on = auto;
-            let failure = match &self.autostart {
-              Some(a) => (if auto { a.enable() } else { a.disable() })
-                .err()
-                .map(|e| format!("{}: {e}", t.autostart_failed)),
-              None => Some(t.autostart_failed.to_string()),
-            };
-            match failure {
-              Some(msg) => {
-                self.push_log(Line::error(&msg));
-                self.toast_err(msg);
-              }
-              None => self.toast_toggle(t.autostart, auto),
+          // Three modes, not two checkboxes: "tray without core" is not worth
+          // offering, because the tray would start a core a second later. With
+          // the short labels from `i18n.rs` all three fit on the label's row,
+          // which is what keeps the page inside the fixed window height.
+          let mut mode = self.autostart_mode;
+          ui.horizontal(|ui| {
+            ui.label(t.autostart);
+            for (value, label) in [
+              (Mode::Off, t.autostart_off),
+              (Mode::Core, t.autostart_core),
+              (Mode::All, t.autostart_all),
+            ] {
+              ui.radio_value(&mut mode, value, label);
             }
+          });
+          if mode != self.autostart_mode {
+            self.apply_autostart_mode(mode);
           }
 
+          // Only meaningful when the tray is part of the autostart mode.
           let mut start_min = self.cfg.start_minimized;
-          if ui.checkbox(&mut start_min, t.start_minimized).changed() {
+          let tray_starts = self.autostart_mode != Mode::Core;
+          if ui
+            .add_enabled(
+              tray_starts,
+              egui::Checkbox::new(&mut start_min, t.start_minimized),
+            )
+            .changed()
+          {
             self.apply_start_minimized(start_min);
           }
 
           let mut auto_conn = self.cfg.auto_connect;
           if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
             self.cfg.auto_connect = auto_conn;
-            self.tx.send(Cmd::SetAutoConnect(auto_conn)).ok();
+            self.send(Cmd::SetAutoConnect(auto_conn));
             match self.cfg.save() {
               Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
               Err(e) => self.toast_err(e),
@@ -1245,11 +930,7 @@ impl App {
           ui.horizontal(|ui| {
             if ui
               .checkbox(&mut self.remember, t.remember_password)
-              .on_hover_text(if cfg!(windows) {
-                t.remember_password_hint
-              } else {
-                t.remember_password_hint_file
-              })
+              .on_hover_text(t.remember_password_hint)
               .changed()
             {
               self.toast = None;
@@ -1900,6 +1581,17 @@ impl eframe::App for App {
       self.show_window(ctx);
     }
 
+    // The core may have been restarted (crash, upgrade, systemd unit or logon
+    // task): reconnect instead of going deaf.
+    self.ensure_link();
+
+    // Ask the service about itself now and then; the row it fills is advisory,
+    // so a slow cadence is plenty.
+    if self.link.as_ref().is_some_and(Link::alive) && Instant::now() >= self.next_core_query {
+      self.next_core_query = Instant::now() + Duration::from_secs(30);
+      self.send(Cmd::CoreInfo);
+    }
+
     // A left click on the tray icon shows the window, a double click hides it.
     match tray_click() {
       Some(true) => self.show_window(ctx),
@@ -1928,7 +1620,7 @@ impl eframe::App for App {
         self.hide_window(ctx);
       } else {
         // No tray icon: hiding would leave the app unreachable, so close quits.
-        self.tx.send(Cmd::Quit).ok();
+        self.send(Cmd::Quit);
         self.quitting = true;
         self.quit_at = Some(Instant::now());
       }

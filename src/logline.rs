@@ -8,9 +8,10 @@
 //! ```
 
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 
 /// Severity, ordered from least to most important.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Level {
   Debug,
   Info,
@@ -57,7 +58,7 @@ impl Level {
   }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Line {
   pub at: DateTime<Local>,
   pub level: Level,

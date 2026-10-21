@@ -52,7 +52,7 @@
    会弹出一个小窗口，程序做的每件事都会写到窗口底部的日志条里。
 3. **打开设置。** 点窗口右上角的按钮。
 4. **填写账号密码。** 输入 TUNET 账号（例如 `1234567890`）和密码，勾选
-   **记住密码**，再点 **应用**。Windows 上密码会交给凭据管理器，绝不会写进设置文件。
+   **记住密码**，再点 **应用**。密码会先用与本机绑定的密钥加密再落盘，绝不会写进设置文件。
 5. **连接。** 回到状态页点 **连接**（如果"连接时自动连接"已经打开，等几秒即可）。
    标题处的圆点变成绿色就表示在线。
 
@@ -100,11 +100,11 @@
 
 | 设置项 | 作用 |
 | --- | --- |
-| 开机自启 | 为当前用户添加或删除自启项 |
-| 启动时最小化到托盘 | 与上一项相互独立：可以自启但隐藏，也可以手动启动时打开窗口，反之亦然 |
+| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——那相当于晚一秒再启动核心 |
+| 启动时最小化到托盘 | 与上一项相互独立：可以自启但隐藏，也可以手动启动时打开窗口，反之亦然。在"服务"档位下置灰（根本没有托盘要最小化） |
 | 启动时自动连接 | 一检测到可用网络就登录 |
 | 创建桌面快捷方式 | 为当前运行的可执行文件在桌面生成一个启动器（等同于 `thunet shortcut`） |
-| 账号 / 密码 / 记住密码 / 应用 / 还原 | 这是唯一一行不会边输入边保存的设置：内容与已保存值不同时会变成强调色并出现 *未保存* 标记。应用会把密码交给操作系统凭据存储（不会写进 JSON），并立刻交给正在运行的会话；还原会丢弃修改，恢复已保存的账号、密码和勾选状态（关闭*记住密码*时它是灰的，因为没有可恢复的内容） |
+| 账号 / 密码 / 记住密码 / 应用 / 还原 | 这是唯一一行不会边输入边保存的设置：内容与已保存值不同时会变成强调色并出现 *未保存* 标记。应用会把密码加密写入 `credential.bin`（不会写进 JSON），并立刻交给正在运行的会话；还原会丢弃修改，恢复已保存的账号、密码和勾选状态（关闭*记住密码*时它是灰的，因为没有可恢复的内容） |
 | 语言 | 跟随系统（默认）、中文、English |
 | 日志级别 | `DEBUG` / `INFO` / `WARN` / `ERROR`：日志页显示的最低级别（默认 `INFO`，存在 `config.json` 里） |
 | 版本 | 左边是版本号，右边是构建时间（本地时钟，精确到秒，并带 UTC 偏移） |
@@ -112,7 +112,7 @@
 三个开关在切换后会用一个提示条确认当前状态（*开机自启：开*），因为页面上没有别的
 东西会随之变化。
 
-**连接**用的是后台工作线程持有的密码：启动时是凭据管理器里的值（必须保存过*记住
+**连接**用的是后台工作线程持有的密码：启动时是从 `credential.bin` 解出的值（必须保存过*记住
 密码*），之后是最后一次应用的值 —— 在点 **应用** 之前，输入框里的文字不会生效，
 *未保存* 标记提醒的正是这件事。取消*记住密码*并应用会删除已保存的条目，但刚刚输入
 的密码在程序退出前仍然可用。完全没有任何密码时，**连接** 会直接报告这一点，而不是
@@ -187,24 +187,50 @@
 ```
 thunet                       # 托盘 + 窗口（等同于不带参数）
 thunet --minimized           # 启动后隐藏在托盘
-thunet status                # 以 JSON 输出会话 / 流量
-thunet login [--force]       # 认证一次
-thunet logout                # 注销
-thunet keepalive --interval 30 --count 5
-thunet run [--once]          # 无界面的自动连接循环
-thunet ac-id                 # 打印探测到的门户 ac_id
+thunet core                  # 后台服务：真正持有网络会话
+thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
+thunet status                # JSON：服务自身状态 + 门户会话/流量
+thunet login                 # 让服务现在就认证
+thunet logout                # 让服务注销
+thunet ac-id                 # 服务正在使用的门户 ac_id
 thunet config                # 配置路径 + 生效中的设置
 thunet shortcut              # 创建桌面快捷方式
 thunet selftest              # 注意：真正的测试向量在 `cargo test` 里
 ```
+
+窗口只是一个**前端**。网络会话住在 `thunet core` 里：窗口按需把它拉起来，之后
+两者通过一个按用户隔离的本地套接字通信。所以关掉窗口不会掉线，而且只有 core 这
+一半能在开机时起（Linux 是 systemd user unit，Windows 是第二个登录任务——都由
+设置页的「随系统启动」创建）。
+
+`status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行
+的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，
+并提示该用哪个命令启动——**绝不会**退回自己去开第二个连接。
+
+`thunet status` 输出一个对象，两半都在：
+
+```json
+{
+  "core":   { "version": "0.1.3", "pid": 1234, "uptime_secs": 812,
+              "state": "Online", "env": "Campus", "ac_id": "169",
+              "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
+              "wanted_online": true, "failures": 0, "frontends": 1,
+              "endpoint": "/run/user/1000/thunet/control.sock" },
+  "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
+}
+```
+
+`core` 描述服务自身（`uptime_secs`、`env` 里的网络判定、当前接入的 frontend 数）。
+门户查询失败时 `portal` 为 `null`、原因在 `portal_error` 里，命令以非零退出。
 
 在已经运行时再次启动 `thunet` **不会**启动第二个副本：只会把已有窗口带回前台。
 
 全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`-u/--username`、
 `-p/--password`、`--ip <addr>`、`--ac-id <id>`。
 
-优先级是 **命令行 > 配置文件 > 凭据存储**，所以
-`thunet -u 1234567890 -p secret status` 可以在不触碰已保存设置的情况下使用。
+优先级是 **命令行 > 配置文件 > 凭据存储**。`-u` / `-p` 会在 `login` 时交给服务
+（只在内存里，不落盘），`--host` / `--http` / `--timeout` 则决定 `thunet core`
+连谁：`thunet -u 1234567890 -p secret login`。
 
 ## 6. 数据存在哪里
 
@@ -219,18 +245,26 @@ thunet selftest              # 注意：真正的测试向量在 `cargo test` �
 | 文件 | 内容 |
 | --- | --- |
 | `config.json` | 账号、门户主机、开机自启 / 最小化 / 自动连接标志、保活设置、语言。**没有密码** —— 序列化时该字段会被跳过。 |
-| `credential.json` | 仅 macOS 和 Linux：保存的密码，权限 `0600`。Windows 使用凭据管理器。 |
+| `credential.bin` | 加密保存的账号密码，权限 `0600`；每次应用时重写，拷到别的机器上解不开。 |
 | `crash.log` | 仅在程序 panic 时追加。 |
 
-各平台的密码存储：
+密码存储在所有平台上只有一套实现：`credential.bin` 里是
+`MAGIC ‖ nonce ‖ 密文`（ChaCha20-Poly1305），权限 `0600`，密钥为
+`SHA-256("thunet/credential/v1" ‖ 0 ‖ 机器标识)`。
 
-| 系统 | 存储位置 |
+| 系统 | 机器标识来源 |
 | --- | --- |
-| Windows | 凭据管理器，普通凭据，目标名 `thunet/auth4.tsinghua.edu.cn`（可在 *控制面板 → 凭据管理器 → Windows 凭据* 中看到） |
-| macOS / Linux | 配置目录下的 `credential.json`，仅当前用户可读 —— 没有链接系统钥匙串 |
+| Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
+| Linux | `/etc/machine-id`（或 `/var/lib/dbus/machine-id`） |
+| macOS | 主机名；将来需要更强的标识再改用 IOKit 的 `IOPlatformUUID` |
+
+用机器密钥的目的就是无人值守启动：核心必须在没人登录时就登录，所以不能要求
+已登录用户来解锁。这也划定了它的边界 —— 文件离开本机（备份、dotfiles 仓库、
+同步的配置目录）就没用，但以你的身份运行的程序能读到同样的机器标识并解密。
+要挡住后者只能靠密码短语或 TPM，而两者都会牺牲无人值守启动。
 
 删除 `config.json` 会重置所有设置。卸载安装包**不会**删除这个目录，所以重装后账号
-和偏好在；想彻底重来，就删掉这个目录和凭据管理器里的条目。
+和偏好在；想彻底重来，就删掉这个目录。
 
 ## 7. 安装、卸载、快捷方式
 
@@ -256,16 +290,42 @@ MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也�
 在事务结束后会重新启动程序；静默安装（`msiexec /qn`、winget）不会，因此不会抢占
 桌面。也就是说，在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
 
-开机自启**不属于**安装包 —— 它是程序保存的用户偏好：
+开机自启**不属于**安装包 —— 程序自己注册条目，状态再直接从系统读回来（不写进
+`config.json`）。条目有两个（托盘、后台服务），模式有三档：
+
+| 模式 | Linux | Windows |
+| --- | --- | --- |
+| **关闭** | 不注册任何条目 | 不注册任何条目 |
+| **服务** | 启用 systemd 用户单元 `thunet.service`；配合 `loginctl enable-linger` 可**在登录前**起飞 | `thunet` 登录任务：保持在线，但没有托盘图标 |
+| **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 两个登录任务：`thunet`（核心）与 `thunet-tray`（托盘） |
+
+没有提供"只启动托盘"：托盘起来后一秒内就会把 core 拉起来，两个开关并不独立。
 
 | 系统 | 自启项 |
 | --- | --- |
-| Windows | 名为 `thunet` 的每用户计划任务（`schtasks /Create /XML`，无延迟，最低权限），运行 `thunet.exe`（打开*最小化*时附加 `--minimized`）。Task Scheduler 服务会在 `explorer.exe` 处理 `Run` 键之前触发它，所以比 `Run` 值启动得更早。 |
-| Linux | `~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart）。systemd 用户单元可以更早启动，但会和托盘宿主、显示套接字抢跑，所以 `.desktop` 既是标准做法也更可靠。 |
-| macOS | 由 `auto-launch` crate 管理的 LaunchAgent |
+| Windows | 每用户计划任务（`schtasks /Create /XML`，无延迟、最低权限）。Task Scheduler 服务在 `explorer.exe` 处理 `Run` 键之前触发它们。两者都是 `InteractiveToken` + `LeastPrivilege`，即用户自己的令牌、不提权 —— 这是定位权限还能用的前提。Windows 想"登录前"就只能装服务，而那需要管理员权限（并且会丢掉这项权限），所以目前只有 Linux 会在登录前启动核心。 |
+| Linux | 托盘：`~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart），所有桌面都认；后台服务：systemd 用户单元，按用户 enable，不需要 root。 |
+| macOS | 由 `auto-launch` crate 管理的 LaunchAgent；后台服务由托盘拉起。 |
+
+即使在关闭档位，第一次运行也会把 unit 文件写上，所以
+`systemctl --user start|stop|status thunet` 不用进设置页就能用。
+`thunet service <action>` 把两个平台包成同一套动词：
+
+| 动作 | Linux | Windows |
+| --- | --- | --- |
+| `install` / `uninstall` | 写入 / 删除 unit | 创建 / 删除 core 任务（任务不能没有触发器而存在） |
+| `enable` / `disable` | 挂进登录/开机路径（并尽力 `enable-linger`） | 同 install / uninstall |
+| `start` / `stop` / `restart` | `systemctl --user …` | `schtasks /Run`、`/End` |
+| `status` | `systemctl --user status` | `schtasks /Query /V /FO LIST` |
+
+core 一旦注册，就属于 systemd / Task Scheduler 管：窗口只会重连它，绝不在后台
+自己再 spawn 一个。
 
 更早的版本在 Windows 上写的是 `HKCU\...\CurrentVersion\Run\thunet`；新版第一次启动
 会把这个值迁移成登录任务（保留它记录的可执行文件路径）并删除原值，因此不会启动两次。
+0.1.x 的托盘任务也叫 `thunet`，而这个名字现在是核心的；两者无法事后区分，所以新版会
+把它改写成“运行核心”，并从“服务”起步——想要图标回来，在设置里选一次
+“服务 + 托盘”即可。
 
 剩下的唯一自助操作就是桌面快捷方式：设置页的 **创建桌面快捷方式**，或
 `thunet shortcut`，它会为当前运行的可执行文件在桌面生成启动器（Linux 上还会把
@@ -273,8 +333,8 @@ MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也�
 
 卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上
 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的设置会保留；想要干净状态就删掉该
-目录和凭据管理器条目。如果不想留下指向已删除文件的自启项（Windows 上是计划任务里的
-`thunet`），请在卸载前先关闭 *开机自启*。
+目录。如果不想留下指向已删除文件的自启项（Windows 上是计划任务里的
+`thunet` 和 `thunet-tray`），请在卸载前先关闭 *开机自启*。
 
 ## 8. 用 winget 安装
 
@@ -415,7 +475,7 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 | `src/session.rs` | 状态机：刷新、登录、保活、注销、退避 |
 | `src/ui.rs` | 工作线程、窗口、托盘、提示条、日志条 |
 | `src/config.rs` | 设置读写、平台路径 |
-| `src/secret.rs` | 各平台凭据存储后端 |
+| `src/secret.rs` | 加密的凭据文件（所有平台同一套实现） |
 | `src/single.rs` | 单实例保护（再次启动会显示已有窗口） |
 | `src/shortcut/` | 各平台的桌面快捷方式创建 |
 | `src/i18n.rs` | 中文 / 英文字符串 |
@@ -427,8 +487,13 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 ## 12. 限制与说明
 
 - 只实现了校园门户协议；不支持 802.1X 或 VPN。
-- Windows 上密码由系统凭据存储保护；macOS 和 Linux 上是 `0600` 文件，请把家目录
-  当作可信环境。
+- 保存的密码用与本机绑定的密钥加密（`credential.bin`，权限 `0600`）：离开本机就没用，
+  但以你的身份运行的程序仍能解密，所以请把本机上的这个账号当作可信环境。
+- **"登录前联网"假设家目录在开机时就可用**：文件权限只看 uid，与有没有登录会话无关，
+  所以 `systemd --user`（靠 `enable-linger` 开机启动）能以你的身份读到
+  `~/.config/thunet/credential.bin`。但如果家目录本身要到登录时才解锁或挂载
+  （`systemd-homed`、ecryptfs / gocryptfs、靠 autofs 挂载的网络家目录），开机时这个文件
+  根本不存在，核心只能退化成"登录后再联网"。
 - 客户端信任门户的 TLS 证书；`--http` 只用于调试。
 - 基于 `netsh` 的 SSID 探测需要 Windows 定位权限。没有该权限时客户端仍可工作，
   但无法区分 `Tsinghua-Secure` 与需要认证的 Wi-Fi —— 此时由外网探测来决定。

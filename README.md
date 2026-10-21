@@ -56,8 +56,8 @@ Linux and macOS, and speaks Chinese or English.
 3. **Open Settings.** Click the button in the top-right corner of the window.
 4. **Enter your credentials.** Type your TUNET account (for example
    `1234567890`) and your password, tick **Remember password**, then click
-   **Apply**. On Windows the password is handed to Credential Manager — it never
-   ends up in the settings file.
+   **Apply**. The password is sealed with a key bound to this machine before it
+   touches the disk, and never ends up in the settings file.
 5. **Connect.** Go back to the Status page and click **Connect** (or just wait a
    few seconds if *Auto connect* is already enabled). The dot in the header turns
    green and your IPv4 address appears.
@@ -122,11 +122,11 @@ clipboard. With nothing selected, right-click opens a small menu with
 
 | Setting | Effect |
 | --- | --- |
-| Start with the system | Adds or removes the autostart entry for your user |
-| Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round |
+| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — it would start a core a second later anyway |
+| Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
 | Auto connect | Log in as soon as a usable network appears |
 | Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
-| Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying hands the password to the OS credential store (never to the JSON file) and passes it to the running session immediately; *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
+| Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying seals the password into `credential.bin` (never into the JSON file) and passes it to the running session immediately; *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
 | Language | Follow system (default), 中文, English |
 | Log level | `DEBUG` / `INFO` / `WARN` / `ERROR`: the lowest level shown in the log page (`INFO` by default, stored in `config.json`) |
 | Version | Version on the left, build time on the right (local clock to the second, with its UTC offset) |
@@ -136,7 +136,7 @@ The three switches confirm the state they just moved to in a toast
 them is flipped.
 
 **Connect** uses the password the background worker holds: at launch that is what
-Credential Manager has (only if *Remember password* was saved), and afterwards
+the credential file has (only if *Remember password* was saved), and afterwards
 whatever was last applied — text typed into the fields does nothing until
 **Apply**, which is what the *Unsaved* marker warns about. Unticking *Remember
 password* and applying deletes the stored entry, yet the password you just typed
@@ -226,16 +226,45 @@ executable does both jobs.
 ```
 thunet                       # tray + window (same as no arguments)
 thunet --minimized           # start hidden in the tray
-thunet status                # JSON session / traffic dump
-thunet login [--force]       # authenticate once
-thunet logout                # de-authenticate
-thunet keepalive --interval 30 --count 5
-thunet run [--once]          # headless auto-connect loop
-thunet ac-id                 # print the detected portal ac_id
+thunet core                  # background service: owns the network session
+thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
+thunet status                # JSON: service state + portal session/traffic
+thunet login                 # ask the service to authenticate now
+thunet logout                # ask the service to de-authenticate
+thunet ac-id                 # portal ac_id the service is using
 thunet config                # config path + effective settings
 thunet shortcut              # create a desktop shortcut
 thunet selftest              # note: the real test vectors live in `cargo test`
 ```
+
+The window is only a *frontend*. The network session lives in `thunet core`,
+which the window starts on demand and then talks to over a per-user local
+socket. Closing the window therefore keeps you online, and the core is the half
+that can start at boot (systemd user unit on Linux, a second logon task on
+Windows — both created by the *Start with the system* setting).
+
+`status`, `login`, `logout` and `ac-id` are frontends too: they ask the running
+service over that same socket instead of contacting the portal themselves, so
+there is exactly one owner of the session. With no service running they stop
+with an error naming the command that starts it — they never fall back to a
+second, unmanaged connection.
+
+`thunet status` prints one object with both halves:
+
+```json
+{
+  "core":   { "version": "0.1.3", "pid": 1234, "uptime_secs": 812,
+              "state": "Online", "env": "Campus", "ac_id": "169",
+              "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
+              "wanted_online": true, "failures": 0, "frontends": 1,
+              "endpoint": "/run/user/1000/thunet/control.sock" },
+  "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
+}
+```
+
+The `core` half describes the running service (`uptime_secs`, the network
+verdict in `env`, the attached frontends). If the portal query fails, `portal`
+is `null`, `portal_error` carries the reason, and the command exits non-zero.
 
 Starting `thunet` while it is already running does **not** start a second copy:
 the existing window is brought back instead.
@@ -243,9 +272,10 @@ the existing window is brought back instead.
 Global overrides: `--host <host>`, `--http`, `--timeout <secs>`, `-u/--username`,
 `-p/--password`, `--ip <addr>`, `--ac-id <id>`.
 
-Precedence is **command line > config file > credential store**, so
-`thunet -u 1234567890 -p secret status` works without touching your saved
-settings.
+Precedence is **command line > config file > credential store**. `-u` / `-p` are
+handed to the service for `login` (in memory only, never written to disk), while
+`--host` / `--http` / `--timeout` shape what `thunet core` talks to:
+`thunet -u 1234567890 -p secret login`.
 
 ## 6. Where your data lives
 
@@ -260,19 +290,29 @@ Files in that directory:
 | File | Contents |
 | --- | --- |
 | `config.json` | Account name, portal host, autostart / minimise / auto-connect flags, keepalive settings, language. **No password** — that field is skipped when serialising. |
-| `credential.json` | macOS and Linux only: the saved password, mode `0600`. Windows uses Credential Manager instead. |
+| `credential.bin` | The sealed account/password pair, mode `0600`. Rewritten on every apply; unreadable if copied to another machine. |
 | `crash.log` | Appended only when the app panics. |
 
-Password storage by platform:
+Password storage is one implementation on every platform: `credential.bin` holds
+`MAGIC ‖ nonce ‖ ciphertext` (ChaCha20-Poly1305) with mode `0600`, under a key
+derived as `SHA-256("thunet/credential/v1" ‖ 0 ‖ machine identity)`.
 
-| OS | Store |
+| OS | Machine identity |
 | --- | --- |
-| Windows | Credential Manager, generic credential, target `thunet/auth4.tsinghua.edu.cn` (visible under *Control Panel → Credential Manager → Windows Credentials*) |
-| macOS / Linux | `credential.json` in the config directory, readable only by your user — no portable OS keyring is linked |
+| Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
+| Linux | `/etc/machine-id` (or `/var/lib/dbus/machine-id`) |
+| macOS | host name, until a release needs IOKit's `IOPlatformUUID` |
+
+The point of a machine key is unattended startup: the core has to log in before
+anyone logs in, so no logged-on user may be needed to unlock the secret. That
+also sets the limit — the file is useless once it leaves this machine (backups,
+dotfile repositories, a synced config directory), but any process running as you
+can read the same identity and decrypt it. Only a passphrase prompt or a TPM
+would stop that, and both cost unattended startup.
 
 Deleting `config.json` resets every setting. Uninstalling the package leaves this
 directory alone, so your account and preferences survive a reinstall; delete the
-directory and the Credential Manager entry for a clean slate.
+directory for a clean slate.
 
 ## 7. Installing, uninstalling, shortcuts
 
@@ -303,18 +343,46 @@ silent install (`msiexec /qn`, winget) does not, so it never hijacks a desktop.
 Double-clicking the package while it is already installed therefore ends with
 the app running rather than with a killed copy.
 
-Autostart is **not** part of the package — it is a user preference stored by the
-app:
+Autostart is **not** part of the package — the app registers the entries itself
+and reads the state back from the OS instead of storing it in `config.json`.
+There are two entries (tray and background service) and three modes:
+
+| Mode | Linux | Windows |
+| --- | --- | --- |
+| **Off** | nothing registered | nothing registered |
+| **Service** | systemd user unit `thunet.service` enabled; with `loginctl enable-linger` it also starts at boot, before anybody logs in | a `thunet` logon task: session kept alive, no tray icon |
+| **Service + tray** | unit + `~/.config/autostart/thunet.desktop` | two logon tasks, `thunet` (core) and `thunet-tray` |
+
+There is deliberately no tray-only mode: the tray would start a core a second
+later anyway, so the two switches are not independent.
 
 | OS | Autostart entry |
 | --- | --- |
-| Windows | A per-user Task Scheduler logon task named `thunet` (`schtasks /Create /XML`, no delay, least privilege) that runs `thunet.exe` (plus `--minimized` when *Start minimised* is on). The Task Scheduler service fires it before `explorer.exe` processes `Run` keys, so the app comes up earlier than a `Run` entry would. |
-| Linux | `~/.config/autostart/thunet.desktop`, started by the desktop session itself (XDG autostart). A systemd user unit could be launched slightly earlier, but it would race the tray host and the display socket, so the `.desktop` entry is both the standard and the reliable choice. |
-| macOS | LaunchAgent managed by the `auto-launch` crate |
+| Windows | Per-user Task Scheduler logon tasks (`schtasks /Create /XML`, no delay, least privilege) which the Task Scheduler service fires before `explorer.exe` processes `Run` keys. Both run as `InteractiveToken` + `LeastPrivilege` — the user's own token, no elevation — which is what keeps the location permission working. Starting before login would need a Windows service, which costs admin rights (and that permission), so only Linux starts the core before a login today. |
+| Linux | Tray: `~/.config/autostart/thunet.desktop`, started by the desktop session (XDG autostart), which every desktop honours, including the ones that never pull `graphical-session.target`. Core: a systemd user unit enabled per user — no root involved. |
+| macOS | A LaunchAgent managed by the `auto-launch` crate; the core is started by the tray. |
+
+The unit file is written on first start even with autostart off, so
+`systemctl --user start|stop|status thunet` works without visiting the
+settings page. `thunet service <action>` wraps both platforms in the same verbs:
+
+| Action | Linux | Windows |
+| --- | --- | --- |
+| `install` / `uninstall` | write / remove the unit | create / delete the core task (a task cannot exist without its trigger) |
+| `enable` / `disable` | put it in the login/boot path (and try `enable-linger`) | same as install / uninstall |
+| `start` / `stop` / `restart` | `systemctl --user …` | `schtasks /Run`, `/End` |
+| `status` | `systemctl --user status` | `schtasks /Query /V /FO LIST` |
+
+Once the core is registered it belongs to systemd / Task Scheduler: the window
+only reconnects to it and never spawns one behind the manager's back.
 
 Releases before this one wrote `HKCU\...\CurrentVersion\Run\thunet` on Windows;
 the first start of a newer build moves that value into the logon task (keeping
-the executable it recorded) and deletes it, so the app never starts twice.
+the executable it recorded) and deletes it, so the app never starts twice. A
+0.1.x install also used the task name `thunet` for its *tray*; that name is the
+core's now, and the two cannot be told apart afterwards, so the first start
+rewrites the task to run the core and starts in *Service* mode —
+pick *Service + tray* once in the settings to get the icon back.
 
 The only self-service action left is the desktop shortcut: **Create desktop
 shortcut** on the Settings page, or `thunet shortcut`, which puts a launcher for
@@ -323,10 +391,10 @@ file as trusted so GNOME will launch it).
 
 To remove THUnet: *Settings → Apps → THUnet → Uninstall* on Windows, or
 `sudo apt remove thunet` on Debian/Ubuntu. Your settings in `%APPDATA%\thunet`
-are left alone; delete that directory (and the Credential Manager entry) if you
+are left alone; delete that directory if you
 want a clean slate. Turn *Start with the system* off before uninstalling if you
-do not want the leftover autostart entry (on Windows that is the `thunet` task
-in Task Scheduler) to point at a missing executable.
+do not want the leftover autostart entry (on Windows that is the `thunet` and
+`thunet-tray` tasks in Task Scheduler) to point at a missing executable.
 
 ## 8. Installing with winget
 
@@ -482,7 +550,7 @@ Notes:
 | `src/session.rs` | state machine: refresh, login, keepalive, logout, backoff |
 | `src/ui.rs` | worker thread, window, tray, toasts, log strip |
 | `src/config.rs` | settings load/save, platform paths |
-| `src/secret.rs` | credential store backends |
+| `src/secret.rs` | sealed credential file (one implementation for every platform) |
 | `src/single.rs` | single-instance guard (second launch shows the first window) |
 | `src/shortcut/` | desktop shortcut creation per platform |
 | `src/i18n.rs` | Chinese/English strings |
@@ -495,8 +563,16 @@ Notes:
 
 - Only the campus portal protocol is implemented; there is no 802.1X or VPN
   support.
-- On Windows the password is protected by the OS credential store; on macOS and
-  Linux it is a `0600` file, so treat your home directory as trusted.
+- The saved password is sealed with a key bound to this machine (`credential.bin`,
+  mode `0600`): useless off this machine, but code running as you can decrypt
+  it, so treat your account on this machine as trusted.
+- **"Connected before login" assumes the home directory is readable at boot.**
+  File permissions only test the uid, not whether a login session exists, so
+  `systemd --user` (started at boot by `enable-linger`) reads
+  `~/.config/thunet/credential.bin` as you. If the home directory itself is only
+  unlocked or mounted at login (`systemd-homed`, ecryptfs / gocryptfs, a network
+  home directory behind autofs), the file does not exist at boot and the core
+  falls back to connecting after a login.
 - The client trusts the portal's TLS certificate; `--http` exists for debugging
   only.
 - `netsh`-based SSID detection needs Windows Location permission. Without it the

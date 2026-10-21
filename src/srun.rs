@@ -175,11 +175,6 @@ impl Client {
     Err("ac_id not found (portal not intercepting?)".into())
   }
 
-  /// Convenience wrapper for informational commands.
-  pub fn ac_id(&self) -> Result<String, String> {
-    self.detect_ac_id().map(|(id, _)| id)
-  }
-
   /// True when `/cgi-bin/rad_user_info` reports an active session.
   pub fn is_online(&self, ac_id: &str) -> bool {
     self

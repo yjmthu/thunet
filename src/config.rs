@@ -1,8 +1,8 @@
 //! Persistent settings in `%APPDATA%/thunet/config.json`.
 //!
 //! The password is never written to the JSON file: `password` is skipped by
-//! serde and the account/password pair is stored in Windows Credential Manager
-//! (see [`crate::secret`]), and only when the user ticks "remember password".
+//! serde and the account/password pair is sealed into `credential.bin` (see
+//! [`crate::secret`]), and only when the user ticks "remember password".
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ use crate::secret;
 #[serde(default)]
 pub struct Config {
   pub username: String,
-  /// Runtime only: never serialized. Persisted via Windows Credential Manager.
+  /// Runtime only: never serialized. Persisted by [`crate::secret`].
   #[serde(skip)]
   pub password: String,
   #[serde(default)]
@@ -105,8 +105,14 @@ impl Config {
           }
           cfg.password = pass;
         }
-        // Credential vanished (other user / cleared): fall back to typing it.
-        None => cfg.remember_password = false,
+        // Nothing usable is stored: a blob from another machine, a cleared
+        // entry, or a 0.1.x plain-text file this build does not read. Drop what
+        // is there — an unreadable blob and, above all, a plain-text password
+        // help nobody — and fall back to typing it.
+        None => {
+          cfg.remember_password = false;
+          secret::delete();
+        }
       }
     }
     cfg
