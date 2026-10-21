@@ -21,7 +21,7 @@ mod wifi;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use proto::{Cmd as CoreCmd, Ev as CoreEv, ToastKind};
 
@@ -156,8 +156,8 @@ enum Cmd {
   Logout,
   /// Run the background service (no window, no tray).
   ///
-  /// Normally started by the systemd user unit or the Windows logon task; the
-  /// tray starts it on demand when it is not running yet.
+  /// Normally started by the systemd user unit or the Windows logon task, or on
+  /// demand with `thunet service start` / the status page's *Start* button.
   Core,
   /// Install or control the background service.
   ///
@@ -171,6 +171,14 @@ enum Cmd {
   Config,
   /// Create a desktop shortcut for this executable.
   Shortcut,
+  /// Print a shell completion script.
+  ///
+  /// Write it where the shell looks for completions, for example
+  /// `thunet completions bash > ~/.local/share/bash-completion/completions/thunet`.
+  Completions {
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
+  },
 }
 
 fn main() {
@@ -219,11 +227,10 @@ fn run(cli: Cli) -> Result<(), String> {
     // equivalent: a launch without the flag still starts in the tray when the
     // user asked for that in the settings page.
     let minimized = cli.minimized || cfg.start_minimized;
-    // Make sure a core exists before the window starts looking for one. The
-    // window also retries, so failing here only means the log says why later.
-    if let Err(e) = ipc::ensure_core() {
-      eprintln!("warning: {e}");
-    }
+    // The window never starts a service by itself: it only talks to one that
+    // already answers (autostart at login, `thunet service start`, or the
+    // status page's *Start* button). Starting one here would make a deliberate
+    // `systemctl --user stop` look broken the next time the window opens.
     return ui::run(cfg, minimized);
   };
 
@@ -244,6 +251,17 @@ fn run(cli: Cli) -> Result<(), String> {
     Cmd::Shortcut => {
       shortcut::create_desktop_shortcut()?;
       println!("desktop shortcut created");
+      Ok(())
+    }
+    Cmd::Completions { shell } => {
+      // Generated from the same `clap` definition the parser uses, so the
+      // script can never drift from the real flags and subcommands. Rendering
+      // into a buffer first keeps `thunet completions bash | head` from
+      // panicking on the closed pipe `head` leaves behind.
+      let mut cmd = Cli::command();
+      let mut script = Vec::new();
+      clap_complete::generate(shell, &mut cmd, "thunet", &mut script);
+      let _ = std::io::stdout().write_all(&script);
       Ok(())
     }
     Cmd::AcId => {

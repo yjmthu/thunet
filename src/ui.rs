@@ -195,6 +195,18 @@ enum Page {
   Settings,
 }
 
+/// A click on the status page's Start/Stop button whose outcome is still
+/// unknown. The toast fires once the service has actually appeared or gone
+/// away, not when the button was pressed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceRequest {
+  Start,
+  Stop,
+}
+
+/// How long a Start/Stop may take before the click is reported as failed.
+const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Toast {
   msg: String,
   at: Instant,
@@ -214,6 +226,9 @@ pub struct App {
   info: Info,
   logs: Vec<Line>,
   last_error: Option<String>,
+  /// The missing-service warning is already in the log; keeps the two-second
+  /// reconnect cadence from repeating it.
+  service_warned: bool,
   cfg: Config,
   lang: Lang,
   /// Lowest level rendered in the log pane; older lines are kept and simply
@@ -253,6 +268,8 @@ pub struct App {
   shown: bool,
   quitting: bool,
   quit_at: Option<Instant>,
+  /// Start/Stop clicked on the status page, waiting for its outcome.
+  service_request: Option<(ServiceRequest, Instant)>,
 }
 
 /// Build the auto-launch entry; `--minimized` is only passed when the user
@@ -270,8 +287,9 @@ impl App {
       cloak::set(true);
     }
 
-    // `main` normally started a core already; if it did not, `logic()` keeps
-    // retrying (see `ensure_link`).
+    // Nothing starts a core at launch: connect if one already answers, and
+    // keep retrying from `logic()` (see `ensure_link`) while the status page
+    // offers *Start*.
     let link = Link::connect();
     let lang = Lang::from_setting(&cfg.lang);
     let min_level = Level::from_setting(&cfg.log_level);
@@ -348,6 +366,7 @@ impl App {
       info: Info::default(),
       logs,
       last_error: None,
+      service_warned: false,
       user_edit: cfg.username.clone(),
       pass_edit: cfg.password.clone(),
       remember: cfg.remember_password,
@@ -375,6 +394,7 @@ impl App {
       shown: !start_hidden,
       quitting: false,
       quit_at: None,
+      service_request: None,
     }
   }
 
@@ -395,10 +415,28 @@ impl App {
 
   /// Reconnect to the background core, without starting one.
   ///
-  /// Only `main` starts a core. A window that kept respawning it would make
-  /// `systemctl --user stop` / `schtasks /End` look broken.
+  /// Starting a core is an explicit action — autostart at login, the status
+  /// page's *Start* button, or the CLI. A window that respawned one on its own
+  /// would make `systemctl --user stop` / `schtasks /End` look broken.
   fn ensure_link(&mut self) {
-    if self.link.as_ref().is_some_and(Link::alive) || Instant::now() < self.next_link_try {
+    if self.link.as_ref().is_some_and(Link::alive) {
+      return;
+    }
+    // A link that went away means the service did too (stopped, crashed,
+    // replaced by an upgrade). Drop the facts it reported, otherwise the status
+    // page keeps claiming "running" for a process that is gone, and with it the
+    // last login error, which describes a session that no longer exists.
+    if self.link.take().is_some() {
+      self.core = None;
+      self.last_error = None;
+      // A pending *Stop* is only done once the core has actually hung up.
+      if let Some((ServiceRequest::Stop, _)) = self.service_request {
+        self.service_request = None;
+        let msg = self.t().service_stopped.to_string();
+        self.toast_ok(msg);
+      }
+    }
+    if Instant::now() < self.next_link_try {
       return;
     }
     self.next_link_try = Instant::now() + Duration::from_secs(2);
@@ -406,18 +444,30 @@ impl App {
       Some(link) => {
         self.link = Some(link);
         self.last_error = None;
+        self.service_warned = false;
         self.push_log(Line::info("connected to the background service"));
         self.send(Cmd::SetLang(self.lang));
         // Ask who we are talking to on the next pass.
         self.next_core_query = Instant::now();
       }
       None => {
-        let msg = "the background service is not running".to_string();
-        if self.last_error.as_deref() != Some(msg.as_str()) {
-          self.push_log(Line::warn(&msg));
-          self.last_error = Some(msg);
+        // Not a login failure, so this belongs in the log rather than in the
+        // red banner; the service row says "not running" by itself.
+        if !self.service_warned {
+          self.service_warned = true;
+          self.push_log(Line::warn("the background service is not running"));
         }
       }
+    }
+    // A pending *Start* is only done once a core actually answers.
+    if self
+      .service_request
+      .is_some_and(|(r, _)| r == ServiceRequest::Start)
+      && self.link.as_ref().is_some_and(Link::alive)
+    {
+      self.service_request = None;
+      let msg = self.t().service_started.to_string();
+      self.toast_ok(msg);
     }
   }
 
@@ -576,6 +626,17 @@ impl App {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
   }
 
+  /// Tray *Quit* (and closing the window when there is no tray icon).
+  ///
+  /// This ends the frontend only, whatever the autostart mode says: the core
+  /// owns the session and keeps running. Stopping it is a separate, explicit
+  /// action — the status page's *Stop* button or `thunet service stop`.
+  fn quit(&mut self) {
+    self.send(Cmd::Quit);
+    self.quitting = true;
+    self.quit_at = Some(Instant::now());
+  }
+
   fn handle_menu(&mut self, ctx: &egui::Context) {
     while let Ok(ev) = MenuEvent::receiver().try_recv() {
       match ev.id().0.as_str() {
@@ -591,11 +652,7 @@ impl App {
           };
           self.apply_autostart_mode(next);
         }
-        "quit" => {
-          self.send(Cmd::Quit);
-          self.quitting = true;
-          self.quit_at = Some(Instant::now());
-        }
+        "quit" => self.quit(),
         "show" => self.show_window(ctx),
         "hide" => self.hide_window(ctx),
         _ => {}
@@ -688,17 +745,16 @@ impl App {
         ui.add_space(8.0);
 
         if self.page == Page::Status {
+          // No core answering is the one state that makes every other action
+          // fail, so it gets a banner of its own — worded as missing service,
+          // not as a login failure. The service row further down carries the
+          // Start button.
+          if !self.link.as_ref().is_some_and(Link::alive) {
+            red_banner(ui, t.service_down);
+            ui.add_space(8.0);
+          }
           if let Some(err) = &self.last_error {
-            egui::Frame::new()
-              .fill(egui::Color32::from_rgb(90, 30, 30))
-              .inner_margin(egui::Margin::same(8))
-              .corner_radius(6)
-              .show(ui, |ui| {
-                ui.label(
-                  egui::RichText::new(format!("{}: {err}", t.login_failed))
-                    .color(egui::Color32::from_rgb(255, 190, 190)),
-                );
-              });
+            red_banner(ui, format!("{}: {err}", t.login_failed));
             ui.add_space(8.0);
           }
 
@@ -749,26 +805,65 @@ impl App {
               ui.end_row();
               // The core is a separate process; say whether one is answering and
               // which version it runs, so a half-finished upgrade is visible.
+              // The button beside it starts or stops that process: like
+              // `thunet service stop` it never closes this window, which keeps
+              // running and reconnects by itself when a service comes back.
+              let service = self
+                .core
+                .as_ref()
+                .map(|c| (c.version.clone(), c.uptime_secs));
               ui.label(t.service);
-              match &self.core {
-                Some(core) => {
-                  ui.horizontal(|ui| {
+              ui.horizontal(|ui| {
+                match &service {
+                  Some((version, uptime)) => {
                     ui.label(
                       egui::RichText::new(t.service_running).color(state_color(State::Online)),
                     );
-                    let version = format!("v{} · {}", core.version, human_uptime(core.uptime_secs));
-                    let text = egui::RichText::new(version).monospace();
-                    ui.label(if core.version == env!("CARGO_PKG_VERSION") {
+                    let label = format!("v{version} · {}", human_uptime(*uptime));
+                    let text = egui::RichText::new(label).monospace();
+                    ui.label(if version == env!("CARGO_PKG_VERSION") {
                       text.weak()
                     } else {
                       text.color(state_color(State::Authenticating))
                     });
-                  });
+                  }
+                  None => {
+                    ui.label(
+                      egui::RichText::new(t.service_gone).color(state_color(State::Offline)),
+                    );
+                  }
                 }
-                None => {
-                  ui.label(egui::RichText::new(t.service_gone).color(state_color(State::Offline)));
+                let running = service.is_some();
+                let label = if running {
+                  t.service_stop
+                } else {
+                  t.service_start
+                };
+                // One request at a time: the outcome arrives when the link is
+                // up (start) or down (stop), which takes a moment.
+                let idle = self.service_request.is_none();
+                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                  if running {
+                    // The core ends itself; the toast and the row's "not
+                    // running" appear together when the link drops.
+                    self.send(Cmd::Shutdown);
+                    self.service_request = Some((ServiceRequest::Stop, Instant::now()));
+                  } else {
+                    match crate::ipc::start_core() {
+                      Ok(()) => {
+                        // Do not sit out the reconnect throttle: the new core
+                        // is usually listening before the next frame.
+                        self.next_link_try = Instant::now();
+                        self.service_request = Some((ServiceRequest::Start, Instant::now()));
+                      }
+                      Err(e) => {
+                        self.push_log(Line::error(format!("service: {e}")));
+                        self.toast_err(t.service_start_failed.to_string());
+                      }
+                    }
+                  }
                 }
-              }
+              });
               ui.end_row();
             });
 
@@ -851,9 +946,10 @@ impl App {
 
           ui.add_space(2.0);
           // Three modes, not two checkboxes: "tray without core" is not worth
-          // offering, because the tray would start a core a second later. With
-          // the short labels from `i18n.rs` all three fit on the label's row,
-          // which is what keeps the page inside the fixed window height.
+          // offering, because a tray icon with no session behind it can only
+          // report "not running". With the short labels from `i18n.rs` all
+          // three fit on the label's row, which is what keeps the page inside
+          // the fixed window height.
           let mut mode = self.autostart_mode;
           ui.horizontal(|ui| {
             ui.label(t.autostart);
@@ -1027,6 +1123,33 @@ impl App {
             // than one run-on line.
             ui.horizontal(|ui| {
               ui.label(egui::RichText::new(build_version()).small().weak());
+              // Source link: the octocat itself is clickable instead of being a
+              // `Hyperlink`, whose label is painted in the link colour (the
+              // solid glyph then looks like a blue blob) and which is also
+              // selectable text (a click leaves a blue selection over it).
+              // The glyph is one of egui's bundled icons, so no image asset is
+              // needed; hovering shows the URL and the pointing-hand cursor.
+              let mark_color = ui.visuals().weak_text_color();
+              let mark = ui
+                .add(
+                  egui::Label::new(
+                    egui::RichText::new(egui::special_emojis::GITHUB)
+                      .small()
+                      .color(mark_color),
+                  )
+                  .selectable(false)
+                  .sense(egui::Sense::click()),
+                )
+                .on_hover_text(env!("CARGO_PKG_REPOSITORY"));
+              if mark.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+              }
+              if mark.clicked() {
+                ui.ctx().open_url(egui::OpenUrl {
+                  url: env!("CARGO_PKG_REPOSITORY").to_owned(),
+                  new_tab: true,
+                });
+              }
               ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(build_time_label(t)).small().weak());
               });
@@ -1538,6 +1661,24 @@ mod tests {
   }
 }
 
+/// Red strip for the two states that stop everything from working: an error
+/// reported by the core, and no core answering at all.
+fn red_banner(ui: &mut egui::Ui, text: impl Into<String>) {
+  egui::Frame::new()
+    .fill(egui::Color32::from_rgb(90, 30, 30))
+    .inner_margin(egui::Margin::same(8))
+    .corner_radius(6)
+    .show(ui, |ui| {
+      // Full width (instead of shrink-wrapping the text) and centred, so the
+      // strip reads as one band across the page rather than a small red box.
+      let width = ui.available_width();
+      ui.set_width(width);
+      ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(text.into()).color(egui::Color32::from_rgb(255, 190, 190)));
+      });
+    });
+}
+
 impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     // GTK delivers the appindicator menu callbacks through its own event loop,
@@ -1585,6 +1726,25 @@ impl eframe::App for App {
     // task): reconnect instead of going deaf.
     self.ensure_link();
 
+    // A Start/Stop whose outcome never arrived (no socket, or a core that did
+    // not exit) is reported instead of leaving the click unanswered.
+    if let Some((request, at)) = self.service_request
+      && at.elapsed() > SERVICE_REQUEST_TIMEOUT
+    {
+      self.service_request = None;
+      let log = match request {
+        ServiceRequest::Start => "service: no core answered after 10 s",
+        ServiceRequest::Stop => "service: the core is still running after 10 s",
+      };
+      self.push_log(Line::warn(log));
+      let msg = match request {
+        ServiceRequest::Start => self.t().service_start_failed,
+        ServiceRequest::Stop => self.t().service_stop_failed,
+      }
+      .to_string();
+      self.toast_err(msg);
+    }
+
     // Ask the service about itself now and then; the row it fills is advisory,
     // so a slow cadence is plenty.
     if self.link.as_ref().is_some_and(Link::alive) && Instant::now() >= self.next_core_query {
@@ -1620,9 +1780,7 @@ impl eframe::App for App {
         self.hide_window(ctx);
       } else {
         // No tray icon: hiding would leave the app unreachable, so close quits.
-        self.send(Cmd::Quit);
-        self.quitting = true;
-        self.quit_at = Some(Instant::now());
+        self.quit();
       }
     }
     if self.quitting {

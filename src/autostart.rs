@@ -27,9 +27,9 @@ pub const APP_NAME: &str = "thunet";
 
 /// How much of the app starts with the system.
 ///
-/// There are two entries (tray and background core), but their combinations are
-/// not independent: a tray without a core would spawn one a second later
-/// anyway, so that state is never offered.
+/// There are two entries (tray and background core). The tray never starts a
+/// core by itself, so "tray only" is not offered: it would put an icon on
+/// screen whose only message is "service not running".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
   /// Nothing starts automatically.
@@ -273,8 +273,9 @@ mod imp {
       register(&exe, a.args(), TRAY_TASK, false)?;
       changed = true;
     }
-    // A tray without a core would only start one a second later, so an
-    // installation that has the tray entry also gets the core entry.
+    // The tray no longer starts a core by itself, so an installation that
+    // autostarts the tray also gets the core entry: an icon with no session
+    // behind it would look broken.
     if task_exists(TRAY_TASK) && !task_exists(CORE_TASK) {
       register(&a.exe, &["core"], CORE_TASK, true)?;
       changed = true;

@@ -91,6 +91,7 @@ corner.
 | `Account` | The account the portal reports for the current session |
 | `IPv4` / `IPv6` | Addresses assigned by the campus network, each with a **Copy** button |
 | `Session traffic` | Bytes downloaded / uploaded during this session |
+| `Service` | Whether a core is answering, with its version and uptime; it turns to `not running` as soon as the core is stopped. The button beside it stops or starts that process — like `thunet service stop`, it never closes the window |
 | **Connect** / **Disconnect** / **Refresh** | Manual actions; only the ones that make sense are enabled |
 | Log strip | The most recent events, newest at the bottom |
 
@@ -122,14 +123,14 @@ clipboard. With nothing selected, right-click opens a small menu with
 
 | Setting | Effect |
 | --- | --- |
-| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — it would start a core a second later anyway |
+| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running" |
 | Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
 | Auto connect | Log in as soon as a usable network appears |
 | Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
 | Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying seals the password into `credential.bin` (never into the JSON file) and passes it to the running session immediately; *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
 | Language | Follow system (default), 中文, English |
 | Log level | `DEBUG` / `INFO` / `WARN` / `ERROR`: the lowest level shown in the log page (`INFO` by default, stored in `config.json`) |
-| Version | Version on the left, build time on the right (local clock to the second, with its UTC offset) |
+| Version | Version on the left, build time on the right (local clock to the second, with its UTC offset); the GitHub icon next to the version opens this repository |
 
 The three switches confirm the state they just moved to in a toast
 (*Start with system: On*), because nothing else on the page changes when one of
@@ -174,7 +175,10 @@ passed.
 **Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect`,
 `Autostart` and `Quit`.
 
-Closing the window hides it — the app keeps working. Only `Quit` really exits.
+Closing the window hides it — the app keeps working. `Quit` ends the window and
+its tray icon only: the background service keeps running, whatever the autostart
+mode says, and is stopped explicitly from the status page's *Stop* button or
+with `thunet service stop`.
 
 ### Feedback messages
 
@@ -184,6 +188,12 @@ online", "copied", or the state a switch just moved to
 ("Start with system: On"). Nothing succeeds silently.
 
 ## 3. Everyday tasks
+
+**Start the service** — the window never starts it by itself: while the
+`Service` row says `not running`, click **Start** next to it (or run
+`thunet service start`). A red banner at the top of the Status page says the
+same until a service answers again. **Stop** ends the service and leaves the
+window open.
 
 **Log in and out** — use the buttons on the Status page, the tray menu, or
 `thunet login` / `thunet logout`. If a session already exists the client says so
@@ -234,14 +244,29 @@ thunet logout                # ask the service to de-authenticate
 thunet ac-id                 # portal ac_id the service is using
 thunet config                # config path + effective settings
 thunet shortcut              # create a desktop shortcut
+thunet completions <shell>   # print a bash/zsh/fish/elvish/powershell completion script
 thunet selftest              # note: the real test vectors live in `cargo test`
 ```
 
+Completion scripts come from the same `clap` definition the parser uses, so they
+cover every subcommand (including `service <action>`) and every global flag:
+
+```
+thunet completions bash > ~/.local/share/bash-completion/completions/thunet
+thunet completions zsh  > ~/.zfunc/_thunet        # with: fpath=(~/.zfunc $fpath)
+thunet completions fish > ~/.config/fish/completions/thunet.fish
+```
+
+The `.deb` already installs bash, zsh and fish completions under `/usr/share`, so
+on Debian/Ubuntu they work right after `apt install` with nothing to set up.
+
 The window is only a *frontend*. The network session lives in `thunet core`,
-which the window starts on demand and then talks to over a per-user local
-socket. Closing the window therefore keeps you online, and the core is the half
-that can start at boot (systemd user unit on Linux, a second logon task on
-Windows — both created by the *Start with the system* setting).
+which the window talks to over a per-user local socket. The window never starts
+that process on its own: it comes from autostart at login, `thunet service
+start`, or the *Start* button on the status page. Closing the window therefore
+keeps you online, and the core is the half that can start at boot (systemd user
+unit on Linux, a second logon task on Windows — both created by the *Start with
+the system* setting).
 
 `status`, `login`, `logout` and `ac-id` are frontends too: they ask the running
 service over that same socket instead of contacting the portal themselves, so
@@ -353,14 +378,14 @@ There are two entries (tray and background service) and three modes:
 | **Service** | systemd user unit `thunet.service` enabled; with `loginctl enable-linger` it also starts at boot, before anybody logs in | a `thunet` logon task: session kept alive, no tray icon |
 | **Service + tray** | unit + `~/.config/autostart/thunet.desktop` | two logon tasks, `thunet` (core) and `thunet-tray` |
 
-There is deliberately no tray-only mode: the tray would start a core a second
-later anyway, so the two switches are not independent.
+There is deliberately no tray-only mode: the tray never starts a core by
+itself, so an icon without a service could only report "not running".
 
 | OS | Autostart entry |
 | --- | --- |
 | Windows | Per-user Task Scheduler logon tasks (`schtasks /Create /XML`, no delay, least privilege) which the Task Scheduler service fires before `explorer.exe` processes `Run` keys. Both run as `InteractiveToken` + `LeastPrivilege` — the user's own token, no elevation — which is what keeps the location permission working. Starting before login would need a Windows service, which costs admin rights (and that permission), so only Linux starts the core before a login today. |
 | Linux | Tray: `~/.config/autostart/thunet.desktop`, started by the desktop session (XDG autostart), which every desktop honours, including the ones that never pull `graphical-session.target`. Core: a systemd user unit enabled per user — no root involved. |
-| macOS | A LaunchAgent managed by the `auto-launch` crate; the core is started by the tray. |
+| macOS | A LaunchAgent managed by the `auto-launch` crate; the core itself is started on demand (`thunet core`, `thunet service start`, or the status page's *Start* button). |
 
 The unit file is written on first start even with autostart off, so
 `systemctl --user start|stop|status thunet` works without visiting the

@@ -18,7 +18,6 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ConnectOptions, ListenerOptions, Name};
@@ -29,9 +28,6 @@ use crate::proto::{Cmd, Ev, Msg, VERSION, Wire};
 /// How many recent events a frontend that connects late gets to see. Enough to
 /// fill the log pane (which shows a handful of lines) without growing forever.
 const HISTORY: usize = 200;
-
-/// How long a frontend waits for a freshly spawned core to publish its socket.
-const SPAWN_WAIT: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------- endpoint
 
@@ -236,6 +232,19 @@ pub fn serve(cfg: Config) -> Result<Serve, String> {
   Ok(Serve::Started)
 }
 
+/// End the core process from [`crate::core::worker`], in response to
+/// [`Cmd::Shutdown`].
+///
+/// The accept loop on the main thread would otherwise keep the process (and the
+/// endpoint) alive forever, so there is nothing to unwind: unlink the socket — a
+/// named pipe disappears with its process — and exit. `bind` already treats a
+/// socket file left behind as free, so a missed unlink would be harmless too.
+pub fn exit_core() -> ! {
+  #[cfg(unix)]
+  let _ = std::fs::remove_file(endpoint());
+  std::process::exit(0)
+}
+
 fn bind(path: &str) -> Result<LocalSocketListener, BindError> {
   let create = || -> std::io::Result<LocalSocketListener> {
     let name = name(path)?;
@@ -415,31 +424,20 @@ pub fn open() -> Option<Link> {
   Link::connect()
 }
 
-/// Connect to the core, starting one if it is not running yet.
+/// Ask for a core without waiting for it to answer.
 ///
-/// Everything goes through the socket even in the "portable" case: one code
-/// path on every platform, and the session survives closing the window.
-pub fn ensure_core() -> Result<Link, String> {
-  if let Some(link) = Link::connect() {
-    return Ok(link);
-  }
+/// The service manager is asked when the core is registered with it (a second,
+/// unmanaged copy would make `stop` useless and fight the unit's `Restart=`
+/// policy); otherwise a plain `thunet core` is spawned. The caller keeps its own
+/// reconnect cadence, and registering a start (`systemctl` / `schtasks`) runs
+/// synchronously, so this is a click-sized call, not a request to poll.
+pub fn start_core() -> Result<(), String> {
   if crate::autostart::core_managed() {
-    // The core belongs to systemd / Task Scheduler. Ask that manager to start
-    // it: spawning a second, unmanaged copy behind its back would make `stop`
-    // useless and fight the unit's own `Restart=` policy.
     crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)?;
+    Ok(())
   } else {
-    spawn_core()?;
+    spawn_core()
   }
-  // The socket appears as soon as the core has bound it, before it touches the
-  // network, so this is a short wait even on a machine with no connectivity.
-  for _ in 0..60 {
-    std::thread::sleep(SPAWN_WAIT);
-    if let Some(link) = Link::connect() {
-      return Ok(link);
-    }
-  }
-  Err("the background service did not start".into())
 }
 
 fn spawn_core() -> Result<(), String> {
@@ -462,6 +460,8 @@ fn spawn_core() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use super::*;
   use crate::logline::Line;
   use crate::proto::{LoginEnv, ToastKind};

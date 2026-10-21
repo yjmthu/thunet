@@ -19,8 +19,10 @@ use crate::proto::{Cmd, Ev, LoginEnv, ToastKind};
 use crate::session::{Session, State};
 use crate::srun::NetEnv;
 
-/// How often the network is re-probed while offline. A missing network makes
-/// every probe wait for its timeout, so that case backs off much further.
+/// How often the network is re-probed. Without a route every probe waits out
+/// its timeout, so that case backs off much further; a route that answers
+/// nothing keeps the normal cadence, because DNS and the portal can lag behind
+/// the link at boot.
 const ENV_PROBE_MS: u64 = 15_000;
 const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
 
@@ -230,28 +232,20 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           // The frontend is closing, not the session: the core outlives it and
           // keeps the connection alive (that is the whole point of the split).
         }
-      }
-    }
-
-    // Probe the network on a timer, online or not: the answer is what greys out
-    // *Connect* off-campus, and it must not be 15 s stale after a Wi-Fi change.
-    if session.state != State::Online && Instant::now() >= next_env_probe {
-      let (env, ac_id) = probe_env(&session);
-      if let Some(ac_id) = ac_id {
-        session.set_ac_id(ac_id);
-      }
-      let wait = if env == LoginEnv::NoNetwork {
-        ENV_PROBE_OFFLINE_MS
-      } else {
-        ENV_PROBE_MS
-      };
-      next_env_probe = Instant::now() + Duration::from_millis(wait);
-      if env != last_env {
-        tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
+        Cmd::Shutdown => {
+          // The user asked for the service to stop (the status page's *Stop*
+          // button; tray *Quit* only ends the window). End the process itself:
+          // the accept loop would otherwise keep the session, its keepalive and
+          // the endpoint alive for nobody. A clean exit is what both service
+          // managers expect — `Restart=on-failure` / `RestartOnFailure` leave
+          // it alone.
+          tx.send(Ev::Log(Line::info(
+            "service stopping at the frontend's request",
+          )))
           .ok();
+          crate::ipc::exit_core();
+        }
       }
-      last_env = env.clone();
-      tx.send(Ev::Env(env)).ok();
     }
 
     // A login attempt without credentials can only be rejected, so say what is
@@ -276,6 +270,12 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     }
 
     // Fast link watch: retry the moment a usable route appears.
+    //
+    // This runs *before* the probe on purpose: a rising edge makes the probe
+    // happen in this same pass, so the attempt at the bottom sees the network
+    // that just appeared instead of the verdict from before it came up. (With
+    // the probe first, boot used to skip once on "no network" and then sit out
+    // that skip's 30 s delay even though the link was already usable.)
     if !missing_creds
       && want_online
       && session.state != State::Online
@@ -287,11 +287,39 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         next_attempt = Instant::now();
         failures = 0;
         last_failure.clear();
-        // The network just changed: re-probe before the attempt below so the
-        // skip decision (and the Connect button) matches the new link.
         next_env_probe = Instant::now();
       }
       link_ready = up;
+    }
+
+    // Probe the network on a timer, online or not: the answer is what greys out
+    // *Connect* off-campus, and it must not be 15 s stale after a Wi-Fi change.
+    if session.state != State::Online && Instant::now() >= next_env_probe {
+      let (env, ac_id) = probe_env(&session);
+      if let Some(ac_id) = ac_id {
+        session.set_ac_id(ac_id);
+      }
+      // Without a route there is nothing to probe, so back off hard. A route
+      // that answers nothing (DNS or the portal still coming up at boot, a
+      // LAN without internet) stays on the normal cadence: the machine is on
+      // a network, it just is not a usable one yet.
+      let wait = if env == LoginEnv::NoNetwork && !link_ready {
+        ENV_PROBE_OFFLINE_MS
+      } else {
+        ENV_PROBE_MS
+      };
+      next_env_probe = Instant::now() + Duration::from_millis(wait);
+      if env != last_env {
+        tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
+          .ok();
+        // The verdict changed (no link → campus, or back), so decide again in
+        // this pass instead of sitting out a backoff chosen for the old one.
+        next_attempt = Instant::now();
+        failures = 0;
+        last_failure.clear();
+      }
+      last_env = env.clone();
+      tx.send(Ev::Env(env)).ok();
     }
 
     if !missing_creds
@@ -302,8 +330,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     {
       // Never spray login attempts at a network where logging in cannot work:
       // enterprise Wi-Fi (802.1X), no cable/Wi-Fi, a network that already
-      // reaches the internet, or some other operator's captive portal. The probe
-      // at the top of the loop already decided which case this is.
+      // reaches the internet, or some other operator's captive portal. The
+      // probe above already decided which case this is.
       let mut skip: Option<(String, String, Duration, ToastKind)> = None;
       match last_env.clone() {
         LoginEnv::Campus => {}

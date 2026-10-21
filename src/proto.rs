@@ -44,6 +44,14 @@ pub enum Cmd {
   AcId,
   /// The frontend is going away. The core keeps running: it owns the session.
   Quit,
+  /// The frontend wants the core to stop: the status page's *Stop* button was
+  /// used (tray *Quit* deliberately only ends the window). The core ends the
+  /// session itself instead of lingering unseen.
+  ///
+  /// Additive on purpose, so [`VERSION`] stays put: a core built before this
+  /// variant existed skips the line it cannot parse, which is exactly the old
+  /// "keep running" behaviour.
+  Shutdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +182,19 @@ mod tests {
       }
       other => panic!("wrong variant: {other:?}"),
     }
+  }
+
+  #[test]
+  fn shutdown_is_a_plain_command_older_cores_skip() {
+    let text = Wire::cmd(Cmd::Shutdown).line().unwrap();
+    assert_eq!(
+      text.trim_end(),
+      r#"{"v":1,"msg":{"t":"cmd","m":"Shutdown"}}"#
+    );
+    assert!(matches!(
+      Wire::parse(text.trim_end()).unwrap().msg,
+      Msg::Cmd(Cmd::Shutdown)
+    ));
   }
 
   #[test]

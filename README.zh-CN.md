@@ -72,6 +72,7 @@
 | `账号` | 门户报告的本会话账号 |
 | `IPv4` / `IPv6` | 校园网分配的地址，各带一个**复制**按钮 |
 | `本次流量` | 本次会话的下载 / 上传字节数 |
+| `后台服务` | 是否有 core 在应答，以及它的版本和运行时长；core 一停（例如 `thunet service stop`）就立刻变成 `未运行`。右侧按钮用于在不关闭窗口的前提下停止 / 启动服务：运行中显示 `停止`，否则显示 `启动` |
 | **连接** / **断开** / **刷新** | 手动操作，只启用当前有意义的那几个 |
 | 日志条 | 最近发生的事件，最新的在最下面 |
 
@@ -100,14 +101,14 @@
 
 | 设置项 | 作用 |
 | --- | --- |
-| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——那相当于晚一秒再启动核心 |
+| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——托盘自己不会拉起 core，那样的图标只会一直显示"未运行" |
 | 启动时最小化到托盘 | 与上一项相互独立：可以自启但隐藏，也可以手动启动时打开窗口，反之亦然。在"服务"档位下置灰（根本没有托盘要最小化） |
 | 启动时自动连接 | 一检测到可用网络就登录 |
 | 创建桌面快捷方式 | 为当前运行的可执行文件在桌面生成一个启动器（等同于 `thunet shortcut`） |
 | 账号 / 密码 / 记住密码 / 应用 / 还原 | 这是唯一一行不会边输入边保存的设置：内容与已保存值不同时会变成强调色并出现 *未保存* 标记。应用会把密码加密写入 `credential.bin`（不会写进 JSON），并立刻交给正在运行的会话；还原会丢弃修改，恢复已保存的账号、密码和勾选状态（关闭*记住密码*时它是灰的，因为没有可恢复的内容） |
 | 语言 | 跟随系统（默认）、中文、English |
 | 日志级别 | `DEBUG` / `INFO` / `WARN` / `ERROR`：日志页显示的最低级别（默认 `INFO`，存在 `config.json` 里） |
-| 版本 | 左边是版本号，右边是构建时间（本地时钟，精确到秒，并带 UTC 偏移） |
+| 版本 | 左边是版本号，右边是构建时间（本地时钟，精确到秒，并带 UTC 偏移）；版本号右侧的 GitHub 图标会打开本仓库 |
 
 三个开关在切换后会用一个提示条确认当前状态（*开机自启：开*），因为页面上没有别的
 东西会随之变化。
@@ -141,7 +142,9 @@
 
 **右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`开机自启`、`退出`。
 
-关闭窗口只是隐藏 —— 程序继续工作。只有 `退出` 才真正结束进程。
+关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务
+照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或
+`thunet service stop`。
 
 ### 提示消息
 
@@ -150,6 +153,10 @@
 （*开机自启：开*）。没有任何操作是静默成功的。
 
 ## 3. 日常操作
+
+**启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它
+右边的 **启动**（或执行 `thunet service start`）。在服务重新应答之前，状态页顶部
+会一直有一条红色横幅说明这一点。**停止** 会结束服务，但窗口保持打开。
 
 **登录与注销** —— 用状态页的按钮、托盘菜单，或者 `thunet login` / `thunet logout`。
 如果会话已经存在，客户端会直接告诉你，而不是重复认证。
@@ -195,13 +202,27 @@ thunet logout                # 让服务注销
 thunet ac-id                 # 服务正在使用的门户 ac_id
 thunet config                # 配置路径 + 生效中的设置
 thunet shortcut              # 创建桌面快捷方式
+thunet completions <shell>   # 输出 bash/zsh/fish/elvish/powershell 补全脚本
 thunet selftest              # 注意：真正的测试向量在 `cargo test` 里
 ```
 
-窗口只是一个**前端**。网络会话住在 `thunet core` 里：窗口按需把它拉起来，之后
-两者通过一个按用户隔离的本地套接字通信。所以关掉窗口不会掉线，而且只有 core 这
-一半能在开机时起（Linux 是 systemd user unit，Windows 是第二个登录任务——都由
-设置页的「随系统启动」创建）。
+补全脚本由解析器使用的同一份 `clap` 定义生成，所以每个子命令（含
+`service <action>`）和每个全局参数都能补全：
+
+```
+thunet completions bash > ~/.local/share/bash-completion/completions/thunet
+thunet completions zsh  > ~/.zfunc/_thunet        # 需配合 fpath=(~/.zfunc $fpath)
+thunet completions fish > ~/.config/fish/completions/thunet.fish
+```
+
+`.deb` 已经把 bash、zsh、fish 的补全装到 `/usr/share` 下，所以在
+Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
+
+窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过一个按用户隔离的
+本地套接字通信。窗口不会自己拉起 core：它来自开机自启、`thunet service start`，
+或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有 core 这一半能在开机时起
+（Linux 是 systemd user unit，Windows 是第二个登录任务——都由设置页的「随系统启动」
+创建）。
 
 `status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行
 的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，
@@ -299,13 +320,13 @@ MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也�
 | **服务** | 启用 systemd 用户单元 `thunet.service`；配合 `loginctl enable-linger` 可**在登录前**起飞 | `thunet` 登录任务：保持在线，但没有托盘图标 |
 | **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 两个登录任务：`thunet`（核心）与 `thunet-tray`（托盘） |
 
-没有提供"只启动托盘"：托盘起来后一秒内就会把 core 拉起来，两个开关并不独立。
+没有提供"只启动托盘"：托盘自己不会拉起 core，单独一个图标只能一直报"未运行"。
 
 | 系统 | 自启项 |
 | --- | --- |
 | Windows | 每用户计划任务（`schtasks /Create /XML`，无延迟、最低权限）。Task Scheduler 服务在 `explorer.exe` 处理 `Run` 键之前触发它们。两者都是 `InteractiveToken` + `LeastPrivilege`，即用户自己的令牌、不提权 —— 这是定位权限还能用的前提。Windows 想"登录前"就只能装服务，而那需要管理员权限（并且会丢掉这项权限），所以目前只有 Linux 会在登录前启动核心。 |
 | Linux | 托盘：`~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart），所有桌面都认；后台服务：systemd 用户单元，按用户 enable，不需要 root。 |
-| macOS | 由 `auto-launch` crate 管理的 LaunchAgent；后台服务由托盘拉起。 |
+| macOS | 由 `auto-launch` crate 管理的 LaunchAgent；core 本身用 `thunet core`、`thunet service start` 或状态页的「启动」按需拉起。 |
 
 即使在关闭档位，第一次运行也会把 unit 文件写上，所以
 `systemctl --user start|stop|status thunet` 不用进设置页就能用。
