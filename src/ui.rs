@@ -233,6 +233,11 @@ pub struct App {
   /// so one value is not compared on every frame.
   pass_check_at: Option<Instant>,
   pass_checked: String,
+  /// A `SetCredentials` is in flight. The window keeps the typed password and
+  /// the *Remember* choice until the core reports that it stored them; a
+  /// failed save (for example a permissions error) must not silently flip the
+  /// checkbox back.
+  credential_save_pending: bool,
   next_core_query: Instant,
   core_version_warned: bool,
   state: State,
@@ -421,6 +426,7 @@ impl App {
       pass_matches: None,
       pass_check_at: None,
       pass_checked: String::new(),
+      credential_save_pending: false,
       next_core_query: Instant::now(),
       core_version_warned: false,
       state: State::Offline,
@@ -569,12 +575,10 @@ impl App {
         password: self.cfg.password.clone(),
         remember: self.cfg.remember_password,
       });
-      // The machine core holds it from now on. Keeping a copy here would make
-      // the window claim a stored password it cannot verify against the core.
-      self.cfg.password.clear();
-      self.pass_edit.clear();
-      self.pass_matches = None;
-      self.pass_checked.clear();
+      // Keep the typed value and the checkbox until `Ev::Credentials` confirms
+      // that the core stored it; a failed save must not erase what the user
+      // entered (the error banner explains why it failed).
+      self.credential_save_pending = true;
     }
     // A pending *Start* is only done once the core actually answers. On
     // Windows the only supported start target is the service, so a portable
@@ -704,13 +708,10 @@ impl App {
           remember: self.cfg.remember_password,
         });
         if owned_by_core {
-          // The core is the only holder now; the field goes back to empty and
-          // the hint explains that the saved value is kept as long as it stays
-          // empty. `Ev::Credentials` will confirm it and fill in the state.
-          self.cfg.password.clear();
-          self.pass_edit.clear();
-          self.pass_matches = None;
-          self.pass_checked.clear();
+          // The core is the only holder once it confirms; keep the typed value
+          // and the checkbox until then so a failed save leaves the user's
+          // input (and the *Remember* tick) intact.
+          self.credential_save_pending = true;
         }
       }
       Err(e) => {
@@ -752,14 +753,31 @@ impl App {
     let editing_user = self.user_edit.trim() != self.cfg.username;
     let editing_remember = self.remember != self.cfg.remember_password;
     self.cfg.username = state.username.clone();
-    self.cfg.remember_password = state.remembered;
-    // Never keep a copy: `has_password` says whether the core has one.
-    self.cfg.password.clear();
     if !editing_user {
       self.user_edit = state.username.clone();
     }
-    if !editing_remember {
-      self.remember = state.remembered;
+    if self.credential_save_pending {
+      // Do not let a failed save (or a periodic status report that still shows
+      // the old state) undo the checkbox the user just ticked. Only a state
+      // that matches the request is a confirmation.
+      let confirmed = state.remembered == self.remember && (state.has_password || !self.remember);
+      if confirmed {
+        self.credential_save_pending = false;
+        self.cfg.remember_password = state.remembered;
+        // The core holds it now; the window keeps no copy and the hint says
+        // that an empty field keeps the saved value.
+        self.cfg.password.clear();
+        self.pass_edit.clear();
+        self.pass_matches = None;
+        self.pass_checked.clear();
+      }
+    } else {
+      self.cfg.remember_password = state.remembered;
+      // Never keep a copy: `has_password` says whether the core has one.
+      self.cfg.password.clear();
+      if !editing_remember {
+        self.remember = state.remembered;
+      }
     }
     self.core_cred = Some(state.clone());
   }
@@ -1104,7 +1122,10 @@ impl App {
             banners.push(t.service_down.to_string());
           }
           if let Some(err) = &self.last_error {
-            banners.push(format!("{}: {err}", t.login_failed));
+            // The core's messages already name the failed operation
+            // (`Cannot save the credential`, `Refresh failed`, ...), so the
+            // banner must not prepend "Login failed".
+            banners.push(err.clone());
           }
           if !banners.is_empty() {
             banner_overlay(ui, banners.join("\n"));

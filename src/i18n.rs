@@ -119,8 +119,9 @@ pub struct Texts {
   pub service_stop_failed: &'static str,
   /// Apply was pressed while the machine service was down; a start is running.
   pub service_starting: &'static str,
+  /// The core could not write the sealed credential (permissions, disk).
+  pub cannot_save_credential: &'static str,
   // messages
-  pub login_failed: &'static str,
   pub connect_ok: &'static str,
   pub connect_failed: &'static str,
   /// The portal rejected the account/password pair (see
@@ -202,7 +203,7 @@ static ZH: Texts = Texts {
   service_start_failed: "后台服务启动失败",
   service_stop_failed: "后台服务停止失败",
   service_starting: "正在启动后台服务，请稍候…",
-  login_failed: "登录失败",
+  cannot_save_credential: "无法保存凭据",
   connect_ok: "连接成功",
   connect_failed: "连接失败",
   invalid_credentials: "用户名或密码错误",
@@ -279,7 +280,7 @@ static EN: Texts = Texts {
   service_start_failed: "Service failed to start",
   service_stop_failed: "Service failed to stop",
   service_starting: "Starting the background service…",
-  login_failed: "Login failed",
+  cannot_save_credential: "Cannot save the credential",
   connect_ok: "Connected",
   connect_failed: "Connection failed",
   invalid_credentials: "Wrong username or password",

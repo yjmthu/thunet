@@ -173,6 +173,7 @@ disable\:"Stop starting automatically (a running core keeps running)"
 start\:""
 stop\:""
 restart\:""
+repair\:"Re-apply the state-directory permissions (installer/elevation internal)"
 status\:"Print what the platform'\''s service manager says"))' \
 && ret=0
 ;;
@@ -199,6 +200,7 @@ disable\:"Stop starting automatically (a running core keeps running)"
 start\:""
 stop\:""
 restart\:""
+repair\:"Re-apply the state-directory permissions (installer/elevation internal)"
 status\:"Print what the platform'\''s service manager says"))' \
 && ret=0
 ;;

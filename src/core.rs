@@ -250,8 +250,11 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           match session.cfg().save_to(&dir) {
             Ok(()) => remembered = remember && !session.cfg().password.is_empty(),
             Err(e) => {
-              tx.send(Ev::Error(Some(format!("cannot save the credential: {e}"))))
-                .ok();
+              tx.send(Ev::Error(Some(format!(
+                "{}: {e}",
+                t.cannot_save_credential
+              ))))
+              .ok();
             }
           }
           let after = (
