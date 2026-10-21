@@ -178,6 +178,17 @@ pub fn service_admin(action: ServiceAction) -> Result<(), String> {
   imp::service_direct(action, &me).map(|_| ())
 }
 
+/// Delete the machine state directory after a real uninstall.
+///
+/// The MSI runs this only when it removes the product (`REMOVE="ALL"` without
+/// `UPGRADINGPRODUCTCODE`), never for an upgrade, a repair or a reinstall: the
+/// sealed credential and `key.bin` are machine state, so they must not outlive
+/// the package. The per-user directory (window preferences, no secret) is left
+/// alone.
+pub fn purge_machine_state() -> Result<(), String> {
+  imp::purge_machine_state()
+}
+
 /// Is the core registered with the OS as something that starts on its own?
 ///
 /// A registered core belongs to systemd / Task Scheduler, so the tray must ask
@@ -311,17 +322,14 @@ mod imp {
   /// Start the core again after the installer replaced the binary, after
   /// making sure the registration points at the build that was just installed.
   pub fn resume_after_update() -> Result<(), String> {
-    if crate::elevate::is_elevated() {
-      if let Some(me) = Autostart::new(false) {
-        sync_image_path(&me)?;
-      }
-      // The package is the one place that always runs elevated after the
-      // files were replaced, so it is also the reliable point to repair the
-      // state-directory ACL. A service registered by an older build may have
-      // been created before the virtual account existed; the directory then
-      // belongs to SYSTEM/Administrators only, and the core can log in but
-      // cannot read `key.bin` or save a credential.
-      ensure_machine_dir()?;
+    if crate::elevate::is_elevated()
+      && let Some(me) = Autostart::new(false)
+    {
+      sync_image_path(&me)?;
+      // An upgrade keeps `%ProgramData%\thunet`, so a previous install's DACL
+      // on `key.bin` and `credential.bin` survives it and the new core can read
+      // `config.json` but not the key. Re-apply the service-only ACL to the
+      // whole tree, not just to the directory.
       harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     }
     if !core_starts_at_boot() {
@@ -337,6 +345,17 @@ mod imp {
       }
     }
     start()
+  }
+
+  /// Remove `%ProgramData%\thunet` and everything in it. The installer stops
+  /// and deletes the service before this runs, so no file is held open.
+  pub fn purge_machine_state() -> Result<(), String> {
+    let dir = crate::config::machine_dir();
+    match std::fs::remove_dir_all(&dir) {
+      Ok(()) => Ok(()),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      Err(e) => Err(format!("{}: {e}", dir.display())),
+    }
   }
 
   /// `thunet service <action>`. The actions that change the registration ask
@@ -394,15 +413,6 @@ mod imp {
         if service_open(SERVICE_QUERY_STATUS).is_none() {
           install(a)?;
         }
-        // This action runs elevated (see `needs_admin`), and starting is the
-        // moment the core needs the state directory. Re-apply the ACL every
-        // time: an earlier install may have registered the service before the
-        // virtual account existed, so the directory can be readable only by
-        // SYSTEM/Administrators even though the service starts fine. Without
-        // the repair the core can log in but cannot read `key.bin` or save a
-        // credential ("cannot read ... key.bin").
-        ensure_machine_dir()?;
-        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core started".into())
       }
@@ -412,8 +422,6 @@ mod imp {
       }
       ServiceAction::Restart => {
         let _ = stop();
-        ensure_machine_dir()?;
-        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core restarted".into())
       }
@@ -472,10 +480,6 @@ mod imp {
     if service_open(SERVICE_QUERY_STATUS).is_none() {
       install(a)?;
     }
-    // Same repair as *Start*: this runs elevated and the core needs the
-    // directory as soon as it starts at the next logon.
-    ensure_machine_dir()?;
-    harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     sc(&["config", CORE_SERVICE, "start=", "auto"])?;
     Ok(())
   }
@@ -1219,6 +1223,12 @@ mod imp {
   /// Nothing to resume by hand: systemd applies `Restart=` and the enabled
   /// unit starts at the next login.
   pub fn resume_after_update() -> Result<(), String> {
+    Ok(())
+  }
+
+  /// The `.deb` removes `/var/lib/thunet` from `postrm` on a real uninstall, so
+  /// this entry point has nothing to do here.
+  pub fn purge_machine_state() -> Result<(), String> {
     Ok(())
   }
 

@@ -512,6 +512,10 @@ impl App {
       // A pending *Stop* is only done once the core has actually hung up.
       if let Some((ServiceRequest::Stop, _)) = self.service_request {
         self.service_request = None;
+        // "Not running" is the expected outcome of this click, not a warning:
+        // keep the reconnect probe quiet until a core answers again. The flag
+        // resets on a successful connect, so a real outage still reports.
+        self.service_warned = true;
         let msg = self.t().service_stopped.to_string();
         self.toast_ok(msg);
       }
@@ -520,9 +524,6 @@ impl App {
       return;
     }
     self.next_link_try = Instant::now() + Duration::from_secs(2);
-    self.push_log(Line::debug(
-      "frontend: trying the machine and portable endpoints",
-    ));
     match crate::ipc::open_result() {
       Ok(link) => {
         let kind = if link.is_machine() {
@@ -2027,7 +2028,6 @@ mod tests {
       username: "alice".into(),
       has_password: true,
       remembered: true,
-      revision: 2,
       matches: None,
     };
     let empty = CredentialEdits::new("alice", "", true, &cfg, Some(&core), None);

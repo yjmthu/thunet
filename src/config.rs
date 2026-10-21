@@ -4,7 +4,7 @@
 //! serde and the account/password pair is sealed into `credential.bin` (see
 //! [`crate::secret`]), and only when the user ticks "remember password".
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -136,16 +136,25 @@ impl Config {
 
   /// Load the machine-wide settings used by the core.
   pub fn load_machine() -> Self {
-    let dir = machine_dir();
-    let cfg = Self::load_from(&dir);
-    recover_stored(cfg, &dir)
+    Self::load_from(&machine_dir())
   }
 
   pub fn load_from(dir: &std::path::Path) -> Self {
-    let mut cfg: Config = std::fs::read_to_string(path_in(dir))
-      .ok()
-      .and_then(|s| serde_json::from_str(&s).ok())
-      .unwrap_or_default();
+    let path = path_in(dir);
+    let mut cfg: Config = match std::fs::read_to_string(&path) {
+      Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+      Err(e) => {
+        // A file this account cannot open - an empty DACL left by an older
+        // install, or EFS under another account - is unusable to us and would
+        // also fail every later save. Remove it through the directory's
+        // delete-child right so the next save creates a healthy one; the
+        // defaults below are all that can be recovered anyway.
+        if e.kind() != std::io::ErrorKind::NotFound {
+          let _ = std::fs::remove_file(&path);
+        }
+        Config::default()
+      }
+    };
     if cfg.remember_password {
       match secret::load_in(dir) {
         Some((user, pass)) => {
@@ -178,7 +187,14 @@ impl Config {
       std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-    std::fs::write(&p, body).map_err(|e| e.to_string())
+    if let Err(first) = std::fs::write(&p, &body) {
+      // Same recovery as on load: an unwritable file (a stale DACL) is
+      // recreated instead of blocking every save.
+      let _ = std::fs::remove_file(&p);
+      std::fs::write(&p, &body)
+        .map_err(|e| format!("{}: {e} (first attempt: {first})", p.display()))?;
+    }
+    Ok(())
   }
 
   pub fn save_to(&self, dir: &std::path::Path) -> Result<(), String> {
@@ -195,7 +211,14 @@ impl Config {
     }
     let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
     let path = path_in(dir);
-    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    if let Err(first) = std::fs::write(&path, &body) {
+      // A `config.json` written by an older install can carry an empty DACL:
+      // unreadable, and unwritable even for the service. Drop and recreate it
+      // rather than failing every save for the rest of the installation.
+      let _ = std::fs::remove_file(&path);
+      std::fs::write(&path, &body)
+        .map_err(|e| format!("{}: {e} (first attempt: {first})", path.display()))?;
+    }
     #[cfg(unix)]
     {
       use std::os::unix::fs::PermissionsExt as _;
@@ -203,27 +226,6 @@ impl Config {
     }
     Ok(())
   }
-}
-
-/// Adopt a sealed credential that the machine config does not mention.
-///
-/// A core older than the `remember_password` bookkeeping wrote `credential.bin`
-/// but never recorded the flag in its own `config.json`, so a restart ignored
-/// the credential it had just saved. The blob itself is the durable record of
-/// that intent: it is only written while the box is ticked and deleted when the
-/// box is cleared. Reading it here makes such an installation heal on the next
-/// start instead of silently asking for the password again.
-fn recover_stored(mut cfg: Config, dir: &Path) -> Config {
-  if let Some((user, pass)) = secret::load_in(dir) {
-    if cfg.username.is_empty() {
-      cfg.username = user;
-    }
-    if cfg.password.is_empty() {
-      cfg.password = pass;
-    }
-    cfg.remember_password = true;
-  }
-  cfg
 }
 
 #[cfg(test)]
@@ -250,28 +252,5 @@ mod tests {
     assert!(!cfg.start_minimized, "start-minimized is opt-in");
     assert!(cfg.password.is_empty());
     assert_eq!(cfg.log_level, "info", "debug output is opt-in");
-  }
-
-  #[test]
-  fn a_sealed_blob_survives_a_missing_remember_flag() {
-    let dir = std::env::temp_dir().join(format!("thunet-config-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    secret::save_in(&dir, "alice", "hunter2").unwrap();
-
-    // What an old core left behind: the blob exists, the JSON says nothing
-    // about remembering it.
-    let cfg = recover_stored(Config::default(), &dir);
-    assert_eq!(cfg.username, "alice");
-    assert_eq!(cfg.password, "hunter2");
-    assert!(cfg.remember_password, "the blob proves the intent");
-
-    // Unticking the box deletes the blob, and a later start must not bring it
-    // back.
-    secret::delete_in(&dir);
-    let cleared = recover_stored(Config::default(), &dir);
-    assert!(cleared.password.is_empty());
-    assert!(!cleared.remember_password);
-    let _ = std::fs::remove_dir_all(&dir);
   }
 }

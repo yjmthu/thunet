@@ -92,8 +92,21 @@ fn read_key(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, String> {
 /// unlike the machine id it is not derivable from public information, so a
 /// copied `credential.bin` alone is useless.
 fn data_key(dir: &Path) -> Result<[u8; KEY_LEN], String> {
-  if let Some(key) = read_key(dir)? {
-    return Ok(key);
+  match read_key(dir) {
+    Ok(Some(key)) => return Ok(key),
+    Ok(None) => {}
+    Err(e) => {
+      // A key this process cannot read is a key nobody can use: it was written
+      // by another account (an older install) or is EFS-encrypted for one.
+      // Removing it goes through the state directory's delete-child right, so
+      // it also works when the file itself denies access. The blob it sealed
+      // is just as unusable, so drop both and mint a new key: the saved
+      // password is lost, which is the only outcome that keeps saving possible.
+      let path = dir.join(KEY_FILE);
+      std::fs::remove_file(&path)
+        .map_err(|e2| format!("{e}; cannot replace {}: {e2}", path.display()))?;
+      delete_in(dir);
+    }
   }
   let path = dir.join(KEY_FILE);
   // A wrong-length file is not a key. It may be the remains of an interrupted

@@ -126,9 +126,6 @@ pub struct CredentialState {
   pub has_password: bool,
   /// A sealed copy is on disk, so a restarted core keeps it.
   pub remembered: bool,
-  /// Increments whenever the pair is replaced; lets a frontend notice an edit
-  /// made by another frontend without seeing the password.
-  pub revision: u64,
   /// Answer to [`Cmd::CheckCredentials`]: whether the candidate equals the
   /// stored pair. `None` for an unsolicited state report.
   #[serde(default)]
@@ -273,7 +270,6 @@ mod tests {
         username: "alice".into(),
         has_password: true,
         remembered: true,
-        revision: 3,
         matches: None,
       },
       auto_connect: true,
@@ -289,7 +285,6 @@ mod tests {
         assert_eq!(back.ac_id, "169");
         assert_eq!(back.state, State::Online);
         assert_eq!(back.frontends, 1);
-        assert_eq!(back.credential.revision, 3);
       }
       other => panic!("wrong variant: {other:?}"),
     }
@@ -301,7 +296,6 @@ mod tests {
       username: "alice".into(),
       has_password: true,
       remembered: true,
-      revision: 4,
       matches: Some(true),
     };
     let text = Wire::ev(Ev::Credentials(state)).line().unwrap();

@@ -78,14 +78,12 @@ fn core_info(
 fn credential_state(
   session: &Session,
   remembered: bool,
-  revision: u64,
   matches: Option<bool>,
 ) -> crate::proto::CredentialState {
   crate::proto::CredentialState {
     username: session.cfg().username.clone(),
     has_password: !session.cfg().password.is_empty(),
     remembered,
-    revision,
     matches,
   }
 }
@@ -98,7 +96,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // sealed blob could be opened, so this pair is exactly "the next start will
   // find a credential".
   let mut remembered = cfg.remember_password && !cfg.password.is_empty();
-  let mut credential_rev = u64::from(remembered);
   let mut session = Session::new(cfg);
   let has_creds = !session.cfg().username.is_empty() && !session.cfg().password.is_empty();
   let mut want_online = session.cfg().auto_connect && has_creds;
@@ -226,11 +223,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           password,
           remember,
         } => {
-          let before = (
-            session.cfg().username.clone(),
-            session.cfg().password.clone(),
-            session.cfg().remember_password,
-          );
           let ready = !username.is_empty() && !password.is_empty();
           if ready {
             session.set_credentials(username.clone(), password.clone());
@@ -254,21 +246,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
                 .ok();
             }
           }
-          let after = (
-            session.cfg().username.clone(),
-            session.cfg().password.clone(),
-            session.cfg().remember_password,
-          );
-          if before != after {
-            credential_rev += 1;
-          }
           // Answer even when the request was a no-op: the window uses the
           // reply to learn whether the value it typed is the stored one.
           tx.send(Ev::Credentials(credential_state(
-            &session,
-            remembered,
-            credential_rev,
-            None,
+            &session, remembered, None,
           )))
           .ok();
           if ready && session.cfg().auto_connect && session.state != State::Online {
@@ -286,10 +267,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             )
           };
           tx.send(Ev::Credentials(credential_state(
-            &session,
-            remembered,
-            credential_rev,
-            matches,
+            &session, remembered, matches,
           )))
           .ok();
         }
@@ -309,7 +287,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             &last_env,
             want_online,
             tx.frontends(),
-            credential_state(&session, remembered, credential_rev, None),
+            credential_state(&session, remembered, None),
           );
           let mut dump = serde_json::json!({ "core": info });
           match session.refresh() {
@@ -329,7 +307,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             &last_env,
             want_online,
             tx.frontends(),
-            credential_state(&session, remembered, credential_rev, None),
+            credential_state(&session, remembered, None),
           );
           tx.send(Ev::Core(info)).ok();
         }

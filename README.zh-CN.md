@@ -250,7 +250,7 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 
 如果整盘镜像把 `key.bin`（以及 Linux 上的 systemd host key）也带走了，仍然可以解密；只有 TPM 绑定密钥或口令能改变这一点。管理员/root 无论如何都能读密钥或 dump core 的内存。
 
-删除每用户目录只会重置窗口偏好；整机目录属于服务，重装后仍在。只有想彻底忘记共享账号时才删它。
+删除每用户目录只会重置窗口偏好；整机目录属于服务，升级和重装后仍在，真正的卸载会连同 `credential.bin`、`key.bin` 一起删除。
 
 ## 7. 安装、卸载、快捷方式
 
@@ -265,7 +265,7 @@ MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安
 
 窗口偏好是**每用户**的（`%APPDATA%\thunet`），而 core 的账号、门户主机和加密凭据在整机目录（`%ProgramData%\thunet`）。服务由应用在第一次选择服务档位或第一次点状态页的 **启动** 时注册（需要管理员），而不是由 MSI 直接创建；MSI 在升级时会停掉、改写路径并重启它。
 
-程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe /F`），在真正的卸载时删除服务，然后才删除文件、快捷方式、开始菜单文件夹和安装目录。主版本升级同样会停服务，但保留注册，并把注册的镜像路径改到刚装上的可执行文件——这样换了安装位置也不会让 SCM 去启动旧路径；托盘登录任务则在下次启动时重写。
+程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe /F`），在真正的卸载时删除服务并删除整机目录（`%ProgramData%\thunet`，含 `credential.bin` 和 `key.bin`），然后才删除文件、快捷方式、开始菜单文件夹和安装目录。主版本升级同样会停服务，但保留注册和整机状态，并把注册的镜像路径改到刚装上的可执行文件——这样换了安装位置也不会让 SCM 去启动旧路径；托盘登录任务则在下次启动时重写。
 
 因为这个 `taskkill` 在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）在事务结束后会重新启动程序。启动走的是桌面外壳自己的 `ShellExecute`（WiX util 扩展的 `WixUnelevatedShellExec`），托盘拿到的是用户自己的令牌，而不是安装程序的提权令牌；早先让它去调用 `explorer.exe`，在部分机器上会弹出资源管理器窗口而不是启动程序。静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
 
@@ -300,7 +300,7 @@ Linux 上服务由安装包提供，`thunet service start|stop|status` 立刻可
 
 剩下的唯一自助操作就是桌面快捷方式：设置页的 **创建桌面快捷方式**，或 `thunet shortcut`，它会为当前运行的可执行文件在桌面生成启动器（Linux 上还会把 `.desktop` 标记为可信，以便 GNOME 直接启动）。
 
-卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的窗口偏好会保留；整机状态在 `%ProgramData%\thunet`，需要干净状态时单独删除。Windows 上卸载不需要提前准备：安装包会结束托盘与 core 服务、删掉注册（服务和本用户的 `thunet-tray-<用户>` 登录任务），并移除 `PATH` 条目。
+卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的窗口偏好会保留；整机状态（`%ProgramData%\thunet`，含 `credential.bin`、`key.bin`）会在真正的卸载时删除，升级/重装则保留。Windows 上卸载不需要提前准备：安装包会结束托盘与 core 服务、删掉注册（服务和本用户的 `thunet-tray-<用户>` 登录任务），并移除 `PATH` 条目。
 
 ## 8. 用 winget 安装
 
@@ -550,6 +550,7 @@ UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个�
 - Windows：安装器用 `--state-dir %ProgramData%\thunet`、显式 DACL、`auto` 启动类型和失败重启创建服务；升级时重写 `binPath` 和 DACL，而不只是替换可执行文件。
 - Linux：包内提供带 `DynamicUser=yes` 和 `StateDirectory=thunet` 的 system unit；`postinst` 执行 `systemctl enable --now thunet.service`。
 - 本版本不迁移旧布局。如果旧版每用户安装留下了 `credential.bin`、`key.bin` 或 `systemd --user` 单元，请在启用服务前手动删除；残留文件会被直接忽略。
+- 真正的卸载会删除整机目录：Windows 上 MSI 删除服务后执行 `service-purge`，Linux 上 `postrm` 删除 `/var/lib/thunet`。账号、`credential.bin` 和 `key.bin` 因此不会在安装包移除后继续存在；升级、修复和重装则保留。
 - 便携/开发模式保留 `--state-dir` 和每用户 core；它不是受支持的多用户配置。
 
 ## 14. 许可证

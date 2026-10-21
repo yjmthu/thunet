@@ -1,6 +1,17 @@
 #!/bin/sh
 set -e
 
+# A real uninstall (remove/purge) means the package is gone, so the machine
+# state goes with it: /var/lib/thunet holds config.json, the sealed credential
+# and key.bin, which must not outlive the product. `upgrade` and the
+# `abort-*`/`failed-upgrade` calls keep it, so upgrades and reinstalls do not
+# lose the account.
+case "${1:-}" in
+  remove|purge)
+    rm -rf /var/lib/thunet
+    ;;
+esac
+
 if [ -d /run/systemd/system ]; then
   systemctl disable thunet.service || true
   systemctl daemon-reload || true

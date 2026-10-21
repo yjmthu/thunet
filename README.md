@@ -258,9 +258,9 @@ The protection is the directory ACL, not the encryption:
 
 A full-disk image that includes `key.bin` (and, on Linux, the systemd host key) can still be decrypted; only a TPM-bound key or a passphrase changes that. An administrator or root can read the key or dump the core's memory in any case.
 
-Deleting the per-user directory resets the window's preferences. The machine directory belongs to the service and survives a reinstall; remove it only when you also want to forget the shared account.
+Deleting the per-user directory resets the window's preferences. The machine directory belongs to the service and is kept across upgrades and reinstalls; a real uninstall removes it, which is also how you forget the shared account.
 
-Deleting `config.json` resets every setting. Uninstalling the package leaves this directory alone, so your account and preferences survive a reinstall; delete the directory for a clean slate.
+Deleting `config.json` resets every setting. A real uninstall (Windows *Uninstall*, `apt remove`) deletes the whole machine directory, including `credential.bin` and `key.bin`; an upgrade or a reinstall keeps it, so the account and the sealed password survive.
 
 ## 7. Installing, uninstalling, shortcuts
 
@@ -275,7 +275,7 @@ The MSI is per-machine (`Scope="perMachine"`), which is what a single UAC prompt
 
 Settings are **per user** (`%APPDATA%\thunet`), while the core's account, portal host and sealed credential live in the machine directory (`%ProgramData%\thunet`). The service is registered by the application on the first *Start with the system* or the first click on the status page's **Start** (administrator), not by the MSI; the MSI stops, repoints and restarts it during upgrades.
 
-Uninstalling while THUnet is running is safe: the MSI is elevated, so it stops the service (`ControlService`, then waits for it to be gone), terminates the tray (`taskkill /IM thunet.exe /F` before `InstallValidate`), removes the service on a real uninstall, and then removes the files, the shortcuts, the Start Menu folder and the install directory. A major upgrade stops the service the same way but keeps the registration — and then points it at the executable that was just installed, so a package that moves the file does not leave the SCM launching a stale path; the tray logon task is rewritten the same way on the next launch.
+Uninstalling while THUnet is running is safe: the MSI is elevated, so it stops the service (`ControlService`, then waits for it to be gone), terminates the tray (`taskkill /IM thunet.exe /F` before `InstallValidate`), removes the service on a real uninstall, deletes the machine directory (`%ProgramData%\thunet`, including `credential.bin` and `key.bin`), and then removes the files, the shortcuts, the Start Menu folder and the install directory. A major upgrade stops the service the same way but keeps the registration and the machine state — and then points the registration at the executable that was just installed, so a package that moves the file does not leave the SCM launching a stale path; the tray logon task is rewritten the same way on the next launch.
 
 Because that `taskkill` also runs for upgrades and repairs, every interactive install (UILevel ≥ 4) starts the app again once the transaction is finished. It does so through the desktop shell's own `ShellExecute` (the WiX util extension's `WixUnelevatedShellExec`), which runs the tray with the user's own token instead of inheriting the installer's elevation — asking `explorer.exe` to do it opened a folder window instead of the app on some machines. A silent install (`msiexec /qn`, winget) does not start anything, so it never hijacks a desktop. Double-clicking the package while it is already installed therefore ends with the app running rather than with a killed copy.
 
@@ -560,6 +560,7 @@ Two more practices for shared machines:
 - Windows: the installer creates the service with `--state-dir %ProgramData%\thunet`, an explicit DACL, start type `auto` and restart-on-failure. Upgrading rewrites `binPath` and the DACL, not just the executable, so an existing registration points at the new image.
 - Linux: the package ships a system unit with `DynamicUser=yes` and `StateDirectory=thunet`; `postinst` runs `systemctl enable --now thunet.service`.
 - This version does not migrate older layouts. If an older per-user install left a `credential.bin`, `key.bin` or `systemd --user` unit behind, remove it by hand before enabling the service; leftover files are simply ignored.
+- A real uninstall removes the machine directory: on Windows the MSI runs `service-purge` after deleting the service, on Linux `postrm` removes `/var/lib/thunet`. The account, `credential.bin` and `key.bin` therefore do not outlive the package. An upgrade, a repair or a reinstall keeps them.
 - Portable/dev mode keeps `--state-dir` and a per-user core; it is not the supported multi-user configuration.
 
 ## 14. License

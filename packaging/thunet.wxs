@@ -86,6 +86,16 @@
                   ExeCommand="service-admin uninstall"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
+    <!-- Uninstall means the package is gone, so the machine state goes with it:
+         `%ProgramData%\thunet` holds `credential.bin` and `key.bin`, which must
+         not outlive the product. Same condition as RemoveCoreService, so an
+         upgrade or a repair keeps the account and the sealed password. Runs
+         after the service is deleted and before RemoveFiles, so the helper
+         still exists and nothing holds the directory open. -->
+    <CustomAction Id="PurgeMachineState" FileRef="THUnetExe"
+                  ExeCommand="service-purge"
+                  Execute="deferred" Impersonate="no" Return="check" />
+
     <!-- The install stopped the service above; bring the new build back — but
          only when it is set to start at boot. `demand` means the user turned
          autostart off, and an upgrade must not resurrect that session. -->
@@ -103,6 +113,8 @@
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <!-- Before RemoveFiles: the helper still has to exist. -->
       <Custom Action="RemoveCoreService" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="PurgeMachineState" After="RemoveCoreService"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <!-- After the files are in place, not during an uninstall. -->
       <Custom Action="ResumeCoreService" After="InstallFinalize"

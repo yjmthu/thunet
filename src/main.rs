@@ -232,6 +232,10 @@ enum Cmd {
   /// internal).
   #[command(hide = true)]
   ServiceResume,
+  /// Delete the machine state directory after a real uninstall (installer
+  /// internal; never called for an upgrade or repair).
+  #[command(hide = true)]
+  ServicePurge,
   /// Print the config path and effective settings.
   Config,
   /// Create a desktop shortcut for this executable.
@@ -430,6 +434,7 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     Cmd::ServiceAdmin { action } => autostart::service_admin(action),
     Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
+    Cmd::ServicePurge => autostart::purge_machine_state(),
   }
 }
 

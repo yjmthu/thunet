@@ -220,6 +220,24 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(service-purge)
+_arguments "${_arguments_options[@]}" : \
+'--host=[Portal host (overrides the config file)]:HOST:_default' \
+'--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
+'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
+'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
+'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
+'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
+'--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
+'--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
+'--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
+'--http[Use plain http instead of https]' \
+'--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
@@ -323,6 +341,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(service-purge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -360,6 +382,7 @@ _thunet_commands() {
 'service:Install or control the background service' \
 'service-admin:Perform one privileged service operation (the elevated half of \`service <action>\`, not for humans)' \
 'service-resume:Restart the core after an upgrade if it starts at boot (installer internal)' \
+'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
 'config:Print the config path and effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
@@ -399,6 +422,7 @@ _thunet__subcmd__help_commands() {
 'service:Install or control the background service' \
 'service-admin:Perform one privileged service operation (the elevated half of \`service <action>\`, not for humans)' \
 'service-resume:Restart the core after an upgrade if it starts at boot (installer internal)' \
+'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
 'config:Print the config path and effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
@@ -456,6 +480,11 @@ _thunet__subcmd__help__subcmd__service-admin_commands() {
     local commands; commands=()
     _describe -t commands 'thunet help service-admin commands' commands "$@"
 }
+(( $+functions[_thunet__subcmd__help__subcmd__service-purge_commands] )) ||
+_thunet__subcmd__help__subcmd__service-purge_commands() {
+    local commands; commands=()
+    _describe -t commands 'thunet help service-purge commands' commands "$@"
+}
 (( $+functions[_thunet__subcmd__help__subcmd__service-resume_commands] )) ||
 _thunet__subcmd__help__subcmd__service-resume_commands() {
     local commands; commands=()
@@ -495,6 +524,11 @@ _thunet__subcmd__service_commands() {
 _thunet__subcmd__service-admin_commands() {
     local commands; commands=()
     _describe -t commands 'thunet service-admin commands' commands "$@"
+}
+(( $+functions[_thunet__subcmd__service-purge_commands] )) ||
+_thunet__subcmd__service-purge_commands() {
+    local commands; commands=()
+    _describe -t commands 'thunet service-purge commands' commands "$@"
 }
 (( $+functions[_thunet__subcmd__service-resume_commands] )) ||
 _thunet__subcmd__service-resume_commands() {
