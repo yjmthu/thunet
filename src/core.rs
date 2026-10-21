@@ -51,6 +51,9 @@ fn core_info(
 ) -> crate::proto::CoreInfo {
   crate::proto::CoreInfo {
     version: env!("CARGO_PKG_VERSION").to_string(),
+    // The same stamp Settings shows, so the two halves can tell whether they
+    // were compiled together.
+    build_epoch: env!("THUNET_BUILD_EPOCH").parse().unwrap_or(0),
     pid: std::process::id(),
     uptime_secs: started.elapsed().as_secs(),
     state: session.state,
@@ -228,10 +231,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         Cmd::AcId => {
           tx.send(Ev::AcId(session.cfg().ac_id.clone())).ok();
         }
-        Cmd::Quit => {
-          // The frontend is closing, not the session: the core outlives it and
-          // keeps the connection alive (that is the whole point of the split).
-        }
         Cmd::Shutdown => {
           // The user asked for the service to stop (the status page's *Stop*
           // button; tray *Quit* only ends the window). End the process itself:
@@ -299,11 +298,13 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       if let Some(ac_id) = ac_id {
         session.set_ac_id(ac_id);
       }
-      // Without a route there is nothing to probe, so back off hard. A route
-      // that answers nothing (DNS or the portal still coming up at boot, a
-      // LAN without internet) stays on the normal cadence: the machine is on
-      // a network, it just is not a usable one yet.
-      let wait = if env == LoginEnv::NoNetwork && !link_ready {
+      // The slow cadence is only for a machine with no route at all.
+      // `link_ready` is maintained by the link watch, and that only runs while
+      // an automatic attempt is possible; ask the route table directly for the
+      // rest (auto connect off, no saved password), so the verdict still
+      // refreshes when the cable or Wi-Fi comes back.
+      let route = link_ready || crate::srun::link_up();
+      let wait = if env == LoginEnv::NoNetwork && !route {
         ENV_PROBE_OFFLINE_MS
       } else {
         ENV_PROBE_MS

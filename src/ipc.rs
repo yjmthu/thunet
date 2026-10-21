@@ -4,23 +4,32 @@
 //! and replays the tail of the log plus the current state to whoever connects
 //! late. See [`crate::proto`] for the message shapes.
 //!
-//! The endpoint is per user:
+//! The endpoint is per machine, not per account:
 //!
 //! * Linux/BSD: `$XDG_RUNTIME_DIR/thunet/control.sock` (mode 0700 directory,
 //!   so no other account can talk to it),
-//! * Windows: named pipe `thunet-control-<user>`.
+//! * Windows: named pipe `\\.\pipe\thunet-control`, whose DACL grants SYSTEM,
+//!   administrators and the interactive users — the core runs as SYSTEM (it is
+//!   a service, so it can start before anybody logs on) while the window runs
+//!   in the user's session.
 //!
-//! `interprocess` maps those two onto one `Stream` that is `Read + Write`, so
-//! nothing above this module is platform specific.
+//! `interprocess` covers the Unix socket; on Windows the pipe is created through
+//! the same crate's named-pipe API, which takes the security descriptor.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use interprocess::local_socket::prelude::*;
+#[cfg(unix)]
 use interprocess::local_socket::{ConnectOptions, ListenerOptions, Name};
+#[cfg(windows)]
+use interprocess::os::windows::named_pipe::{
+  PipeListener, PipeListenerOptions, PipeStream, pipe_mode::Bytes,
+};
 
 use crate::config::Config;
 use crate::proto::{Cmd, Ev, Msg, VERSION, Wire};
@@ -30,6 +39,40 @@ use crate::proto::{Cmd, Ev, Msg, VERSION, Wire};
 const HISTORY: usize = 200;
 
 // ---------------------------------------------------------------- endpoint
+
+/// The two directions of one connection, boxed so the rest of this module does
+/// not have to know which platform produced them.
+type Halves = (Box<dyn Read + Send>, Box<dyn Write + Send>);
+
+#[cfg(unix)]
+type Stream = interprocess::local_socket::Stream;
+#[cfg(unix)]
+type Listener = interprocess::local_socket::Listener;
+#[cfg(windows)]
+type Stream = PipeStream<Bytes, Bytes>;
+#[cfg(windows)]
+type Listener = PipeListener<Bytes, Bytes>;
+
+/// Splits a connection at the type level, which `interprocess` spells
+trait Duplex: Send + 'static {
+  fn halves(self) -> Halves;
+}
+
+#[cfg(unix)]
+impl Duplex for Stream {
+  fn halves(self) -> Halves {
+    let (recv, send) = self.split();
+    (Box::new(recv), Box::new(send))
+  }
+}
+
+#[cfg(windows)]
+impl Duplex for Stream {
+  fn halves(self) -> Halves {
+    let (recv, send) = self.split();
+    (Box::new(recv), Box::new(send))
+  }
+}
 
 #[cfg(unix)]
 fn endpoint() -> String {
@@ -48,14 +91,22 @@ fn endpoint() -> String {
 
 #[cfg(windows)]
 fn endpoint() -> String {
-  // The pipe namespace is machine-wide, so the account name keeps two users
-  // from meeting each other.
-  format!("thunet-control-{}", user_tag())
+  // One name for the whole machine: the core is a service running as SYSTEM in
+  // session 0, so an account-suffixed name could never be reached from the
+  // window. Who may connect is decided by the pipe's DACL, not by the name.
+  "thunet-control".into()
 }
 
 /// Where frontends connect; shown by `thunet status`.
 pub fn endpoint_path() -> String {
-  endpoint()
+  #[cfg(windows)]
+  {
+    format!(r"\\.\pipe\{}", endpoint())
+  }
+  #[cfg(unix)]
+  {
+    endpoint()
+  }
 }
 
 #[cfg(unix)]
@@ -65,21 +116,10 @@ fn user_tag() -> String {
     .unwrap_or_else(|_| "user".into())
 }
 
-#[cfg(windows)]
-fn user_tag() -> String {
-  std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
-}
-
 #[cfg(unix)]
 fn name(path: &str) -> std::io::Result<Name<'_>> {
   use interprocess::local_socket::GenericFilePath;
   path.to_fs_name::<GenericFilePath>()
-}
-
-#[cfg(windows)]
-fn name(path: &str) -> std::io::Result<Name<'_>> {
-  use interprocess::local_socket::GenericNamespaced;
-  path.to_ns_name::<GenericNamespaced>()
 }
 
 // --------------------------------------------------------------------- hub
@@ -114,9 +154,9 @@ impl Hub {
       Ev::Env(env) => shared.env = Some(env.clone()),
       Ev::Info(info) => shared.info = Some(info.clone()),
       Ev::Error(err) => shared.error = err.clone(),
-      // Diagnostics also go to the journal / `%APPDATA%` log via stderr; the
+      // Diagnostics also go to the journal / the service log file; the
       // frontend only needs them for the log pane.
-      Ev::Log(line) => eprintln!("{}", line.render()),
+      Ev::Log(line) => crate::diag::line(&line.render()),
       // Replies to one-off requests belong to the client that asked; they are
       // not part of the state a late frontend needs.
       Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::AcId(_) => {}
@@ -215,7 +255,6 @@ pub fn serve(cfg: Config) -> Result<Serve, String> {
     use std::os::unix::fs::PermissionsExt as _;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
   }
-
   let hub = Hub::new();
   let (cmd_tx, cmd_rx) = channel::<Cmd>();
   let worker_hub = hub.clone();
@@ -240,13 +279,16 @@ pub fn serve(cfg: Config) -> Result<Serve, String> {
 /// named pipe disappears with its process — and exit. `bind` already treats a
 /// socket file left behind as free, so a missed unlink would be harmless too.
 pub fn exit_core() -> ! {
+  #[cfg(windows)]
+  crate::winsvc::report_stopped();
   #[cfg(unix)]
   let _ = std::fs::remove_file(endpoint());
   std::process::exit(0)
 }
 
-fn bind(path: &str) -> Result<LocalSocketListener, BindError> {
-  let create = || -> std::io::Result<LocalSocketListener> {
+#[cfg(unix)]
+fn bind(path: &str) -> Result<Listener, BindError> {
+  let create = || -> std::io::Result<Listener> {
     let name = name(path)?;
     ListenerOptions::new().name(name).create_sync()
   };
@@ -257,7 +299,6 @@ fn bind(path: &str) -> Result<LocalSocketListener, BindError> {
       if connect(path).is_ok() {
         return Err(BindError::InUse);
       }
-      #[cfg(unix)]
       let _ = std::fs::remove_file(path);
       create().map_err(|e| {
         BindError::Other(format!(
@@ -268,7 +309,54 @@ fn bind(path: &str) -> Result<LocalSocketListener, BindError> {
   }
 }
 
-fn connect(path: &str) -> Result<LocalSocketStream, String> {
+/// Named pipe with an explicit DACL: the core owns the pipe as SYSTEM, whose
+/// default ACL (SYSTEM + administrators) would hide it from the window.
+#[cfg(windows)]
+fn pipe_options(path: &str) -> Result<PipeListenerOptions<'static>, String> {
+  use std::borrow::Cow;
+
+  use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+  use widestring::U16CString;
+
+  // SYSTEM and administrators get everything; interactive users may read and
+  // write, which is all a frontend needs to drive the core.
+  const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+
+  let full =
+    U16CString::from_str(format!(r"\\.\pipe\{path}")).map_err(|e| format!("bad pipe name: {e}"))?;
+  let sddl = U16CString::from_str(PIPE_SDDL).map_err(|e| format!("bad pipe DACL: {e}"))?;
+  let descriptor =
+    SecurityDescriptor::deserialize(sddl.as_ucstr()).map_err(|e| format!("bad pipe DACL: {e}"))?;
+
+  let mut options = PipeListenerOptions::new();
+  options.path = Cow::Owned(full);
+  options.security_descriptor = Some(descriptor);
+  Ok(options)
+}
+
+#[cfg(windows)]
+fn bind(path: &str) -> Result<Listener, BindError> {
+  let options = pipe_options(path).map_err(BindError::Other)?;
+  let create = || options.create_duplex::<Bytes>();
+  match create() {
+    Ok(listener) => Ok(listener),
+    Err(first) => {
+      // ERROR_PIPE_BUSY or ERROR_ACCESS_DENIED both mean an instance exists,
+      // so this name is taken rather than broken.
+      if connect(path).is_ok() {
+        return Err(BindError::InUse);
+      }
+      create().map_err(|e| {
+        BindError::Other(format!(
+          "cannot listen on {path}: {e} (first attempt: {first})"
+        ))
+      })
+    }
+  }
+}
+
+#[cfg(unix)]
+fn connect(path: &str) -> Result<Stream, String> {
   let name = name(path).map_err(|e| format!("bad endpoint {path}: {e}"))?;
   ConnectOptions::new()
     .name(name)
@@ -276,12 +364,21 @@ fn connect(path: &str) -> Result<LocalSocketStream, String> {
     .map_err(|e| format!("{path}: {e}"))
 }
 
-fn attach(stream: LocalSocketStream, cmds: Sender<Cmd>, hub: Hub) {
+#[cfg(windows)]
+fn connect(path: &str) -> Result<Stream, String> {
+  use widestring::U16CString;
+
+  let full = format!(r"\\.\pipe\{path}");
+  let wide = U16CString::from_str(&full).map_err(|e| format!("bad pipe name: {e}"))?;
+  PipeStream::<Bytes, Bytes>::connect_by_path(wide.as_ucstr()).map_err(|e| format!("{full}: {e}"))
+}
+
+fn attach(stream: impl Duplex, cmds: Sender<Cmd>, hub: Hub) {
   // Subscribe before writing the backlog, so an event published in between
   // arrives exactly once through the channel (the backlog is a snapshot).
   let (events, backlog) = hub.attach();
   hub.publish(Ev::Log(crate::logline::Line::debug("frontend connected")));
-  let (recv_half, send_half) = stream.split();
+  let (recv_half, send_half) = stream.halves();
 
   std::thread::spawn(move || {
     let mut out = BufWriter::new(send_half);
@@ -346,7 +443,7 @@ impl Link {
   /// `None` when no core is listening.
   pub fn connect() -> Option<Link> {
     let stream = connect(&endpoint()).ok()?;
-    let (recv_half, send_half) = stream.split();
+    let (recv_half, send_half) = stream.halves();
     let alive = Arc::new(AtomicBool::new(true));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (ev_tx, ev_rx) = channel::<Ev>();
@@ -441,7 +538,7 @@ pub fn start_core() -> Result<(), String> {
 }
 
 fn spawn_core() -> Result<(), String> {
-  let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
   let mut cmd = std::process::Command::new(exe);
   cmd
     .arg("core")

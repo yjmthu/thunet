@@ -5,8 +5,6 @@
 
 /// Held for the lifetime of the process; dropping it releases the guard.
 pub struct Guard {
-  #[cfg(windows)]
-  handle: isize,
   #[cfg(unix)]
   path: std::path::PathBuf,
 }
@@ -29,6 +27,14 @@ pub fn show_requested() -> bool {
   imp::show_requested()
 }
 
+/// Best-effort cleanup before `std::process::exit`, which skips [`Guard::drop`].
+///
+/// Windows releases the mutex when the process ends; only the Unix lock file
+/// has to be removed by hand.
+pub fn release() {
+  imp::release()
+}
+
 #[cfg(windows)]
 mod imp {
   use std::sync::atomic::{AtomicIsize, Ordering};
@@ -39,12 +45,13 @@ mod imp {
   use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
   };
-  use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
-  };
 
   /// Auto-reset event a second launch signals; owned by the primary instance.
   static SHOW: AtomicIsize = AtomicIsize::new(0);
+
+  /// Primary-instance mutex. Kept here (not in the `Guard`) so a process that
+  /// is about to hand over to a freshly spawned successor can close it first.
+  static MUTEX: AtomicIsize = AtomicIsize::new(0);
 
   fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -57,18 +64,17 @@ mod imp {
     // lives for the rest of the process.
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
-      return Some(super::Guard { handle: 0 });
+      return Some(super::Guard {});
     }
     let taken = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     if !taken {
+      MUTEX.store(handle as isize, Ordering::Relaxed);
       // Created before the guard is returned, so a second launch can only ever
       // find it once this process is the running instance.
       let ev = wide(r"Local\thunet-show-window");
       let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, ev.as_ptr()) };
       SHOW.store(ev as isize, Ordering::Relaxed); // 0 = unavailable
-      return Some(super::Guard {
-        handle: handle as isize,
-      });
+      return Some(super::Guard {});
     }
 
     // Ring the doorbell instead of touching the other process's window: its
@@ -84,17 +90,8 @@ mod imp {
       return None;
     }
 
-    // Fallback for a running build that predates the doorbell.
-    let title = wide("THUnet");
-    // SAFETY: both calls take NUL-terminated strings/handles owned above.
-    unsafe {
-      let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-      if !hwnd.is_null() {
-        ShowWindow(hwnd, SW_SHOW);
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
-      }
-    }
+    // No event means the running instance cannot be asked to show itself; this
+    // launch just exits.
     None
   }
 
@@ -102,6 +99,19 @@ mod imp {
     let handle = SHOW.load(Ordering::Relaxed);
     // SAFETY: the handle is a live auto-reset event (0 is checked above).
     handle != 0 && unsafe { WaitForSingleObject(handle as _, 0) == WAIT_OBJECT_0 }
+  }
+
+  /// Close the mutex so a successor spawned a moment ago can take over.
+  ///
+  /// Idempotent: `Drop` calls it too, and the swap makes the second call a
+  /// no-op. The event needs no cleanup — it dies with the process.
+  pub fn release() {
+    let handle = MUTEX.swap(0, Ordering::Relaxed);
+    if handle != 0 {
+      // SAFETY: the handle came from CreateMutexW and is closed exactly once
+      // thanks to the swap above.
+      unsafe { CloseHandle(handle as _) };
+    }
   }
 }
 
@@ -163,6 +173,11 @@ mod imp {
     }
     false
   }
+
+  /// Remove the lock file the guard would have removed on drop.
+  pub fn release() {
+    let _ = std::fs::remove_file(lock_path());
+  }
 }
 
 impl Drop for Guard {
@@ -170,12 +185,6 @@ impl Drop for Guard {
     #[cfg(unix)]
     let _ = std::fs::remove_file(&self.path);
     #[cfg(windows)]
-    {
-      use windows_sys::Win32::Foundation::CloseHandle;
-      if self.handle != 0 {
-        // SAFETY: the handle came from CreateMutexW and is closed once.
-        unsafe { CloseHandle(self.handle as _) };
-      }
-    }
+    imp::release();
   }
 }

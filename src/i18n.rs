@@ -124,6 +124,9 @@ pub struct Texts {
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
   pub autostart_failed: &'static str,
+  /// The autostart change needs administrator rights and the UAC prompt was
+  /// dismissed; nothing was changed.
+  pub admin_cancelled: &'static str,
   pub already_online: &'static str,
   pub not_connected: &'static str,
   pub status_refreshed: &'static str,
@@ -199,6 +202,7 @@ static ZH: Texts = Texts {
   refresh_failed: "刷新失败",
   disconnect_failed: "断开失败",
   autostart_failed: "自启设置失败",
+  admin_cancelled: "需要管理员权限，已取消",
   already_online: "已经在线，无需重复连接",
   not_connected: "当前未连接",
   status_refreshed: "状态已刷新",
@@ -273,6 +277,7 @@ static EN: Texts = Texts {
   refresh_failed: "Refresh failed",
   disconnect_failed: "Disconnect failed",
   autostart_failed: "Failed to change autostart",
+  admin_cancelled: "Administrator rights are required; cancelled",
   already_online: "Already online, nothing to do",
   not_connected: "Not connected",
   status_refreshed: "Status refreshed",

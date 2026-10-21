@@ -89,7 +89,7 @@ fn install_icon() -> Result<(), String> {
 
 /// Create (or refresh) `~/Desktop/thunet.desktop`.
 pub fn create_desktop_shortcut() -> Result<(), String> {
-  let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
   let dir = desktop_dir();
   fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
   let path = dir.join("thunet.desktop");

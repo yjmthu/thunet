@@ -8,6 +8,7 @@
 //! `logic()` handles tray/menu/close events and keeps ticking even while the
 //! window is hidden (that is what eframe calls instead of `ui()` then).
 
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -270,6 +271,18 @@ pub struct App {
   quit_at: Option<Instant>,
   /// Start/Stop clicked on the status page, waiting for its outcome.
   service_request: Option<(ServiceRequest, Instant)>,
+  /// A mode change running on a helper thread. On Windows its core half can
+  /// wait for a UAC prompt, which must not block a frame.
+  mode_rx: Option<Receiver<(Mode, Result<(), String>)>>,
+  /// A Start runs on a helper thread (`systemctl` / `schtasks` can take a
+  /// moment); its outcome arrives here rather than blocking a frame.
+  start_tx: Sender<Result<(), String>>,
+  start_rx: Receiver<Result<(), String>>,
+  /// Executable a restart would launch (the file on disk, with the `(deleted)`
+  /// suffix removed), plus its stamp when this process started. The stamp is
+  /// what tells an upgrade apart from a stale copy at a fixed path.
+  exe_path: Option<std::path::PathBuf>,
+  exe_stamp: Option<(u64, std::time::SystemTime)>,
 }
 
 /// Build the auto-launch entry; `--minimized` is only passed when the user
@@ -324,23 +337,24 @@ impl App {
     }
 
     let autostart = autostart_entry(cfg.start_minimized);
+    let (start_tx, start_rx) = mpsc::channel();
+    let exe_path = crate::exe_path();
+    let exe_stamp = exe_path.as_deref().and_then(exe_stamp);
 
     // Surface where settings live; also proves the file exists on first run.
     let mut logs = vec![Line::info(format!(
       "config: {}",
       crate::config::path().display()
     ))];
-    // An entry written by an older release is rewritten once (on Windows this
-    // moves the `Run` value to a logon task, which fires earlier), and a
-    // portable install gets the systemd unit so `systemctl --user start`
+    // A portable install gets the systemd unit so `systemctl --user start`
     // works without touching the settings page.
-    match autostart.as_ref().map(Autostart::migrate) {
-      Some(Ok(true)) => logs.push(Line::debug("autostart: entry upgraded")),
+    match autostart.as_ref().map(Autostart::prepare_service) {
+      Some(Ok(true)) => logs.push(Line::debug("autostart: service entry installed")),
       Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
       _ => {}
     }
-    // Read the mode *after* migrating: an older layout may just have been
-    // renamed, and the radio buttons have to show the result.
+    // Read the mode *after* that: the settings page has to show what is
+    // actually registered, not what was requested.
     let autostart_mode = autostart.as_ref().map(Autostart::mode).unwrap_or(Mode::Off);
     autostart_item.set_checked(autostart_mode != Mode::Off);
 
@@ -395,6 +409,11 @@ impl App {
       quitting: false,
       quit_at: None,
       service_request: None,
+      mode_rx: None,
+      start_tx,
+      start_rx,
+      exe_path,
+      exe_stamp,
     }
   }
 
@@ -422,13 +441,18 @@ impl App {
     if self.link.as_ref().is_some_and(Link::alive) {
       return;
     }
+    // Deliver whatever the core managed to say before it went away — the last
+    // log lines are what explain an exit — and only then drop the dead link.
+    self.drain_events();
     // A link that went away means the service did too (stopped, crashed,
     // replaced by an upgrade). Drop the facts it reported, otherwise the status
-    // page keeps claiming "running" for a process that is gone, and with it the
-    // last login error, which describes a session that no longer exists.
+    // page keeps claiming "running" for a process that is gone, with session
+    // rows nothing updates any more.
     if self.link.take().is_some() {
       self.core = None;
       self.last_error = None;
+      self.state = State::Offline;
+      self.info = Info::default();
       // A pending *Stop* is only done once the core has actually hung up.
       if let Some((ServiceRequest::Stop, _)) = self.service_request {
         self.service_request = None;
@@ -563,12 +587,39 @@ impl App {
   }
 
   /// Apply one of the three autostart modes and report the result.
+  ///
+  /// The work happens on a helper thread: on Windows the core half may show a
+  /// UAC prompt, so the answer can take as long as the user needs to click.
   fn apply_autostart_mode(&mut self, mode: Mode) {
-    let t = self.t();
-    let result = match &self.autostart {
-      Some(a) => a.set_mode(mode),
-      None => Err(t.autostart_failed.to_string()),
+    let Some(autostart) = self.autostart.clone() else {
+      self.toast_err(self.t().autostart_failed.to_string());
+      return;
     };
+    if self.mode_rx.is_some() {
+      // One at a time: a second prompt for the same setting helps nobody.
+      return;
+    }
+    // Show the requested state right away; the toast confirms or reverts it.
+    self.autostart_mode = mode;
+    self.autostart_item.set_checked(mode != Mode::Off);
+    let (tx, rx) = mpsc::channel::<(Mode, Result<(), String>)>();
+    std::thread::spawn(move || {
+      let result = autostart.set_mode(mode);
+      let _ = tx.send((mode, result));
+    });
+    self.mode_rx = Some(rx);
+  }
+
+  /// Deliver the outcome of the last mode change, if it has arrived.
+  fn pump_mode_request(&mut self) {
+    let Some(rx) = self.mode_rx.as_ref() else {
+      return;
+    };
+    let Ok((mode, result)) = rx.try_recv() else {
+      return;
+    };
+    self.mode_rx = None;
+    let t = self.t();
     match result {
       Ok(()) => {
         self.autostart_mode = mode;
@@ -580,12 +631,30 @@ impl App {
         };
         self.toast_ok(format!("{}: {label}", t.autostart));
       }
+      Err(e) if e == crate::elevate::CANCELLED => {
+        // Nothing changed: go back to what the OS actually says.
+        self.reload_autostart_mode();
+        self.toast_err(t.admin_cancelled.to_string());
+      }
       Err(e) => {
+        self.reload_autostart_mode();
         let msg = format!("{}: {e}", t.autostart_failed);
         self.push_log(Line::error(&msg));
         self.toast_err(msg);
       }
     }
+  }
+
+  /// Re-read the autostart state from the OS (after a cancelled or failed
+  /// change, the radio buttons must not keep the optimistic value).
+  fn reload_autostart_mode(&mut self) {
+    let mode = self
+      .autostart
+      .as_ref()
+      .map(Autostart::mode)
+      .unwrap_or(Mode::Off);
+    self.autostart_mode = mode;
+    self.autostart_item.set_checked(mode != Mode::Off);
   }
 
   /// "Start minimised" and "start with the system" are independent settings,
@@ -596,12 +665,10 @@ impl App {
       self.toast_err(e);
       return;
     }
-    let mode = self.autostart_mode;
     self.autostart = autostart_entry(on);
     let mut failure = None;
-    if mode != Mode::Off
-      && let Some(a) = &self.autostart
-      && let Err(e) = a.set_mode(mode)
+    if let Some(a) = &self.autostart
+      && let Err(e) = a.refresh_tray()
     {
       failure = Some(format!("{}: {e}", self.t().autostart_failed));
     }
@@ -632,9 +699,48 @@ impl App {
   /// owns the session and keeps running. Stopping it is a separate, explicit
   /// action — the status page's *Stop* button or `thunet service stop`.
   fn quit(&mut self) {
-    self.send(Cmd::Quit);
     self.quitting = true;
     self.quit_at = Some(Instant::now());
+  }
+
+  /// Replace this process with a fresh launch of the executable on disk.
+  ///
+  /// Used when the service reports a newer build: this process still runs the
+  /// replaced image. The instance guard is released before the spawn so the
+  /// successor can become the primary instance; if the spawn fails, this
+  /// window keeps running (and takes the guard back) instead of leaving no
+  /// window at all.
+  fn restart(&mut self) {
+    let Some(exe) = self.exe_path.clone() else {
+      return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    if !self.shown {
+      // The user hid the window, not the app: come back in the tray.
+      cmd.arg("--minimized");
+    }
+    #[cfg(windows)]
+    {
+      use std::os::windows::process::CommandExt as _;
+      const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+      cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    crate::single::release();
+    match cmd.spawn() {
+      Ok(_) => {
+        // Skip destructors: the successor owns the guard now, and
+        // `Guard::drop` would delete the lock file it just created.
+        std::process::exit(0)
+      }
+      Err(e) => {
+        if let Some(guard) = crate::single::acquire() {
+          std::mem::forget(guard); // stay the primary instance
+        }
+        self.push_log(Line::error(format!(
+          "restart failed: {e}; staying on the old build"
+        )));
+      }
+    }
   }
 
   fn handle_menu(&mut self, ctx: &egui::Context) {
@@ -676,6 +782,17 @@ impl App {
         }
         Ev::Env(env) => self.env = env,
         Ev::Core(info) => {
+          // A newer build on the service side means the package was upgraded
+          // and this process still runs the replaced file; relaunch it. The
+          // checks in `should_restart` keep a manual stop/start (same build)
+          // and a stale copy (unchanged file) from restarting forever.
+          let file_changed = self.exe_path.as_deref().and_then(exe_stamp) != self.exe_stamp;
+          if !self.quitting && should_restart(info.build_epoch, own_build_epoch(), file_changed) {
+            self.push_log(Line::info(
+              "service runs a newer build; restarting this window to match",
+            ));
+            self.restart();
+          }
           // A half-finished upgrade leaves the old core running next to the new
           // window; say so once instead of showing mismatched numbers silently.
           if !self.core_version_warned && info.version != env!("CARGO_PKG_VERSION") {
@@ -812,6 +929,10 @@ impl App {
                 .core
                 .as_ref()
                 .map(|c| (c.version.clone(), c.uptime_secs));
+              // A connected link means a core is running even before its first
+              // `CoreInfo` answer lands, so the row and the button agree from
+              // the moment the connection is up.
+              let running = service.is_some() || self.link.as_ref().is_some_and(Link::alive);
               ui.label(t.service);
               ui.horizontal(|ui| {
                 match &service {
@@ -827,21 +948,25 @@ impl App {
                       text.color(state_color(State::Authenticating))
                     });
                   }
+                  None if running => {
+                    ui.label(
+                      egui::RichText::new(t.service_running).color(state_color(State::Online)),
+                    );
+                  }
                   None => {
                     ui.label(
                       egui::RichText::new(t.service_gone).color(state_color(State::Offline)),
                     );
                   }
                 }
-                let running = service.is_some();
+                // One request at a time: the outcome arrives when the link is
+                // up (start) or down (stop), which takes a moment.
+                let idle = self.service_request.is_none();
                 let label = if running {
                   t.service_stop
                 } else {
                   t.service_start
                 };
-                // One request at a time: the outcome arrives when the link is
-                // up (start) or down (stop), which takes a moment.
-                let idle = self.service_request.is_none();
                 if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
                   if running {
                     // The core ends itself; the toast and the row's "not
@@ -849,18 +974,13 @@ impl App {
                     self.send(Cmd::Shutdown);
                     self.service_request = Some((ServiceRequest::Stop, Instant::now()));
                   } else {
-                    match crate::ipc::start_core() {
-                      Ok(()) => {
-                        // Do not sit out the reconnect throttle: the new core
-                        // is usually listening before the next frame.
-                        self.next_link_try = Instant::now();
-                        self.service_request = Some((ServiceRequest::Start, Instant::now()));
-                      }
-                      Err(e) => {
-                        self.push_log(Line::error(format!("service: {e}")));
-                        self.toast_err(t.service_start_failed.to_string());
-                      }
-                    }
+                    // Registering the start can block, so it happens off the UI
+                    // thread; `logic` picks the outcome up.
+                    self.service_request = Some((ServiceRequest::Start, Instant::now()));
+                    let tx = self.start_tx.clone();
+                    std::thread::spawn(move || {
+                      let _ = tx.send(crate::ipc::start_core());
+                    });
                   }
                 }
               });
@@ -1659,6 +1779,20 @@ mod tests {
     let v: Value = serde_json::from_str(r#"{"ip":"198.51.100.7"}"#).unwrap();
     assert_eq!(info_from(&v).ip4, "198.51.100.7");
   }
+
+  #[test]
+  fn only_a_newer_core_build_restarts_the_window() {
+    // Same build (manual stop/start, plain restart): leave the window alone.
+    assert!(!should_restart(100, 100, true));
+    // A newer core whose file was replaced by an upgrade: restart once.
+    assert!(should_restart(200, 100, true));
+    // The file did not change, so a restart would run the same old binary.
+    assert!(!should_restart(200, 100, false));
+    // An older core, and one that predates the stamp.
+    assert!(!should_restart(100, 200, true));
+    assert!(!should_restart(0, 200, true));
+    assert!(!should_restart(200, 0, true));
+  }
 }
 
 /// Red strip for the two states that stop everything from working: an error
@@ -1688,6 +1822,10 @@ impl eframe::App for App {
     while gtk::events_pending() {
       gtk::main_iteration_do(false);
     }
+
+    // A mode change may have been waiting for a UAC prompt; its result is due
+    // regardless of what else happens this frame.
+    self.pump_mode_request();
 
     if !self.started {
       self.started = true;
@@ -1725,6 +1863,25 @@ impl eframe::App for App {
     // The core may have been restarted (crash, upgrade, systemd unit or logon
     // task): reconnect instead of going deaf.
     self.ensure_link();
+
+    // Outcome of a Start that ran on the helper thread. Success only starts the
+    // 10 s clock (waiting for the link); a failure is reported right away.
+    while let Ok(result) = self.start_rx.try_recv() {
+      match result {
+        Ok(()) => {
+          // Do not sit out the reconnect throttle: the new core is usually
+          // listening before the next frame.
+          self.next_link_try = Instant::now();
+          self.service_request = Some((ServiceRequest::Start, Instant::now()));
+        }
+        Err(e) => {
+          self.service_request = None;
+          self.push_log(Line::error(format!("service: {e}")));
+          let msg = self.t().service_start_failed.to_string();
+          self.toast_err(msg);
+        }
+      }
+    }
 
     // A Start/Stop whose outcome never arrived (no socket, or a core that did
     // not exit) is reported instead of leaving the click unanswered.
@@ -1791,6 +1948,9 @@ impl eframe::App for App {
         .map(|t| t.elapsed() > Duration::from_millis(1500))
         .unwrap_or(false)
       {
+        // `process::exit` skips `Guard::drop`; remove the Unix lock file first
+        // so the next launch does not have to reap it by pid.
+        crate::single::release();
         std::process::exit(0);
       }
     }
@@ -1856,6 +2016,31 @@ fn build_version() -> String {
     crate::shortcut::APP_TITLE,
     env!("CARGO_PKG_VERSION")
   )
+}
+
+/// Build stamp of this process (see `build.rs`), seconds since the epoch.
+fn own_build_epoch() -> u64 {
+  env!("THUNET_BUILD_EPOCH").parse().unwrap_or(0)
+}
+
+/// (size, mtime) of the executable a restart would exec.
+fn exe_stamp(path: &std::path::Path) -> Option<(u64, std::time::SystemTime)> {
+  let meta = std::fs::metadata(path).ok()?;
+  Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Should this window replace itself with the file on disk?
+///
+/// All three conditions matter:
+/// * the service must report a *newer* build: an equal one is a manual
+///   stop/start or a plain restart and must leave the window alone, and a
+///   merely different one could bounce against an older service forever;
+/// * the stamp must be known (`0` is a core built before this field existed);
+/// * the file this process would exec must have changed since it started,
+///   otherwise a stale copy at a fixed path (a portable install next to a
+///   newer system service) would restart itself forever.
+fn should_restart(core_epoch: u64, own_epoch: u64, file_changed: bool) -> bool {
+  file_changed && core_epoch > 0 && own_epoch > 0 && core_epoch > own_epoch
 }
 
 /// Right half of the settings footer: what the build time actually is.
@@ -2184,6 +2369,8 @@ fn init_gtk() -> Result<(), String> {
 }
 
 fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<(), String> {
+  // Mutated only by the X11 block below; other platforms build it as is.
+  #[allow(unused_mut)]
   let mut options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])

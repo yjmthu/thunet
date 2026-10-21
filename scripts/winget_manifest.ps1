@@ -103,7 +103,7 @@ Platform:
 - Windows.Desktop
 MinimumOSVersion: 10.0.17763.0
 InstallerType: msi
-Scope: user
+Scope: machine
 InstallModes:
 - interactive
 - silent
@@ -113,7 +113,7 @@ Installers:
 - Architecture: x64
   InstallerUrl: $url
   InstallerSha256: $hash
-  Scope: user
+  Scope: machine
   InstallerSwitches:
     Silent: /qn
     SilentWithProgress: /qb

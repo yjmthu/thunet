@@ -34,9 +34,6 @@ const DOMAIN: &[u8] = b"thunet/credential/v1";
 const NONCE_LEN: usize = 12;
 /// Sealed credential file in the config directory.
 const CREDENTIAL_FILE: &str = "credential.bin";
-/// The plain-text file written by 0.1.x; removed whenever the store is written
-/// or cleared, so an old password cannot linger on disk.
-const LEGACY_FILE: &str = "credential.json";
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
@@ -79,7 +76,6 @@ fn save_in(dir: &Path, username: &str, password: &str) -> Result<(), String> {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
       .map_err(|e| e.to_string())?;
   }
-  remove_legacy(dir);
   Ok(())
 }
 
@@ -92,11 +88,6 @@ fn load_in(dir: &Path) -> Option<(String, String)> {
 
 fn delete_in(dir: &Path) {
   let _ = std::fs::remove_file(dir.join(CREDENTIAL_FILE));
-  remove_legacy(dir);
-}
-
-fn remove_legacy(dir: &Path) {
-  let _ = std::fs::remove_file(dir.join(LEGACY_FILE));
 }
 
 /// 32-byte key for `identity`, domain-separated from every other use.
@@ -318,21 +309,6 @@ mod tests {
 
     delete_in(&dir);
     assert_eq!(load_in(&dir), None, "delete should remove the file");
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// An upgrade must not leave the 0.1.x plain-text password behind.
-  #[test]
-  fn writing_or_clearing_removes_the_plaintext_legacy_file() {
-    let dir = scratch("legacy");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(LEGACY_FILE), b"{\"password\":\"old\"}").unwrap();
-    save_in(&dir, "u", "p").unwrap();
-    assert!(!dir.join(LEGACY_FILE).exists(), "save should clean it up");
-
-    std::fs::write(dir.join(LEGACY_FILE), b"{}").unwrap();
-    delete_in(&dir);
-    assert!(!dir.join(LEGACY_FILE).exists(), "delete should clean it up");
     let _ = std::fs::remove_dir_all(&dir);
   }
 

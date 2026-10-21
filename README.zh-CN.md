@@ -44,7 +44,7 @@
 
    | 系统 | 文件 | 安装方式 |
    | --- | --- | --- |
-   | Windows | `thunet-<version>-x64.msi` | 双击、`msiexec /i thunet-<version>-x64.msi`，发布后也可以 `winget install --id THUnet.THUnet -e`（见 [用 winget 安装](#8-用-winget-安装)） |
+   | Windows | `thunet-<version>-x64.msi` | 双击、`msiexec /i thunet-<version>-x64.msi`（需管理员权限，装到 `Program Files`），发布后也可以 `winget install --id THUnet.THUnet -e`（见 [用 winget 安装](#8-用-winget-安装)） |
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | 其他 Linux | `thunet-<version>-linux-x64.tar.gz` | 解压后运行 `./thunet`（可选 `./thunet shortcut` 生成桌面图标） |
 
@@ -101,7 +101,7 @@
 
 | 设置项 | 作用 |
 | --- | --- |
-| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——托盘自己不会拉起 core，那样的图标只会一直显示"未运行" |
+| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——托盘自己不会拉起 core，那样的图标只会一直显示"未运行"。Windows 上这一行是唯一会弹 UAC 的地方：注册或修改服务需要一次管理员授权，启停不需要 |
 | 启动时最小化到托盘 | 与上一项相互独立：可以自启但隐藏，也可以手动启动时打开窗口，反之亦然。在"服务"档位下置灰（根本没有托盘要最小化） |
 | 启动时自动连接 | 一检测到可用网络就登录 |
 | 创建桌面快捷方式 | 为当前运行的可执行文件在桌面生成一个启动器（等同于 `thunet shortcut`） |
@@ -168,7 +168,9 @@
 向校园主页发一次请求来保持会话。
 
 **开机自启** —— 设置 → *开机自启*。如果希望启动时窗口保持隐藏，同时打开
-*启动时最小化到托盘*（自启项随后会带上 `--minimized`）。
+*启动时最小化到托盘*（自启项随后会带上 `--minimized`）。Windows 上这个开关会
+弹一次管理员授权，因为后台服务必须注册给服务管理器；Linux 上整个过程都在你的
+用户账号内完成。
 
 **切换语言** —— 设置 → *语言*。选择会存进配置文件并立即生效。
 
@@ -218,11 +220,12 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 `.deb` 已经把 bash、zsh、fish 的补全装到 `/usr/share` 下，所以在
 Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
 
-窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过一个按用户隔离的
-本地套接字通信。窗口不会自己拉起 core：它来自开机自启、`thunet service start`，
-或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有 core 这一半能在开机时起
-（Linux 是 systemd user unit，Windows 是第二个登录任务——都由设置页的「随系统启动」
-创建）。
+窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过本地套接字通信
+（Windows 上是命名管道）。窗口不会自己拉起 core：它来自开机自启、
+`thunet service start`，或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有
+core 这一半能在开机时起——Linux 是 systemd user unit，Windows 是一个真正的
+**服务**，都由设置页的「随系统启动」创建。Windows 上这个开关也是唯一会弹 UAC 的
+地方：注册或修改服务需要管理员权限，之后启停都不需要。
 
 `status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行
 的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，
@@ -232,7 +235,8 @@ Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
 
 ```json
 {
-  "core":   { "version": "0.1.3", "pid": 1234, "uptime_secs": 812,
+  "core":   { "version": "0.1.3", "build_epoch": 1792571000, "pid": 1234,
+              "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
               "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
               "wanted_online": true, "failures": 0, "frontends": 1,
@@ -290,26 +294,34 @@ Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
 ## 7. 安装、卸载、快捷方式
 
 **THUnet 的安装与卸载只由操作系统负责** —— Windows 上是 `.msi`，Debian/Ubuntu 上
-是 `.deb`。程序本身从不复制文件、不写卸载项、不注册自己；没有"为我安装"按钮，
+是 `.deb`。程序本身从不复制文件、不写卸载项；它唯一会注册的东西是自启（托盘的
+登录任务、core 的服务），而且只在你主动开启时才注册。没有"为我安装"按钮，
 也没有 `thunet install` 命令。这样每次安装只有一个所有者，不会出现两份注册信息
 争抢同一批文件。
 
 | 系统 | 安装后的可执行文件 | 注册信息（由安装包创建） |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\Programs\thunet\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、开始菜单里的 `THUnet`、桌面快捷方式 |
+| Windows | `C:\Program Files\THUnet\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、开始菜单里的 `THUnet`、桌面快捷方式 |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`、`/usr/share/icons/hicolor/scalable/apps/` 下的图标 |
 
-MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也不产生机器级状态，
-所以共用一台机器时每个账号都有自己的设置。它装到 `%LOCALAPPDATA%` 而不是
-`Program Files`，因为写后者会让安装、升级*和*卸载都需要 UAC 提权 —— 对一个单文件
-托盘程序来说不值得。
+MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级
+状态，所以它能在替换文件前停掉 core 服务、卸载时删除它——而每用户的包以普通权限
+运行，两件事都做不到，只能留下一个指向已删除 exe 的服务条目。代价是安装、升级和
+卸载各需一次管理员授权。
 
-程序运行时卸载是安全的：MSI 会先结束正在运行的副本（`InstallValidate` 之前执行
-`taskkill /IM thunet.exe /F`），然后删除文件、快捷方式、开始菜单文件夹和安装目录。
+设置仍然是**每用户**的（`%APPDATA%\thunet`），服务也仍然由应用在开启自启时自行
+注册，因为它必须指向**你自己的**配置目录。
+
+程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，
+并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe
+/F`），在真正的卸载时删除服务，然后才删除文件、快捷方式、开始菜单文件夹和安装
+目录。主版本升级同样会停服务，但保留注册。
 
 因为这个 `taskkill` 在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）
-在事务结束后会重新启动程序；静默安装（`msiexec /qn`、winget）不会，因此不会抢占
-桌面。也就是说，在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
+在事务结束后会重新启动程序。启动是通过 `explorer.exe` 转一手做的：自定义动作本身
+是提权运行的，直接启动托盘会拿到管理员令牌，而经过 explorer 启动的程序属于交互
+用户。静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，
+在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
 
 开机自启**不属于**安装包 —— 程序自己注册条目，状态再直接从系统读回来（不写进
 `config.json`）。条目有两个（托盘、后台服务），模式有三档：
@@ -317,14 +329,14 @@ MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也�
 | 模式 | Linux | Windows |
 | --- | --- | --- |
 | **关闭** | 不注册任何条目 | 不注册任何条目 |
-| **服务** | 启用 systemd 用户单元 `thunet.service`；配合 `loginctl enable-linger` 可**在登录前**起飞 | `thunet` 登录任务：保持在线，但没有托盘图标 |
-| **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 两个登录任务：`thunet`（核心）与 `thunet-tray`（托盘） |
+| **服务** | 启用 systemd 用户单元 `thunet.service`；配合 `loginctl enable-linger` 可**在登录前**起飞 | `thunet` **服务**（LocalSystem，启动类型 `auto`）：登录界面出现前就已在线，没有托盘图标 |
+| **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 该服务 + `thunet-tray` 登录任务 |
 
 没有提供"只启动托盘"：托盘自己不会拉起 core，单独一个图标只能一直报"未运行"。
 
 | 系统 | 自启项 |
 | --- | --- |
-| Windows | 每用户计划任务（`schtasks /Create /XML`，无延迟、最低权限）。Task Scheduler 服务在 `explorer.exe` 处理 `Run` 键之前触发它们。两者都是 `InteractiveToken` + `LeastPrivilege`，即用户自己的令牌、不提权 —— 这是定位权限还能用的前提。Windows 想"登录前"就只能装服务，而那需要管理员权限（并且会丢掉这项权限），所以目前只有 Linux 会在登录前启动核心。 |
+| Windows | core 是一个 **服务**（`thunet`，LocalSystem，`SERVICE_WIN32_OWN_PROCESS`），由服务控制管理器在开机时拉起——比任何人登录都早，这是登录任务做不到的。托盘仍是每用户登录任务（`schtasks /Create /XML`，无延迟、`InteractiveToken` + `LeastPrivilege`），这也是定位权限还能用的原因。注册或重新配置服务需要管理员权限（一次 UAC）；启停不需要。 |
 | Linux | 托盘：`~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart），所有桌面都认；后台服务：systemd 用户单元，按用户 enable，不需要 root。 |
 | macOS | 由 `auto-launch` crate 管理的 LaunchAgent；core 本身用 `thunet core`、`thunet service start` 或状态页的「启动」按需拉起。 |
 
@@ -334,19 +346,18 @@ MSI 是每用户安装（`Scope="perUser"`）：不需要管理员权限，也�
 
 | 动作 | Linux | Windows |
 | --- | --- | --- |
-| `install` / `uninstall` | 写入 / 删除 unit | 创建 / 删除 core 任务（任务不能没有触发器而存在） |
-| `enable` / `disable` | 挂进登录/开机路径（并尽力 `enable-linger`） | 同 install / uninstall |
-| `start` / `stop` / `restart` | `systemctl --user …` | `schtasks /Run`、`/End` |
-| `status` | `systemctl --user status` | `schtasks /Query /V /FO LIST` |
+| `install` / `uninstall` | 写入 / 删除 unit | 创建 / 删除服务，需要管理员 |
+| `enable` / `disable` | 挂进登录/开机路径（并尽力 `enable-linger`） | 把启动类型设为 `auto` / `demand`，需要管理员 |
+| `start` / `stop` / `restart` | `systemctl --user …` | `StartServiceW` / `ControlService`，登录用户即可 |
+| `status` | `systemctl --user status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
 
-core 一旦注册，就属于 systemd / Task Scheduler 管：窗口只会重连它，绝不在后台
-自己再 spawn 一个。
+core 一旦注册，就属于 systemd / 服务控制管理器管：窗口只会重连它，绝不在后台
+自己再 spawn 一个。`enable` / `disable` 只决定**下次开机**是否自动起，不改变当前
+是否在运行 —— 那是 `start` / `stop` 的事。
 
-更早的版本在 Windows 上写的是 `HKCU\...\CurrentVersion\Run\thunet`；新版第一次启动
-会把这个值迁移成登录任务（保留它记录的可执行文件路径）并删除原值，因此不会启动两次。
-0.1.x 的托盘任务也叫 `thunet`，而这个名字现在是核心的；两者无法事后区分，所以新版会
-把它改写成“运行核心”，并从“服务”起步——想要图标回来，在设置里选一次
-“服务 + 托盘”即可。
+Linux 上即使没开开机自启，第一次启动也会写入 unit，所以 `thunet service
+start|stop|status` 立刻可用。Windows 上服务由 `thunet service install`（或选择任一
+服务档位）创建，之后 `start|stop|status` 都不再需要授权。
 
 剩下的唯一自助操作就是桌面快捷方式：设置页的 **创建桌面快捷方式**，或
 `thunet shortcut`，它会为当前运行的可执行文件在桌面生成启动器（Linux 上还会把
@@ -354,8 +365,9 @@ core 一旦注册，就属于 systemd / Task Scheduler 管：窗口只会重连�
 
 卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上
 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的设置会保留；想要干净状态就删掉该
-目录。如果不想留下指向已删除文件的自启项（Windows 上是计划任务里的
-`thunet` 和 `thunet-tray`），请在卸载前先关闭 *开机自启*。
+目录。卸载前请先关闭 *开机自启*（去掉 `thunet-tray` 登录任务），再执行
+`thunet service uninstall`（一次授权：停止并删除服务）。只关自启会留下服务条目，
+只删服务会留下登录任务——两者都会指向一个不存在的可执行文件。
 
 ## 8. 用 winget 安装
 
@@ -465,13 +477,14 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 
 | 路径 | 作用 |
 | --- | --- |
-| `packaging/thunet.wxs` | 每用户 MSI 的 WiX v5 源码 |
+| `packaging/thunet.wxs` | 每机器 MSI 的 WiX v5 源码 |
 | `scripts/build_msi.ps1` | 读取版本并驱动 `wix build` |
 | `scripts/build_tarball.sh` | 读取版本并打包 tarball |
 | `Cargo.toml` → `[package.metadata.deb]` | Debian control 字段和文件列表 |
 | `build.rs` | 把 `assets/thunet.ico`（以及版本信息块）嵌入 exe |
 | `assets/thunet.ico`、`assets/thunet.svg` | 安装包和快捷方式使用的图标 |
 | `assets/thunet.desktop` | `.deb` 安装的启动器条目 |
+| `assets/completions/` | `.deb` 安装的 bash/zsh/fish 补全脚本；单元测试保证它们与 CLI 定义同步 |
 | `scripts/make_icon.py` | 重新生成图标资源（`pixi run -e tools python scripts/make_icon.py`） |
 
 注意事项：
@@ -518,8 +531,15 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 - 客户端信任门户的 TLS 证书；`--http` 只用于调试。
 - 基于 `netsh` 的 SSID 探测需要 Windows 定位权限。没有该权限时客户端仍可工作，
   但无法区分 `Tsinghua-Secure` 与需要认证的 Wi-Fi —— 此时由外网探测来决定。
-- 单实例保护在 Windows 上会激活已有窗口。Linux 和 macOS 上第二次启动只是退出：
-  拉起另一个进程的窗口并不可移植，请改用托盘图标。
+- Windows 上 core 以 **服务**（LocalSystem）运行，因为只有服务能比登录更早启动。
+  它读的仍是你自己的 `%APPDATA%\thunet`（路径通过 `--state-dir` 传进去），控制管道
+  是整机范围的，DACL 允许已登录用户驱动它：能本机登录的人都能启停这个会话；注册服务
+  本身仍然只有管理员能做。
+- 单实例保护在各平台都会把已有窗口叫回来：Windows 上通过会话内的命名事件，
+  Linux/macOS 上第二次启动会留下一个标记文件，由正在运行的实例自己轮询并显示窗口。
+- 升级后用新版本重启服务（`systemctl --user restart thunet`）时，仍在跑旧构建的
+  窗口会比较两边的构建时间戳，自动重启到磁盘上的新二进制；版本/构建相同、或自己
+  那份文件根本没被替换时，窗口保持不动。
 - 日志条里右键复制的是整行；自由选择复制用常规的 `Ctrl+C`。
 
 ## 13. 许可证

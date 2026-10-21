@@ -42,8 +42,6 @@ pub enum Cmd {
   CoreInfo,
   /// Report the access-controller id the core is currently using.
   AcId,
-  /// The frontend is going away. The core keeps running: it owns the session.
-  Quit,
   /// The frontend wants the core to stop: the status page's *Stop* button was
   /// used (tray *Quit* deliberately only ends the window). The core ends the
   /// session itself instead of lingering unseen.
@@ -84,6 +82,13 @@ pub enum LoginEnv {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreInfo {
   pub version: String,
+  /// Build stamp of the core (see `build.rs`), seconds since the epoch.
+  ///
+  /// `#[serde(default)]` lets a new frontend read an old core, where the field
+  /// is absent (it then reads as 0 = unknown). Additive, so [`VERSION`] stays
+  /// put.
+  #[serde(default)]
+  pub build_epoch: u64,
   pub pid: u32,
   pub uptime_secs: u64,
   pub state: State,
@@ -229,6 +234,7 @@ mod tests {
   fn the_core_status_roundtrips() {
     let info = CoreInfo {
       version: "0.1.3".into(),
+      build_epoch: 1_700_000_000,
       pid: 42,
       uptime_secs: 7,
       state: State::Online,

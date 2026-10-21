@@ -73,7 +73,14 @@ fn env_path(key: &str) -> PathBuf {
 /// | Windows | `%APPDATA%\thunet`                     |
 /// | macOS   | `~/Library/Application Support/thunet`  |
 /// | Linux   | `$XDG_CONFIG_HOME/thunet` (or `~/.config/thunet`) |
+///
+/// `THUNET_STATE_DIR` overrides all of them. The Windows service needs it: it
+/// runs under SYSTEM, whose `%APPDATA%` is the system profile, while the
+/// settings and the sealed credential belong to the user who installed it.
 pub fn dir() -> PathBuf {
+  if let Some(dir) = std::env::var_os("THUNET_STATE_DIR").filter(|v| !v.is_empty()) {
+    return PathBuf::from(dir);
+  }
   let base = if cfg!(windows) {
     env_path("APPDATA")
   } else if cfg!(target_os = "macos") {
@@ -105,10 +112,9 @@ impl Config {
           }
           cfg.password = pass;
         }
-        // Nothing usable is stored: a blob from another machine, a cleared
-        // entry, or a 0.1.x plain-text file this build does not read. Drop what
-        // is there — an unreadable blob and, above all, a plain-text password
-        // help nobody — and fall back to typing it.
+        // Nothing usable is stored: a blob sealed by another machine, or a
+        // cleared entry. Drop what is there — an unreadable blob helps nobody —
+        // and fall back to typing the password.
         None => {
           cfg.remember_password = false;
           secret::delete();

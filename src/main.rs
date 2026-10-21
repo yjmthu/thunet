@@ -6,6 +6,8 @@ mod autostart;
 mod config;
 mod core;
 mod crypto;
+mod diag;
+mod elevate;
 mod i18n;
 mod ipc;
 mod logline;
@@ -17,6 +19,8 @@ mod single;
 mod srun;
 mod ui;
 mod wifi;
+#[cfg(windows)]
+mod winsvc;
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -84,6 +88,31 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
+/// Path to the executable on disk.
+///
+/// After an in-place upgrade the running image is unlinked, and on Linux
+/// `/proc/self/exe` then reads `"/usr/bin/thunet (deleted)"`. Spawning or
+/// registering that path fails, so the suffix is stripped and the current file
+/// on disk is used instead.
+pub fn exe_path() -> Option<std::path::PathBuf> {
+  Some(without_deleted_suffix(std::env::current_exe().ok()?))
+}
+
+/// `/proc/self/exe` reads `"/usr/bin/thunet (deleted)"` once the file was
+/// replaced in place (an upgrade); the path on disk is what we want.
+#[cfg(target_os = "linux")]
+fn without_deleted_suffix(exe: std::path::PathBuf) -> std::path::PathBuf {
+  match exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+    Some(path) => std::path::PathBuf::from(path),
+    None => exe,
+  }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn without_deleted_suffix(exe: std::path::PathBuf) -> std::path::PathBuf {
+  exe
+}
+
 /// With no console, a panic would vanish; keep it on disk instead.
 fn install_panic_log() {
   let previous = std::panic::take_hook();
@@ -137,6 +166,11 @@ struct Cli {
   /// Start minimised to the tray (used by the autostart entry).
   #[arg(long, global = true)]
   minimized: bool,
+  /// Where `config.json` and `credential.bin` live. The Windows service is
+  /// registered with the installing user's directory, because the token it
+  /// runs under has no profile of its own.
+  #[arg(long, global = true, hide = true)]
+  state_dir: Option<std::path::PathBuf>,
 
   #[command(subcommand)]
   cmd: Option<Cmd>,
@@ -156,17 +190,34 @@ enum Cmd {
   Logout,
   /// Run the background service (no window, no tray).
   ///
-  /// Normally started by the systemd user unit or the Windows logon task, or on
-  /// demand with `thunet service start` / the status page's *Start* button.
-  Core,
+  /// Normally started by the systemd user unit or the Windows service manager,
+  /// or on demand with `thunet service start` / the status page's *Start*
+  /// button.
+  Core {
+    /// Started by the Windows service manager; not for humans.
+    #[arg(long, hide = true)]
+    service: bool,
+  },
   /// Install or control the background service.
   ///
-  /// Wraps `systemctl --user` on Linux and `schtasks` on Windows, so the same
-  /// verbs work everywhere.
+  /// Wraps `systemctl --user` on Linux and the Service Control Manager on
+  /// Windows, so the same verbs work everywhere. Changing the registration
+  /// needs administrator rights on Windows, which this asks for once.
   Service {
     #[arg(value_enum)]
     action: autostart::ServiceAction,
   },
+  /// Perform one privileged service operation (the elevated half of
+  /// `service <action>`, not for humans).
+  #[command(hide = true)]
+  ServiceAdmin {
+    #[arg(value_enum)]
+    action: autostart::ServiceAction,
+  },
+  /// Restart the core after an upgrade if it starts at boot (installer
+  /// internal).
+  #[command(hide = true)]
+  ServiceResume,
   /// Print the config path and effective settings.
   Config,
   /// Create a desktop shortcut for this executable.
@@ -194,6 +245,14 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+  // The Windows service runs as SYSTEM, whose own `%APPDATA%` is the system
+  // profile; `sc create` therefore passes the installing user's directory.
+  if let Some(dir) = &cli.state_dir {
+    // SAFETY: this runs on the main thread before anything reads the
+    // environment (no other thread exists yet, and `config::dir` is only
+    // reached below).
+    unsafe { std::env::set_var("THUNET_STATE_DIR", dir) };
+  }
   // Effective settings: config file first, explicit CLI flags win.
   let mut cfg = config::Config::load();
   if let Some(h) = cli.host.clone() {
@@ -314,18 +373,28 @@ fn run(cli: Cli) -> Result<(), String> {
       link.send(CoreCmd::Disconnect);
       settled(&link, Duration::from_secs(20))
     }
-    Cmd::Core => match ipc::serve(cfg)? {
-      ipc::Serve::Started => Ok(()),
-      ipc::Serve::AlreadyRunning => {
-        // Nothing to do: whoever owns the endpoint keeps serving the frontends.
-        eprintln!("another core is already running");
-        Ok(())
+    Cmd::Core { service } => {
+      #[cfg(windows)]
+      if service {
+        return winsvc::run();
       }
-    },
+      #[cfg(not(windows))]
+      let _ = service;
+      match ipc::serve(cfg)? {
+        ipc::Serve::Started => Ok(()),
+        ipc::Serve::AlreadyRunning => {
+          // Nothing to do: whoever owns the endpoint keeps serving the frontends.
+          eprintln!("another core is already running");
+          Ok(())
+        }
+      }
+    }
     Cmd::Service { action } => {
       println!("{}", autostart::Autostart::service(action, cli.minimized)?);
       Ok(())
     }
+    Cmd::ServiceAdmin { action } => autostart::service_admin(action),
+    Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
   }
 }
 
@@ -402,5 +471,59 @@ fn settled(link: &ipc::Link, timeout: Duration) -> Result<(), String> {
     }
     CoreEv::Error(Some(e)) => Err(e),
     _ => Ok(()),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The `.deb` installs the scripts under `assets/completions/`, and a
+  /// checked-in copy can only stay honest if something compares it with the
+  /// real CLI definition.
+  #[test]
+  fn checked_in_completion_scripts_match_the_cli() {
+    let cases = [
+      (
+        clap_complete::Shell::Bash,
+        "thunet.bash",
+        include_str!("../assets/completions/thunet.bash"),
+      ),
+      (
+        clap_complete::Shell::Zsh,
+        "_thunet",
+        include_str!("../assets/completions/_thunet"),
+      ),
+      (
+        clap_complete::Shell::Fish,
+        "thunet.fish",
+        include_str!("../assets/completions/thunet.fish"),
+      ),
+    ];
+    for (shell, file, expected) in cases {
+      let mut cmd = Cli::command();
+      let mut out = Vec::new();
+      clap_complete::generate(shell, &mut cmd, "thunet", &mut out);
+      let generated = String::from_utf8(out).expect("completion scripts are UTF-8");
+      assert_eq!(
+        generated, expected,
+        "assets/completions/{file} is stale; regenerate it with \
+         `cargo run -- completions {shell} > assets/completions/{file}`"
+      );
+    }
+  }
+
+  #[test]
+  fn an_unlinked_image_resolves_to_the_path_on_disk() {
+    // Right after an in-place upgrade `/proc/self/exe` keeps the marker.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+      without_deleted_suffix(std::path::PathBuf::from("/usr/bin/thunet (deleted)")),
+      std::path::PathBuf::from("/usr/bin/thunet")
+    );
+    assert_eq!(
+      without_deleted_suffix(std::path::PathBuf::from("/usr/bin/thunet")),
+      std::path::PathBuf::from("/usr/bin/thunet")
+    );
   }
 }

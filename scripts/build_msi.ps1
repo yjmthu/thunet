@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Build the per-user MSI.
+    Build the per-machine MSI.
 
 .DESCRIPTION
     The version is never hard-coded: by default it is read from Cargo.toml, and

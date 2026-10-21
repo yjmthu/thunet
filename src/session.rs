@@ -158,16 +158,23 @@ impl Session {
           }
         }
       }
-      let v = self
-        .client
-        .login_logout(
-          &self.cfg.username,
-          Some(&self.cfg.password),
-          &self.cfg.ip,
-          &self.cfg.ac_id,
-          false,
-        )
-        .map_err(|e| format!("request to {} failed: {e}", self.cfg.host))?;
+      let v = match self.client.login_logout(
+        &self.cfg.username,
+        Some(&self.cfg.password),
+        &self.cfg.ip,
+        &self.cfg.ac_id,
+        false,
+      ) {
+        Ok(v) => v,
+        Err(e) => {
+          // The request never reached the portal, so the state is unknown, not
+          // "authenticating". Leaving it there kept the window and the tray
+          // amber until a later status poll happened to succeed — which on a
+          // dead network never happens.
+          self.state = State::Offline;
+          return Err(format!("request to {} failed: {e}", self.cfg.host));
+        }
+      };
 
       if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
         self.state = State::Online;

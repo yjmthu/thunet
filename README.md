@@ -46,7 +46,7 @@ Linux and macOS, and speaks Chinese or English.
 
    | System | File | Install with |
    | --- | --- | --- |
-   | Windows | `thunet-<version>-x64.msi` | double-click, `msiexec /i thunet-<version>-x64.msi`, or `winget install --id THUnet.THUnet -e` once published (see [Installing with winget](#8-installing-with-winget)) |
+   | Windows | `thunet-<version>-x64.msi` | double-click, `msiexec /i thunet-<version>-x64.msi` (administrator rights, installs to `Program Files`), or `winget install --id THUnet.THUnet -e` once published (see [Installing with winget](#8-installing-with-winget)) |
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | other Linux | `thunet-<version>-linux-x64.tar.gz` | unpack and run `./thunet` (optionally `./thunet shortcut` for a desktop launcher) |
 
@@ -123,7 +123,7 @@ clipboard. With nothing selected, right-click opens a small menu with
 
 | Setting | Effect |
 | --- | --- |
-| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running" |
+| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running". On Windows this row is the only place the app asks for administrator rights: registering or changing the service takes one UAC prompt, starting and stopping it takes none |
 | Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
 | Auto connect | Log in as soon as a usable network appears |
 | Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
@@ -208,7 +208,9 @@ homepage every 5 minutes.
 
 **Start with the computer** — Settings → *Start with the system*. Enable *Start
 minimised to tray* as well if the window should stay hidden (the autostart entry
-then carries `--minimized`).
+then carries `--minimized`). On Windows the switch asks for administrator rights
+once, because the background core has to be registered with the Service Control
+Manager; on Linux everything stays inside your user account.
 
 **Switch language** — Settings → *Language*. The choice is stored in the config
 file and applies immediately.
@@ -261,12 +263,14 @@ The `.deb` already installs bash, zsh and fish completions under `/usr/share`, s
 on Debian/Ubuntu they work right after `apt install` with nothing to set up.
 
 The window is only a *frontend*. The network session lives in `thunet core`,
-which the window talks to over a per-user local socket. The window never starts
-that process on its own: it comes from autostart at login, `thunet service
-start`, or the *Start* button on the status page. Closing the window therefore
-keeps you online, and the core is the half that can start at boot (systemd user
-unit on Linux, a second logon task on Windows — both created by the *Start with
-the system* setting).
+which the window talks to over a local socket (a named pipe on Windows, a Unix
+socket elsewhere). The window never starts that process on its own: it comes
+from autostart, `thunet service start`, or the *Start* button on the status
+page. Closing the window therefore keeps you online, and the core is the half
+that can start at boot — a systemd user unit on Linux, a **Windows service** on
+Windows, both created by the *Start with the system* setting. That switch is
+the only place a UAC prompt appears: registering the service needs
+administrator rights, starting and stopping it afterwards does not.
 
 `status`, `login`, `logout` and `ac-id` are frontends too: they ask the running
 service over that same socket instead of contacting the portal themselves, so
@@ -278,7 +282,8 @@ second, unmanaged connection.
 
 ```json
 {
-  "core":   { "version": "0.1.3", "pid": 1234, "uptime_secs": 812,
+  "core":   { "version": "0.1.3", "build_epoch": 1792571000, "pid": 1234,
+              "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
               "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
               "wanted_online": true, "failures": 0, "frontends": 1,
@@ -342,28 +347,40 @@ directory for a clean slate.
 ## 7. Installing, uninstalling, shortcuts
 
 **THUnet is installed and removed by the operating system only** — the `.msi` on
-Windows, the `.deb` on Debian/Ubuntu. The application itself never copies files,
-writes uninstall entries or registers itself; there is no "install for me"
-button and no `thunet install` command. That keeps one owner per installation
-and avoids the two registrations fighting over the same files.
+Windows, the `.deb` on Debian/Ubuntu. The application itself never copies files
+or writes uninstall entries; the one thing it does register is autostart (a
+logon task for the tray, a service for the core), and only when you ask for it.
+There is no "install for me" button and no `thunet install` command. That keeps
+one owner per installation and avoids the two registrations fighting over the
+same files.
 
 | OS | Installed executable | Registration (created by the package) |
 | --- | --- | --- |
-| Windows | `%LOCALAPPDATA%\Programs\thunet\thunet.exe` | Windows Installer entry in *Settings → Apps*, Start Menu entry under `THUnet`, desktop shortcut |
+| Windows | `C:\Program Files\THUnet\thunet.exe` | Windows Installer entry in *Settings → Apps*, Start Menu entry under `THUnet`, desktop shortcut |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`, icon under `/usr/share/icons/hicolor/scalable/apps/` |
 
-The MSI is per-user (`Scope="perUser"`): no administrator rights and no machine-wide
-state, so every account on a shared machine keeps its own settings. It installs
-to `%LOCALAPPDATA%` rather than `Program Files`, because writing there would
-require UAC elevation for install, upgrade *and* removal — a poor trade for a
-single-file tray app.
+The MSI is per-machine (`Scope="perMachine"`), which is what a single UAC
+prompt at install buys: the package owns machine-wide state, so it can stop the
+core service before files are replaced and delete it on uninstall — a per-user
+package runs unelevated and can do neither, leaving a service behind that points
+at a deleted executable. The trade is that install, upgrade and removal all ask
+for administrator rights once.
 
-Uninstalling while THUnet is running is safe: the MSI terminates the running copy
-first (`taskkill /IM thunet.exe /F` before `InstallValidate`), then removes the
-files, the shortcuts, the Start Menu folder and the install directory.
+Settings are still **per user** (`%APPDATA%\thunet`), and the service is still
+registered by the application when you enable autostart, because it has to point
+at *your* config directory.
+
+Uninstalling while THUnet is running is safe: the MSI is elevated, so it stops
+the service (`ControlService`, then waits for it to be gone), terminates the tray
+(`taskkill /IM thunet.exe /F` before `InstallValidate`), removes the service on
+a real uninstall, and then removes the files, the shortcuts, the Start Menu
+folder and the install directory. A major upgrade stops the service the same way
+but keeps the registration.
 
 Because that `taskkill` also runs for upgrades and repairs, every interactive
-install (UILevel ≥ 4) starts the app again once the transaction is finished; a
+install (UILevel ≥ 4) starts the app again once the transaction is finished,
+through `explorer.exe` so the restarted tray keeps the user's own token rather
+than inheriting the installer's elevation; a
 silent install (`msiexec /qn`, winget) does not, so it never hijacks a desktop.
 Double-clicking the package while it is already installed therefore ends with
 the app running rather than with a killed copy.
@@ -375,15 +392,15 @@ There are two entries (tray and background service) and three modes:
 | Mode | Linux | Windows |
 | --- | --- | --- |
 | **Off** | nothing registered | nothing registered |
-| **Service** | systemd user unit `thunet.service` enabled; with `loginctl enable-linger` it also starts at boot, before anybody logs in | a `thunet` logon task: session kept alive, no tray icon |
-| **Service + tray** | unit + `~/.config/autostart/thunet.desktop` | two logon tasks, `thunet` (core) and `thunet-tray` |
+| **Service** | systemd user unit `thunet.service` enabled; with `loginctl enable-linger` it also starts at boot, before anybody logs in | a `thunet` **service** (LocalSystem, start type `auto`): up before the login screen, no tray icon |
+| **Service + tray** | unit + `~/.config/autostart/thunet.desktop` | that service + a `thunet-tray` logon task |
 
 There is deliberately no tray-only mode: the tray never starts a core by
 itself, so an icon without a service could only report "not running".
 
 | OS | Autostart entry |
 | --- | --- |
-| Windows | Per-user Task Scheduler logon tasks (`schtasks /Create /XML`, no delay, least privilege) which the Task Scheduler service fires before `explorer.exe` processes `Run` keys. Both run as `InteractiveToken` + `LeastPrivilege` — the user's own token, no elevation — which is what keeps the location permission working. Starting before login would need a Windows service, which costs admin rights (and that permission), so only Linux starts the core before a login today. |
+| Windows | The core is a **service** (`thunet`, LocalSystem, `SERVICE_WIN32_OWN_PROCESS`) that the Service Control Manager starts at boot — before anyone logs on, which a logon task cannot do. The tray stays a per-user Task Scheduler logon task (`schtasks /Create /XML`, no delay, `InteractiveToken` + `LeastPrivilege`), which is what keeps the location permission working. Registering or reconfiguring the service takes administrator rights (one UAC prompt); starting and stopping it does not. |
 | Linux | Tray: `~/.config/autostart/thunet.desktop`, started by the desktop session (XDG autostart), which every desktop honours, including the ones that never pull `graphical-session.target`. Core: a systemd user unit enabled per user — no root involved. |
 | macOS | A LaunchAgent managed by the `auto-launch` crate; the core itself is started on demand (`thunet core`, `thunet service start`, or the status page's *Start* button). |
 
@@ -393,21 +410,20 @@ settings page. `thunet service <action>` wraps both platforms in the same verbs:
 
 | Action | Linux | Windows |
 | --- | --- | --- |
-| `install` / `uninstall` | write / remove the unit | create / delete the core task (a task cannot exist without its trigger) |
-| `enable` / `disable` | put it in the login/boot path (and try `enable-linger`) | same as install / uninstall |
-| `start` / `stop` / `restart` | `systemctl --user …` | `schtasks /Run`, `/End` |
-| `status` | `systemctl --user status` | `schtasks /Query /V /FO LIST` |
+| `install` / `uninstall` | write / remove the unit | create / delete the service, administrator only |
+| `enable` / `disable` | put it in the login/boot path (and try `enable-linger`) | set the service start type to `auto` / `demand`, administrator only |
+| `start` / `stop` / `restart` | `systemctl --user …` | `StartServiceW`, `ControlService` — allowed for the signed-in user |
+| `status` | `systemctl --user status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
 
-Once the core is registered it belongs to systemd / Task Scheduler: the window
-only reconnects to it and never spawns one behind the manager's back.
+Once the core is registered it belongs to systemd / the Service Control Manager:
+the window only reconnects to it and never spawns one behind the manager's back.
+`enable` and `disable` only decide what happens at the **next** boot; they never
+start or stop the running core — that is what `start` and `stop` are for.
 
-Releases before this one wrote `HKCU\...\CurrentVersion\Run\thunet` on Windows;
-the first start of a newer build moves that value into the logon task (keeping
-the executable it recorded) and deletes it, so the app never starts twice. A
-0.1.x install also used the task name `thunet` for its *tray*; that name is the
-core's now, and the two cannot be told apart afterwards, so the first start
-rewrites the task to run the core and starts in *Service* mode —
-pick *Service + tray* once in the settings to get the icon back.
+On Linux the unit is written on first start even with autostart off, so
+`thunet service start|stop|status` works right away. On Windows the service is
+created by `thunet service install` (or by picking a service mode), and
+`start|stop|status` then work without any further prompt.
 
 The only self-service action left is the desktop shortcut: **Create desktop
 shortcut** on the Settings page, or `thunet shortcut`, which puts a launcher for
@@ -417,9 +433,11 @@ file as trusted so GNOME will launch it).
 To remove THUnet: *Settings → Apps → THUnet → Uninstall* on Windows, or
 `sudo apt remove thunet` on Debian/Ubuntu. Your settings in `%APPDATA%\thunet`
 are left alone; delete that directory if you
-want a clean slate. Turn *Start with the system* off before uninstalling if you
-do not want the leftover autostart entry (on Windows that is the `thunet` and
-`thunet-tray` tasks in Task Scheduler) to point at a missing executable.
+want a clean slate. Before uninstalling, turn *Start with the system* off (that
+removes the `thunet-tray` logon task) **and** run `thunet service uninstall`
+(one elevation: it stops and deletes the service). Turning autostart off alone
+leaves the service registered; deleting the service alone leaves the logon
+task — either way something would point at a deleted executable.
 
 ## 8. Installing with winget
 
@@ -544,13 +562,14 @@ Sources:
 
 | Path | Purpose |
 | --- | --- |
-| `packaging/thunet.wxs` | WiX v5 source for the per-user MSI |
+| `packaging/thunet.wxs` | WiX v5 source of the per-machine MSI |
 | `scripts/build_msi.ps1` | Reads the version and drives `wix build` |
 | `scripts/build_tarball.sh` | Reads the version and packs the tarball |
 | `Cargo.toml` → `[package.metadata.deb]` | Debian control fields and file list |
 | `build.rs` | Embeds `assets/thunet.ico` (and the version block) into the exe |
 | `assets/thunet.ico`, `assets/thunet.svg` | Icons used by the packages and shortcuts |
 | `assets/thunet.desktop` | Launcher entry installed by the `.deb` |
+| `assets/completions/` | bash/zsh/fish completion scripts installed by the `.deb`; a unit test keeps them in sync with the CLI |
 | `scripts/make_icon.py` | Regenerates the icon assets (`pixi run -e tools python scripts/make_icon.py`) |
 
 Notes:
@@ -603,9 +622,20 @@ Notes:
 - `netsh`-based SSID detection needs Windows Location permission. Without it the
   client still works, but it cannot tell `Tsinghua-Secure` from a captive Wi-Fi —
   the internet probe then decides.
-- The single-instance guard activates the existing window on Windows. On Linux
-  and macOS a second launch simply exits: raising another process's window is not
-  portable, so use the tray icon instead.
+- On Windows the core runs as a **service** under LocalSystem, because only a
+  service can start before a login. It reads the same `%APPDATA%\thunet` you do
+  (the path travels as `--state-dir`), and its control pipe is machine-wide with
+  a DACL that lets the signed-in user drive it: anyone who can log on locally
+  can start or stop the session. Registering the service itself stays
+  administrator-only.
+- The single-instance guard brings the existing window back on every platform:
+  Windows rings a session-local event, and on Linux/macOS the second launch
+  leaves a marker file that the running instance polls, so the window is raised
+  from inside the process that owns it.
+- After an upgrade plus a service restart (`systemctl --user restart thunet`),
+  a window still running the old build compares the two build stamps and
+  relaunches itself on the new binary. A restart with the same build, or a copy
+  whose own file was not replaced, leaves the window untouched.
 - Right-click in the log strip copies whole lines; free-form selection copy uses
   the usual `Ctrl+C`.
 

@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Per-user MSI for THUnet (see README §7): no elevation, installed to
-  %LOCALAPPDATA%\Programs\thunet\thunet.exe. The application never installs
-  itself, so this package is the only owner of files and shortcuts.
+  Per-machine MSI for THUnet (see README §7): installs to
+  %ProgramFiles%\THUnet and asks for administrator rights once.
+
+  The background core is a Windows service, i.e. a machine-wide resource, so
+  the package has to be able to stop and delete it; a per-user package runs
+  unelevated and could do neither. Settings stay per user (`%APPDATA%`), and
+  the service itself is still registered by the application, because its state
+  directory argument points at the configuration of the user who enabled it.
 
   Build with:  pixi run -e package msi
   Version is required and comes from Cargo.toml: -d Version=<x.y.z>
@@ -14,7 +19,7 @@
       Manufacturer="THUnet contributors"
       Version="$(var.Version)"
       UpgradeCode="8F0A6F2E-1F1B-4A0F-9C63-2E7A6F0C91D2"
-      Scope="perUser"
+      Scope="perMachine"
       Compressed="yes">
 
     <!-- Uninstalling the old product before installing the new one keeps a
@@ -35,9 +40,18 @@
     <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]"
                  After="CostFinalize" Sequence="both" />
 
+    <!-- Stop the core service the polite way (`ControlService(STOP)`, which is
+         not a failure and therefore does not trigger the restart-on-failure
+         policy) and wait for it, so the binary can be replaced right after.
+         ServiceControl is not used on purpose: the service is registered by the
+         application, not by this package, and may not exist at all. -->
+    <CustomAction Id="StopCoreService" FileRef="THUnetExe"
+                  ExeCommand="service-admin stop"
+                  Execute="immediate" Return="ignore" />
+
     <!-- The app hides itself on WM_CLOSE (tray behaviour), so util:CloseApplication
-         is not enough: terminate any running copy before files are replaced or
-         removed, otherwise a running exe blocks the operation. -->
+         is not enough: terminate the tray before files are replaced or removed.
+         The service is already gone by then (StopCoreService runs first). -->
     <CustomAction Id="StopRunningApp" Directory="TARGETDIR"
                   ExeCommand="taskkill /IM thunet.exe /F"
                   Execute="immediate" Return="ignore" />
@@ -47,23 +61,51 @@
          `StopRunningApp`, so the condition must not be limited to
          `NOT Installed` - otherwise double-clicking the package again silently
          leaves no app running. Silent installs such as `msiexec /qn` or winget
-         keep UILevel = 2 and stay quiet. -->
-    <CustomAction Id="LaunchApp" FileRef="THUnetExe" ExeCommand=""
+         keep UILevel = 2 and stay quiet.
+
+         The launch goes through explorer.exe on purpose: this custom action
+         runs elevated, and starting the tray directly would give it an
+         administrator token. Explorer already runs as the interactive user, so
+         the app it starts belongs to that user. -->
+    <CustomAction Id="LaunchApp" Directory="TARGETDIR"
+                  ExeCommand="[WindowsFolder]explorer.exe &quot;[INSTALLFOLDER]thunet.exe&quot;"
                   Execute="immediate" Return="asyncNoWait" />
+
+    <!-- Remove the service on a real uninstall only. A major upgrade also runs
+         this product's uninstall, and `UPGRADINGPRODUCTCODE` is what tells the
+         two apart; without the condition every upgrade would silently drop the
+         autostart registration. Deferred + Impersonate="no" because deleting a
+         service needs the SYSTEM token, not the user's. -->
+    <CustomAction Id="RemoveCoreService" FileRef="THUnetExe"
+                  ExeCommand="service-admin uninstall"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- The install stopped the service above; bring the new build back — but
+         only when it is set to start at boot. `demand` means the user turned
+         autostart off, and an upgrade must not resurrect that session. -->
+    <CustomAction Id="ResumeCoreService" FileRef="THUnetExe"
+                  ExeCommand="service-resume"
+                  Execute="immediate" Return="ignore" />
 
     <InstallExecuteSequence>
       <!-- Only a previous installation can still be running: on a clean install
            there is nothing to stop, and an unconditional `taskkill` would just
            spawn a process that fails in every validation sandbox. -->
+      <Custom Action="StopCoreService" Before="StopRunningApp"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <Custom Action="StopRunningApp" Before="InstallValidate"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <!-- Before RemoveFiles: the helper still has to exist. -->
+      <Custom Action="RemoveCoreService" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <!-- After the files are in place, not during an uninstall. -->
+      <Custom Action="ResumeCoreService" After="InstallFinalize"
+              Condition="NOT REMOVE=&quot;ALL&quot; AND (Installed OR WIX_UPGRADE_DETECTED)" />
       <Custom Action="LaunchApp" After="InstallFinalize" Condition="UILevel &gt;= 4" />
     </InstallExecuteSequence>
 
-    <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="ProgramsDir" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="thunet" />
-      </Directory>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="THUnet" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="AppMenuFolder" Name="THUnet" />

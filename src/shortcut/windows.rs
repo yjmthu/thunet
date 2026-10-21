@@ -8,7 +8,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Create (or refresh) the desktop shortcut for this executable.
 pub fn create_desktop_shortcut() -> Result<(), String> {
-  let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
   shortcut("Desktop", "THUnet.lnk", &exe)
 }
 

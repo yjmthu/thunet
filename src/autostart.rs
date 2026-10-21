@@ -16,14 +16,9 @@
 //! walks `Run`, so the app is up noticeably earlier. Both tasks run as
 //! `InteractiveToken` + `LeastPrivilege`, i.e. with the user's own token and no
 //! elevation, which is what keeps the credential store and location permission
-//! working. A `Run` value written by an older release is migrated on the next
-//! start, and so is a pre-split install that only had the tray task.
+//! working.
 
 use std::path::PathBuf;
-
-/// Task name on Windows; also the value name a previous release wrote to
-/// `Run`, and the name `auto-launch` uses for the desktop entry.
-pub const APP_NAME: &str = "thunet";
 
 /// How much of the app starts with the system.
 ///
@@ -59,6 +54,7 @@ pub enum ServiceAction {
   Status,
 }
 
+#[derive(Clone)]
 pub struct Autostart {
   exe: PathBuf,
   minimized: bool,
@@ -68,7 +64,7 @@ impl Autostart {
   /// `None` when the running executable path cannot be determined.
   pub fn new(minimized: bool) -> Option<Self> {
     Some(Self {
-      exe: std::env::current_exe().ok()?,
+      exe: crate::exe_path()?,
       minimized,
     })
   }
@@ -89,9 +85,9 @@ impl Autostart {
   pub fn mode(&self) -> Mode {
     if imp::tray_registered(self) {
       // A tray entry on its own cannot happen through this API; treat a
-      // half-installed state as "all" and let `migrate` repair it.
+      // half-installed state as "all".
       Mode::All
-    } else if imp::core_registered() {
+    } else if imp::core_starts_at_boot() {
       Mode::Core
     } else {
       Mode::Off
@@ -99,32 +95,74 @@ impl Autostart {
   }
 
   pub fn set_mode(&self, mode: Mode) -> Result<(), String> {
+    // The core half goes first: on Windows it may raise a UAC prompt, and
+    // cancelling that must leave the settings exactly as they were.
     match mode {
       Mode::Off => {
-        imp::disable_tray(self)?;
-        imp::disable_core()
+        imp::disable_core()?;
+        imp::disable_tray(self)
       }
       Mode::Core => {
-        imp::disable_tray(self)?;
-        imp::enable_core(self)
+        imp::enable_core(self)?;
+        imp::disable_tray(self)
       }
       Mode::All => {
-        imp::enable_tray(self)?;
-        imp::enable_core(self)
+        imp::enable_core(self)?;
+        imp::enable_tray(self)
       }
     }
   }
 
-  /// Replace an entry left behind by an older release. `Ok(true)` means one
-  /// was found and rewritten; other platforms have nothing to migrate.
-  pub fn migrate(&self) -> Result<bool, String> {
-    imp::migrate(self)
+  /// Rewrite the tray entry after its command line changed (`--minimized`).
+  ///
+  /// The core entry never carries that flag, so this deliberately leaves it
+  /// alone — on Windows touching it would mean a UAC prompt for a checkbox.
+  pub fn refresh_tray(&self) -> Result<(), String> {
+    imp::refresh_tray(self)
+  }
+
+  /// Install the service entry the CLI drives, if it is missing, so
+  /// `thunet service start|stop|status` also works on a portable install.
+  ///
+  /// `Ok(true)` means an entry was written. Windows has nothing to prepare —
+  /// registering the service *is* the install — and reports `false`.
+  pub fn prepare_service(&self) -> Result<bool, String> {
+    imp::prepare_service(self)
+  }
+
+  /// Bring the core back after an upgrade, but only when it is configured to
+  /// start at boot.
+  ///
+  /// The installer stops the service before replacing the binary; this is what
+  /// starts the new build again. A service whose autostart is off (start type
+  /// `demand`) is left alone, so upgrading cannot resurrect a session the user
+  /// turned off.
+  pub fn resume_after_update() -> Result<(), String> {
+    imp::resume_after_update()
   }
 
   /// `thunet service <action>`: run it and return the line to print.
   pub fn service(action: ServiceAction, minimized: bool) -> Result<String, String> {
     let me = Autostart::new(minimized).ok_or("cannot determine the executable path")?;
     imp::service(action, &me)
+  }
+}
+
+/// Perform one service operation that needs administrator rights.
+///
+/// This is what the elevated copy of the executable runs
+/// (`thunet service-admin <action>`); it must not ask for elevation again, or
+/// the prompt would never end.
+pub fn service_admin(action: ServiceAction) -> Result<(), String> {
+  #[cfg(not(windows))]
+  {
+    let _ = action;
+    Err("this platform has no elevation step".into())
+  }
+  #[cfg(windows)]
+  {
+    let me = Autostart::new(false).ok_or("cannot determine the executable path")?;
+    imp::service_direct(action, &me).map(|_| ())
   }
 }
 
@@ -139,93 +177,490 @@ pub fn core_managed() -> bool {
 #[cfg(windows)]
 mod imp {
   use std::os::windows::process::CommandExt as _;
-  use std::path::{Path, PathBuf};
+  use std::path::Path;
 
-  use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+  use windows_sys::Win32::Foundation::GetLastError;
+  use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
+    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatusEx, SC_HANDLE,
+    SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS,
+    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
+    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_WIN32_OWN_PROCESS, StartServiceW,
   };
 
-  use super::{APP_NAME, Autostart, ServiceAction};
+  use super::{Autostart, ServiceAction};
 
-  /// Task Scheduler location of the background core. Same name as the Linux
-  /// unit (`thunet.service`), so the mental model is identical on both
+  /// Service Control Manager key of the background core. The same name as the
+  /// Linux unit (`thunet.service`), so the mental model is identical on both
   /// platforms: `thunet` *is* the service, `thunet-tray` is the frontend.
-  const CORE_TASK: &str = "thunet";
+  const CORE_SERVICE: &str = "thunet";
   /// Task Scheduler location of the window/tray process.
   const TRAY_TASK: &str = "thunet-tray";
-  /// `Run` value a previous release used instead of the logon task.
-  const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-  /// Task Manager's "startup apps" enable flag for that value.
-  const APPROVED_KEY: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-  const ERROR_MORE_DATA: u32 = 234;
+
+  /// Service DACL. Interactive users may query, start and stop the core, so
+  /// the status page's buttons never raise a UAC prompt; creating, deleting and
+  /// reconfiguring the service stays administrator-only.
+  const SERVICE_SDDL: &str = concat!(
+    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)",
+    "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)",
+    "(A;;CCLCSWRPWPLOCRRC;;;IU)"
+  );
 
   /// Never flash a console window: this binary uses the GUI subsystem.
   const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+  const SERVICE_ERROR_NORMAL: u32 = 0x0000_0001;
+  /// Standard access right `DELETE`, needed by `DeleteService`.
+  const DELETE: u32 = 0x0001_0000;
+  /// `ERROR_SERVICE_ALREADY_RUNNING` / `ERROR_SERVICE_NOT_ACTIVE`.
+  const ALREADY_RUNNING: u32 = 1056;
+  const NOT_ACTIVE: u32 = 1062;
+
   pub fn tray_registered(_a: &Autostart) -> bool {
-    task_exists(TRAY_TASK) || legacy_run_present()
+    task_exists(TRAY_TASK)
   }
 
+  /// The core is a service: the window asks the SCM to start it instead of
+  /// spawning a second, unmanaged copy. This stays true when autostart is off
+  /// but the service is still registered (start type `demand`) — the tray must
+  /// not fight the SCM over who owns the process.
   pub fn core_registered() -> bool {
-    task_exists(CORE_TASK)
+    service_open(SERVICE_QUERY_STATUS).is_some()
+  }
+
+  /// Whether the SCM starts it at boot. This, not registration, is what the
+  /// settings page shows.
+  pub fn core_starts_at_boot() -> bool {
+    let Some(service) = service_open(SERVICE_QUERY_CONFIG) else {
+      return false;
+    };
+    let start = query_start_type(service);
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    start == Some(SERVICE_AUTO_START)
   }
 
   pub fn enable_tray(a: &Autostart) -> Result<(), String> {
-    register(&a.exe, a.args(), TRAY_TASK, false)
+    register(&a.exe, a.args(), TRAY_TASK)
   }
 
   pub fn disable_tray(_a: &Autostart) -> Result<(), String> {
-    remove_legacy_run();
     delete_task(TRAY_TASK)
   }
 
-  /// A task always carries the trigger that starts it, so Windows cannot tell
-  /// "installed" from "enabled": registering *is* enabling.
+  /// Rewrite the tray task after its command line changed (`--minimized`).
+  /// The core entry has no such argument, so it is deliberately left alone.
+  pub fn refresh_tray(a: &Autostart) -> Result<(), String> {
+    if !task_exists(TRAY_TASK) {
+      return Ok(());
+    }
+    register(&a.exe, a.args(), TRAY_TASK)
+  }
+
+  /// Register the core as a boot-time service and keep it running.
+  ///
+  /// Creating or reconfiguring a service needs administrator rights, so an
+  /// ordinary caller is replaced by an elevated copy of this executable.
   pub fn enable_core(a: &Autostart) -> Result<(), String> {
-    register(&a.exe, &["core"], CORE_TASK, true)
+    if crate::elevate::is_elevated() {
+      enable_direct(a)
+    } else {
+      elevate("enable")
+    }
   }
 
   pub fn disable_core() -> Result<(), String> {
-    delete_task(CORE_TASK)
+    if crate::elevate::is_elevated() {
+      stop_starting_at_boot()
+    } else {
+      elevate("disable")
+    }
   }
 
-  /// `thunet service <action>`: the Task Scheduler equivalents of
-  /// `systemctl --user …`.
-  pub fn service(action: ServiceAction, a: &Autostart) -> Result<String, String> {
-    match action {
-      ServiceAction::Install | ServiceAction::Enable => {
-        enable_core(a)?;
-        Ok(
-          "core logon task registered (a Windows task cannot be installed without its trigger)"
-            .into(),
-        )
+  pub fn prepare_service(_a: &Autostart) -> Result<bool, String> {
+    // Nothing to prepare: `service install` (or switching autostart to a
+    // service mode) is what registers it.
+    Ok(false)
+  }
+
+  /// Start the core again after the installer replaced the binary.
+  pub fn resume_after_update() -> Result<(), String> {
+    if !core_starts_at_boot() {
+      return Ok(());
+    }
+    if let Some(service) = service_open(SERVICE_QUERY_STATUS) {
+      let state = query_state(service);
+      unsafe {
+        CloseServiceHandle(service);
       }
-      ServiceAction::Uninstall | ServiceAction::Disable => {
-        disable_core()?;
-        Ok("core logon task removed".into())
+      if state == Some(SERVICE_RUNNING) {
+        return Ok(());
+      }
+    }
+    start()
+  }
+
+  /// `thunet service <action>`. The actions that change the registration ask
+  /// for administrator rights once; start/stop/status do not need them.
+  pub fn service(action: ServiceAction, a: &Autostart) -> Result<String, String> {
+    if needs_admin(action) && !crate::elevate::is_elevated() {
+      elevate(action_name(action))?;
+      return Ok(already_done(action));
+    }
+    service_direct(action, a)
+  }
+
+  /// Start an elevated copy of this executable for one operation.
+  ///
+  /// The state directory is spelled out rather than recomputed: the elevated
+  /// process may run as a different administrator, whose `%APPDATA%` is not
+  /// the one the window writes to.
+  fn elevate(action: &str) -> Result<(), String> {
+    let dir = crate::config::dir();
+    crate::elevate::run_as_admin(&[
+      "service-admin",
+      action,
+      "--state-dir",
+      &dir.to_string_lossy(),
+    ])
+  }
+
+  /// The action performed by the elevated copy (`thunet service-admin …`).
+  pub fn service_direct(action: ServiceAction, a: &Autostart) -> Result<String, String> {
+    match action {
+      ServiceAction::Install => {
+        install(a)?;
+        Ok("core registered as a service (start type demand)".into())
+      }
+      ServiceAction::Uninstall => {
+        delete()?;
+        Ok("core service removed".into())
+      }
+      ServiceAction::Enable => {
+        enable_direct(a)?;
+        Ok("core starts with the machine".into())
+      }
+      ServiceAction::Disable => {
+        stop_starting_at_boot()?;
+        Ok("core no longer starts with the machine".into())
       }
       ServiceAction::Start => {
-        expect_success(&["/Run", "/TN", CORE_TASK])?;
+        start()?;
         Ok("core started".into())
       }
       ServiceAction::Stop => {
-        expect_success(&["/End", "/TN", CORE_TASK])?;
+        stop()?;
         Ok("core stopped".into())
       }
       ServiceAction::Restart => {
-        let _ = expect_success(&["/End", "/TN", CORE_TASK]);
-        expect_success(&["/Run", "/TN", CORE_TASK])?;
+        let _ = stop();
+        start()?;
         Ok("core restarted".into())
       }
-      ServiceAction::Status => {
-        let out = run(&["/Query", "/TN", CORE_TASK, "/V", "/FO", "LIST"])
-          .map_err(|e| format!("schtasks: {e}"))?;
-        let mut text = decode(&out.stdout);
-        text.push_str(&decode(&out.stderr));
-        Ok(text.trim_end().to_string())
-      }
+      ServiceAction::Status => status_text(),
     }
+  }
+
+  fn needs_admin(action: ServiceAction) -> bool {
+    matches!(
+      action,
+      ServiceAction::Install
+        | ServiceAction::Uninstall
+        | ServiceAction::Enable
+        | ServiceAction::Disable
+    )
+  }
+
+  /// Must match the clap value names, because the elevated copy is started
+  /// with them.
+  fn action_name(action: ServiceAction) -> &'static str {
+    match action {
+      ServiceAction::Install => "install",
+      ServiceAction::Uninstall => "uninstall",
+      ServiceAction::Enable => "enable",
+      ServiceAction::Disable => "disable",
+      ServiceAction::Start => "start",
+      ServiceAction::Stop => "stop",
+      ServiceAction::Restart => "restart",
+      ServiceAction::Status => "status",
+    }
+  }
+
+  /// What to report when the work happened in the elevated copy.
+  fn already_done(action: ServiceAction) -> String {
+    match action {
+      ServiceAction::Install => "core registered as a service (start type demand)",
+      ServiceAction::Uninstall => "core service removed",
+      ServiceAction::Enable => "core starts with the machine",
+      _ => "core no longer starts with the machine",
+    }
+    .into()
+  }
+
+  fn enable_direct(a: &Autostart) -> Result<(), String> {
+    install(a)?;
+    sc(&["config", CORE_SERVICE, "start=", "auto"])?;
+    Ok(())
+  }
+
+  fn stop_starting_at_boot() -> Result<(), String> {
+    if service_open(SERVICE_QUERY_STATUS).is_none() {
+      return Ok(());
+    }
+    sc(&["config", CORE_SERVICE, "start=", "demand"])
+  }
+
+  /// Create the service (start type `demand`, i.e. installed but not enabled).
+  ///
+  /// The binary line carries the state directory: the token the SCM uses has no
+  /// profile of its own, so `%APPDATA%` there is the system profile. The
+  /// settings and the sealed credential stay where the user's window writes
+  /// them.
+  fn install(a: &Autostart) -> Result<(), String> {
+    if service_open(SERVICE_QUERY_STATUS).is_some() {
+      return Ok(());
+    }
+    let manager =
+      open_manager(SC_MANAGER_CREATE_SERVICE).ok_or("cannot open the service manager")?;
+    let name = wide(CORE_SERVICE);
+    let display = wide("THUnet background service");
+    let binary = wide(&format!(
+      "\"{}\" core --service --state-dir \"{}\"",
+      a.exe.display(),
+      crate::config::dir().display()
+    ));
+    // SAFETY: every string outlives the call; the returned handle is closed
+    // below. A null account name means LocalSystem, which is what can start
+    // before anyone logs on.
+    let service = unsafe {
+      CreateServiceW(
+        manager,
+        name.as_ptr(),
+        display.as_ptr(),
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_DEMAND_START,
+        SERVICE_ERROR_NORMAL,
+        binary.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+      )
+    };
+    let err = unsafe { GetLastError() };
+    unsafe {
+      CloseServiceHandle(manager);
+    }
+    if service.is_null() {
+      return Err(format!(
+        "cannot create the {CORE_SERVICE} service (error {err})"
+      ));
+    }
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    // Both are best effort: the service works without them, it is just less
+    // convenient (a UAC prompt per button, no restart after a crash).
+    let _ = sc(&["sdset", CORE_SERVICE, SERVICE_SDDL]);
+    let _ = sc(&[
+      "failure",
+      CORE_SERVICE,
+      "reset=",
+      "86400",
+      "actions=",
+      "restart/5000/restart/5000/restart/5000",
+    ]);
+    let _ = sc(&[
+      "description",
+      CORE_SERVICE,
+      "Keeps the THUNet portal session online, starting with the machine.",
+    ]);
+    Ok(())
+  }
+
+  fn delete() -> Result<(), String> {
+    if service_open(SERVICE_QUERY_STATUS).is_none() {
+      return Ok(());
+    }
+    let _ = stop();
+    let service = service_open(DELETE).ok_or("cannot open the service for deletion")?;
+    // SAFETY: the handle comes from OpenServiceW and is closed below.
+    let ok = unsafe { DeleteService(service) };
+    let err = unsafe { GetLastError() };
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    if ok != 0 {
+      Ok(())
+    } else {
+      Err(format!("cannot delete the service (error {err})"))
+    }
+  }
+
+  fn start() -> Result<(), String> {
+    let service = service_open(SERVICE_START).ok_or("the core service is not installed")?;
+    // SAFETY: the handle is valid and closed below.
+    let ok = unsafe { StartServiceW(service, 0, std::ptr::null()) };
+    let err = unsafe { GetLastError() };
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    if ok != 0 || err == ALREADY_RUNNING {
+      return Ok(());
+    }
+    Err(format!("cannot start the core service (error {err})"))
+  }
+
+  fn stop() -> Result<(), String> {
+    let service = service_open(SERVICE_STOP | SERVICE_QUERY_STATUS)
+      .ok_or("the core service is not installed")?;
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is valid, and the status outlives the call.
+    let ok = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) };
+    let err = unsafe { GetLastError() };
+    if ok == 0 && err != NOT_ACTIVE {
+      unsafe {
+        CloseServiceHandle(service);
+      }
+      return Err(format!("cannot stop the core service (error {err})"));
+    }
+    // Wait for the process to be gone: an installer calls this right before it
+    // replaces the binary, and a stop that is only *requested* would leave the
+    // exe in use. Five seconds is generous for a process that just exits.
+    let mut state = None;
+    for _ in 0..50 {
+      state = query_state(service);
+      if state == Some(SERVICE_STOPPED) {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    if state == Some(SERVICE_STOPPED) {
+      Ok(())
+    } else {
+      Err("the core service did not stop within five seconds".into())
+    }
+  }
+
+  fn status_text() -> Result<String, String> {
+    let Some(service) = service_open(SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG) else {
+      return Ok(format!("{CORE_SERVICE}: not installed"));
+    };
+    let state = query_state(service).unwrap_or(0);
+    let start = query_start_type(service).unwrap_or(0);
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    let state = match state {
+      SERVICE_RUNNING => "running",
+      SERVICE_STOPPED => "stopped",
+      SERVICE_START_PENDING => "starting",
+      SERVICE_STOP_PENDING => "stopping",
+      _ => "unknown",
+    };
+    let start = match start {
+      SERVICE_AUTO_START => "auto",
+      SERVICE_DEMAND_START => "demand",
+      _ => "disabled",
+    };
+    Ok(format!(
+      "name               : {CORE_SERVICE}\
+       \nstate              : {state}\
+       \nstart_type         : {start}"
+    ))
+  }
+
+  fn query_state(service: SC_HANDLE) -> Option<u32> {
+    let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+    let mut needed = 0u32;
+    // SAFETY: the buffer is exactly as large as the size passed, and lives
+    // until the call returns.
+    let ok = unsafe {
+      QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        &mut status as *mut _ as *mut u8,
+        std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+        &mut needed,
+      )
+    };
+    (ok != 0).then_some(status.dwCurrentState)
+  }
+
+  fn query_start_type(service: SC_HANDLE) -> Option<u32> {
+    let mut needed = 0u32;
+    // The first call only reports how much room the answer needs.
+    // SAFETY: a null buffer with size 0 is the documented size query.
+    unsafe {
+      QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+      return None;
+    }
+    let mut buffer = vec![0u32; (needed as usize).div_ceil(4)];
+    // SAFETY: the buffer is aligned and at least `needed` bytes long.
+    let ok = unsafe {
+      QueryServiceConfigW(
+        service,
+        buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+        needed,
+        &mut needed,
+      )
+    };
+    if ok == 0 {
+      return None;
+    }
+    // SAFETY: a successful call filled the buffer with a QUERY_SERVICE_CONFIGW.
+    let config = unsafe { &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW) };
+    Some(config.dwStartType)
+  }
+
+  fn open_manager(access: u32) -> Option<SC_HANDLE> {
+    // SAFETY: plain Win32 call; the handle is closed by the caller.
+    let handle = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), access) };
+    (!handle.is_null()).then_some(handle)
+  }
+
+  fn service_open(access: u32) -> Option<SC_HANDLE> {
+    let manager = open_manager(SC_MANAGER_CONNECT)?;
+    let name = wide(CORE_SERVICE);
+    // SAFETY: the manager handle is valid and the name outlives the call.
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), access) };
+    unsafe {
+      CloseServiceHandle(manager);
+    }
+    (!service.is_null()).then_some(service)
+  }
+
+  fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+  }
+
+  /// `sc.exe`, used for the operations whose Win32 form takes a dozen
+  /// arguments (DACL, failure actions, description, start type).
+  fn sc(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new(system32("sc.exe"))
+      .args(args)
+      .creation_flags(CREATE_NO_WINDOW)
+      .output()
+      .map_err(|e| format!("sc: {e}"))?;
+    if out.status.success() {
+      return Ok(());
+    }
+    let err = decode(&out.stderr).trim().to_string();
+    Err(if err.is_empty() {
+      format!("sc exited with {:?}", out.status.code())
+    } else {
+      err
+    })
   }
 
   fn delete_task(name: &str) -> Result<(), String> {
@@ -235,13 +670,15 @@ mod imp {
     expect_success(&["/Delete", "/TN", name, "/F"])
   }
 
-  /// `schtasks /XML` and `/FO LIST` print UTF-16 with a BOM on some consoles
-  /// and plain (OEM/UTF-8) on others; accept either.
+  /// `schtasks /XML` and `sc` print UTF-16 with a BOM on some consoles and
+  /// plain (OEM/UTF-8) on others; accept either.
   fn decode(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) {
       let units: Vec<u16> = bytes[2..]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
       String::from_utf16_lossy(&units)
     } else {
@@ -249,43 +686,9 @@ mod imp {
     }
   }
 
-  /// Bring an installation from an older layout onto the current task names.
-  ///
-  /// Two things exist in the wild: the `Run` value used by 0.1.1 and earlier,
-  /// and the single tray task named `thunet` used by 0.1.2/0.1.3. The split
-  /// build never shipped for Windows, so there is no third layout to handle.
-  pub fn migrate(a: &Autostart) -> Result<bool, String> {
-    let mut changed = false;
-    // 0.1.x kept the tray task at `thunet`, which is now the core's name. The
-    // two cannot be told apart afterwards, so rewrite the core task with the
-    // arguments it must have: an old tray task then becomes a real core task
-    // (the tray can be re-enabled in the settings), and a current Core-only
-    // install is merely rewritten identically. Not reported as a change, so a
-    // Core-only install does not log an upgrade it did not have.
-    if task_exists(CORE_TASK) && !task_exists(TRAY_TASK) {
-      register(&a.exe, &["core"], CORE_TASK, true)?;
-    }
-    // Move an entry written by an even older release to the logon task, keeping
-    // the executable it recorded: `current_exe()` would repoint it at a build
-    // that was merely launched once from another directory.
-    if legacy_run_present() {
-      let exe = legacy_exe().unwrap_or_else(|| a.exe.clone());
-      register(&exe, a.args(), TRAY_TASK, false)?;
-      changed = true;
-    }
-    // The tray no longer starts a core by itself, so an installation that
-    // autostarts the tray also gets the core entry: an icon with no session
-    // behind it would look broken.
-    if task_exists(TRAY_TASK) && !task_exists(CORE_TASK) {
-      register(&a.exe, &["core"], CORE_TASK, true)?;
-      changed = true;
-    }
-    Ok(changed)
-  }
-
-  fn register(exe: &Path, args: &[&str], name: &str, restart: bool) -> Result<(), String> {
+  fn register(exe: &Path, args: &[&str], name: &str) -> Result<(), String> {
     let user = current_user()?;
-    let xml = task_xml(exe, args, &user, restart);
+    let xml = task_xml(exe, args, &user);
     let path = std::env::temp_dir().join(format!("thunet-autostart-{}.xml", std::process::id()));
     write_utf16(&path, &xml)?;
     let result = expect_success(&[
@@ -297,11 +700,7 @@ mod imp {
       "/F",
     ]);
     let _ = std::fs::remove_file(&path);
-    result?;
-    // The task supersedes the `Run` value older releases wrote; leaving it in
-    // place would start a second copy at logon.
-    remove_legacy_run();
-    Ok(())
+    result
   }
 
   fn task_exists(name: &str) -> bool {
@@ -313,7 +712,7 @@ mod imp {
   /// `Err` only when `schtasks.exe` cannot be started at all; a non-zero exit
   /// status is returned as `Ok` so callers can interpret it.
   fn run(args: &[&str]) -> Result<std::process::Output, String> {
-    std::process::Command::new(schtasks())
+    std::process::Command::new(system32("schtasks.exe"))
       .args(args)
       .creation_flags(CREATE_NO_WINDOW)
       .output()
@@ -334,15 +733,10 @@ mod imp {
   }
 
   /// Full path so a hijacked `PATH` cannot redirect the call.
-  fn schtasks() -> std::ffi::OsString {
+  fn system32(exe: &str) -> std::ffi::OsString {
     std::env::var_os("SystemRoot")
-      .map(|root| {
-        Path::new(&root)
-          .join("System32")
-          .join("schtasks.exe")
-          .into_os_string()
-      })
-      .unwrap_or_else(|| "schtasks.exe".into())
+      .map(|root| Path::new(&root).join("System32").join(exe).into_os_string())
+      .unwrap_or_else(|| exe.into())
   }
 
   /// The task runs as its owner, so the account must be spelled out; the
@@ -353,83 +747,6 @@ mod imp {
       Ok(domain) if !domain.is_empty() => format!("{domain}\\{name}"),
       _ => name,
     })
-  }
-
-  fn legacy_run_present() -> bool {
-    read_legacy_run().is_some()
-  }
-
-  /// The command line a previous release stored under `Run`, if any.
-  fn read_legacy_run() -> Option<String> {
-    let key = wide(RUN_KEY);
-    let name = wide(APP_NAME);
-    let mut size = 0u32;
-    // SAFETY: a null buffer and zero length only report the required size.
-    let code = unsafe {
-      RegGetValueW(
-        HKEY_CURRENT_USER,
-        key.as_ptr(),
-        name.as_ptr(),
-        RRF_RT_REG_SZ,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut size,
-      )
-    };
-    if !(code == 0 || code == ERROR_MORE_DATA) || size < 2 {
-      return None;
-    }
-    let mut buf = vec![0u16; (size as usize).div_ceil(2)];
-    // SAFETY: `size` is the byte count the first call asked for.
-    let code = unsafe {
-      RegGetValueW(
-        HKEY_CURRENT_USER,
-        key.as_ptr(),
-        name.as_ptr(),
-        RRF_RT_REG_SZ,
-        std::ptr::null_mut(),
-        buf.as_mut_ptr().cast(),
-        &mut size,
-      )
-    };
-    if code != 0 {
-      return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(String::from_utf16_lossy(&buf[..len]))
-  }
-
-  /// Executable recorded by the old `Run` value, when it still exists.
-  fn legacy_exe() -> Option<PathBuf> {
-    let path = parse_command(&read_legacy_run()?)?;
-    path.is_file().then_some(path)
-  }
-
-  /// `auto-launch` stored `<path> <args>` without quoting the path, so an
-  /// argument separator ends it; quoted command lines end at the quote.
-  fn parse_command(raw: &str) -> Option<PathBuf> {
-    let raw = raw.trim();
-    if let Some(rest) = raw.strip_prefix('"') {
-      return Some(PathBuf::from(&rest[..rest.find('"')?]));
-    }
-    let end = raw.find(" --").unwrap_or(raw.len());
-    Some(PathBuf::from(raw[..end].trim_end()))
-  }
-
-  /// Deleting a missing value or key just fails; nothing to clean up then.
-  fn remove_legacy_run() {
-    for key in [RUN_KEY, APPROVED_KEY] {
-      let key = wide(key);
-      let name = wide(APP_NAME);
-      // SAFETY: both strings are NUL-terminated and outlive the call.
-      unsafe {
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr());
-      }
-    }
-  }
-
-  fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
   }
 
   /// `schtasks /Create /XML` wants a Unicode file with a BOM.
@@ -444,23 +761,12 @@ mod imp {
 
   /// A logon task with no delay: same trigger the other login-time clients
   /// use, so the app is scheduled alongside them rather than after the shell.
-  fn task_xml(exe: &Path, args: &[&str], user: &str, restart: bool) -> String {
+  fn task_xml(exe: &Path, args: &[&str], user: &str) -> String {
     let args = args.join(" ");
     let args = if args.is_empty() {
       String::new()
     } else {
       format!("      <Arguments>{}</Arguments>\n", esc(&args))
-    };
-    // The core must come back after a crash; the tray is restarted by the user.
-    let restart = if restart {
-      concat!(
-        "    <RestartOnFailure>\n",
-        "      <Count>3</Count>\n",
-        "      <Interval>PT1M</Interval>\n",
-        "    </RestartOnFailure>\n",
-      )
-    } else {
-      ""
     };
     format!(
       concat!(
@@ -484,7 +790,6 @@ mod imp {
         "  </Principals>\n",
         "  <Settings>\n",
         "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n",
-        "{restart}",
         "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n",
         "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n",
         "    <AllowHardTerminate>true</AllowHardTerminate>\n",
@@ -513,7 +818,6 @@ mod imp {
       user = esc(user),
       exe = esc(&exe.to_string_lossy()),
       args = args,
-      restart = restart,
     )
   }
 
@@ -525,8 +829,8 @@ mod imp {
 
   #[cfg(test)]
   mod tests {
-    use super::{esc, parse_command, task_xml};
-    use std::path::{Path, PathBuf};
+    use super::{esc, task_xml};
+    use std::path::Path;
 
     #[test]
     fn xml_carries_the_command_line() {
@@ -552,20 +856,6 @@ mod imp {
       let xml = task_xml(Path::new(r"C:\a&b\thunet.exe"), &[], "PC\\me");
       assert!(xml.contains(r"<Command>C:\a&amp;b\thunet.exe</Command>"));
     }
-
-    #[test]
-    fn legacy_command_is_split_into_path_and_args() {
-      let exe = PathBuf::from(r"C:\Tools\thunet.exe");
-      assert_eq!(
-        parse_command(r#""C:\Program Files\thunet\thunet.exe" --minimized"#),
-        Some(PathBuf::from(r"C:\Program Files\thunet\thunet.exe"))
-      );
-      assert_eq!(
-        parse_command(r"C:\Tools\thunet.exe --minimized"),
-        Some(exe.clone())
-      );
-      assert_eq!(parse_command(r" C:\Tools\thunet.exe "), Some(exe));
-    }
   }
 }
 
@@ -575,7 +865,10 @@ mod imp {
 
   use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
-  use super::{APP_NAME, Autostart, ServiceAction};
+  use super::{Autostart, ServiceAction};
+
+  /// Name of the XDG desktop entry (`auto-launch` writes `thunet.desktop`).
+  const APP_NAME: &str = "thunet";
 
   /// The background core as a systemd *user* unit. It needs no display, so it
   /// can start with the user manager (`WantedBy=default.target`) and — with
@@ -604,6 +897,11 @@ mod imp {
     unit_enabled()
   }
 
+  /// Whether the user manager starts it at login/boot.
+  pub fn core_starts_at_boot() -> bool {
+    unit_enabled()
+  }
+
   /// The tray keeps using the XDG autostart entry: every desktop honours it,
   /// including the ones that never pull `graphical-session.target` (i3, sway).
   pub fn enable_tray(a: &Autostart) -> Result<(), String> {
@@ -626,21 +924,40 @@ mod imp {
     disable_unit()
   }
 
-  /// Keep an existing installation working: an older build only had the tray
-  /// entry, and a portable one has no unit at all.
-  pub fn migrate(a: &Autostart) -> Result<bool, String> {
-    let mut changed = false;
-    if tray_registered(a) && !unit_enabled() {
-      enable_core(a)?;
-      changed = true;
+  /// The tray entry is the only one `--minimized` affects.
+  pub fn refresh_tray(a: &Autostart) -> Result<(), String> {
+    if tray_registered(a) {
+      enable_tray(a)
+    } else {
+      Ok(())
     }
-    if !unit_installed() {
-      // Installed but not enabled: `systemctl --user start thunet` works
-      // without turning autostart on.
+  }
+
+  /// Nothing to resume by hand: systemd applies `Restart=` and the enabled
+  /// unit starts at the next login.
+  pub fn resume_after_update() -> Result<(), String> {
+    Ok(())
+  }
+
+  /// A portable install has no unit, so `thunet service start` would have
+  /// nothing to drive: write it (without enabling autostart) the first time.
+  ///
+  /// macOS has no service manager for the core at all — the LaunchAgent starts
+  /// the tray, and the core is started on demand.
+  pub fn prepare_service(a: &Autostart) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+      if unit_installed() {
+        return Ok(false);
+      }
       install_unit(a)?;
-      changed = true;
+      Ok(true)
     }
-    Ok(changed)
+    #[cfg(not(target_os = "linux"))]
+    {
+      let _ = a;
+      Ok(false)
+    }
   }
 
   pub fn service(action: ServiceAction, a: &Autostart) -> Result<String, String> {
@@ -731,8 +1048,11 @@ mod imp {
 
   #[cfg(target_os = "linux")]
   fn enable_unit() -> Result<(), String> {
-    // `--now` also starts it, so the switch takes effect without a re-login.
-    systemctl(&["enable", "--now", CORE_UNIT])?;
+    // Deliberately not `--now`: this switch is about what happens at the next
+    // boot, exactly like the Windows service start type. The window never
+    // starts a core on its own, so a running session stays a separate,
+    // deliberate *Start* (`thunet service start`).
+    systemctl(&["enable", CORE_UNIT])?;
     // Best effort: without linger the unit starts at login instead of at boot.
     // Granting it may need a policy prompt, so a failure is not an error here.
     let _ = std::process::Command::new("loginctl")
@@ -788,13 +1108,9 @@ mod imp {
     }
   }
 
-  /// macOS: the core is started by the tray (a LaunchAgent has no equivalent of
-  /// a display-less unit), so there is nothing extra to register.
-  #[cfg(not(target_os = "linux"))]
-  fn unit_installed() -> bool {
-    false
-  }
-
+  /// macOS: there is no service manager for the core (a LaunchAgent has no
+  /// display-less equivalent), so it is started on demand — the status page's
+  /// *Start* button or `thunet core` / `thunet service start`.
   #[cfg(not(target_os = "linux"))]
   fn install_unit(_a: &Autostart) -> Result<(), String> {
     Ok(())
