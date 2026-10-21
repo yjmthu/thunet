@@ -2,13 +2,11 @@
 
 ## Never commit real identifiers
 
-Code, tests, documentation, commit messages, screenshots and log samples must not
-contain real personal or network identifiers. In particular:
+Code, tests, documentation, commit messages, screenshots and log samples must not contain real personal or network identifiers. In particular:
 
 - no real account names or passwords (TUNET or otherwise);
 - no real IPv4/IPv6 addresses, MAC addresses, host names or user-profile paths;
-- no tokens, API keys, private keys or sealed credentials (`credential.bin`,
-  `key.bin`), and no `config.json`, `core.log` or `crash.log` from a real machine.
+- no tokens, API keys, private keys or sealed credentials (`credential.bin`, `key.bin`), and no `config.json`, `core.log` or `crash.log` from a real machine.
 
 Use placeholders instead:
 
@@ -22,10 +20,14 @@ Use placeholders instead:
 
 Public service names (`auth4.tsinghua.edu.cn`, `Tsinghua-Secure`) are fine.
 
-Runtime state and build artifacts are ignored: `credential.bin`, `key.bin`,
-`config.json`, `core.log`, `crash.log`, `dist/`, `*.msi`, `*.deb`, `*.tar.gz`.
-Never force-add them.
+Runtime state and build artifacts are ignored: `credential.bin`, `key.bin`, `config.json`, `core.log`, `crash.log`, `dist/`, `*.msi`, `*.deb`, `*.tar.gz`. Never force-add them.
 
-Before committing, review `git diff --cached`. If personal data ever lands in a
-commit, rewrite the history instead of adding a second commit that deletes it
-(a deletion commit leaves the value readable in the old commit).
+Before committing, review `git diff --cached`. If personal data ever lands in a commit, rewrite the history instead of adding a second commit that deletes it (a deletion commit leaves the value readable in the old commit).
+
+## Markdown: no hard wrapping
+
+Never hard-wrap prose in Markdown. Each paragraph, list item and blockquote stays on one line, however long; a line break inside a sentence is a formatting defect, not a style choice. Only fenced code blocks, tables and explicit line breaks keep their own lines.
+
+## Commits: only when asked
+
+Do not commit or push this repository unless the user explicitly asks. Edits in the working tree are fine; present the diff summary and wait. The only repository the agent may commit to on its own is the config/memory repository, following its own rules.
