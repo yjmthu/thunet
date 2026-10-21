@@ -48,9 +48,6 @@ pub enum ServiceAction {
   Restart,
   /// Re-apply the state-directory permissions (installer/elevation internal).
   Repair,
-  /// Repair permissions and drop sealed files the service cannot read, so the
-  /// window can save a fresh credential (used after a save failure).
-  ResetCredential,
   /// Print what the platform's service manager says.
   Status,
 }
@@ -433,26 +430,6 @@ mod imp {
         harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         Ok("state directory permissions repaired".into())
       }
-      ServiceAction::ResetCredential => {
-        ensure_machine_dir()?;
-        harden_machine_dir(None)?;
-        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
-        // A blob the service cannot open is unusable anyway. Try to decrypt
-        // it first (works only when this elevated account owns the EFS
-        // certificate), then delete it: a fresh key created by the service is
-        // not encrypted, and the window resends the password.
-        let dir = crate::config::machine_dir();
-        for name in ["key.bin", "credential.bin"] {
-          let path = dir.join(name);
-          let _ = std::process::Command::new(system32("cipher.exe"))
-            .arg("/d")
-            .arg(&path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-          let _ = std::fs::remove_file(&path);
-        }
-        Ok("credential reset; the window will save it again".into())
-      }
       ServiceAction::Status => status_text(),
     }
   }
@@ -468,7 +445,6 @@ mod imp {
         | ServiceAction::Stop
         | ServiceAction::Restart
         | ServiceAction::Repair
-        | ServiceAction::ResetCredential
     )
   }
 
@@ -484,7 +460,6 @@ mod imp {
       ServiceAction::Stop => "stop",
       ServiceAction::Restart => "restart",
       ServiceAction::Repair => "repair",
-      ServiceAction::ResetCredential => "reset-credential",
       ServiceAction::Status => "status",
     }
   }
@@ -500,7 +475,6 @@ mod imp {
       ServiceAction::Stop => "core stopped",
       ServiceAction::Restart => "core restarted",
       ServiceAction::Repair => "state directory permissions repaired",
-      ServiceAction::ResetCredential => "credential reset; the window will save it again",
       ServiceAction::Status => "status",
     }
     .into()
@@ -666,19 +640,6 @@ mod imp {
     // stops at the first inaccessible file, so reset the tree first: that
     // discards explicit ACEs and lets the grants below decide the result.
     take_ownership();
-    // EFS is independent of the DACL. If the directory is marked "encrypt new
-    // files", every file the service creates is encrypted to an account it
-    // cannot use. Clear that flag (existing files are handled by
-    // `ResetCredential`).
-    let _ = std::process::Command::new(system32("cipher.exe"))
-      .arg("/d")
-      .arg(&dir)
-      .creation_flags(CREATE_NO_WINDOW)
-      .output();
-    // Make SYSTEM the owner before resetting: the owner implicitly has
-    // WRITE_DAC, which is what lets the reset and grants below succeed even
-    // when the old ACL named a different account.
-    let _ = icacls(&["/setowner", "*S-1-5-18", "/T", "/C"]);
     let _ = icacls(&["/reset", "/T", "/C"]);
     let _ = std::fs::remove_file(dir.join("core.log"));
 
@@ -1325,7 +1286,6 @@ mod imp {
       ServiceAction::Stop => "stop",
       ServiceAction::Restart => "restart",
       ServiceAction::Repair => "repair",
-      ServiceAction::ResetCredential => "reset-credential",
       ServiceAction::Status => "status",
     }
   }
@@ -1340,7 +1300,6 @@ mod imp {
       ServiceAction::Stop => "core stopped".into(),
       ServiceAction::Restart => "core restarted".into(),
       ServiceAction::Repair => "state directory permissions repaired".into(),
-      ServiceAction::ResetCredential => "credential reset; the window will save it again".into(),
       ServiceAction::Status => "status".into(),
     }
   }
@@ -1389,13 +1348,6 @@ mod imp {
         // DynamicUser + StateDirectory owns the directory; there is no
         // per-user ACL to repair on this platform.
         Ok("state directory permissions repaired".into())
-      }
-      ServiceAction::ResetCredential => {
-        let dir = crate::config::machine_dir();
-        for name in ["key.bin", "credential.bin"] {
-          let _ = std::fs::remove_file(dir.join(name));
-        }
-        Ok("credential reset; the window will save it again".into())
       }
       ServiceAction::Status => Ok(systemctl_output(&["status", "--no-pager", CORE_UNIT])),
     }
