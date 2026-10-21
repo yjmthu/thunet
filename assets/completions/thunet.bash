@@ -729,7 +729,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart repair status"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -783,7 +783,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__admin)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart repair status"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

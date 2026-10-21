@@ -46,8 +46,6 @@ pub enum ServiceAction {
   Start,
   Stop,
   Restart,
-  /// Re-apply the state-directory permissions (installer/elevation internal).
-  Repair,
   /// Print what the platform's service manager says.
   Status,
 }
@@ -324,7 +322,6 @@ mod imp {
       // belongs to SYSTEM/Administrators only, and the core can log in but
       // cannot read `key.bin` or save a credential.
       ensure_machine_dir()?;
-      harden_machine_dir(None)?;
       harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     }
     if !core_starts_at_boot() {
@@ -405,7 +402,6 @@ mod imp {
         // the repair the core can log in but cannot read `key.bin` or save a
         // credential ("cannot read ... key.bin").
         ensure_machine_dir()?;
-        harden_machine_dir(None)?;
         harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core started".into())
@@ -417,18 +413,9 @@ mod imp {
       ServiceAction::Restart => {
         let _ = stop();
         ensure_machine_dir()?;
-        harden_machine_dir(None)?;
         harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core restarted".into())
-      }
-      ServiceAction::Repair => {
-        ensure_machine_dir()?;
-        // Reset first: an older install could have left explicit ACEs (even
-        // deny ACEs) that a plain `/grant:r` would not remove.
-        harden_machine_dir(None)?;
-        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
-        Ok("state directory permissions repaired".into())
       }
       ServiceAction::Status => status_text(),
     }
@@ -444,7 +431,6 @@ mod imp {
         | ServiceAction::Start
         | ServiceAction::Stop
         | ServiceAction::Restart
-        | ServiceAction::Repair
     )
   }
 
@@ -459,7 +445,6 @@ mod imp {
       ServiceAction::Start => "start",
       ServiceAction::Stop => "stop",
       ServiceAction::Restart => "restart",
-      ServiceAction::Repair => "repair",
       ServiceAction::Status => "status",
     }
   }
@@ -474,7 +459,6 @@ mod imp {
       ServiceAction::Start => "core started",
       ServiceAction::Stop => "core stopped",
       ServiceAction::Restart => "core restarted",
-      ServiceAction::Repair => "state directory permissions repaired",
       ServiceAction::Status => "status",
     }
     .into()
@@ -491,7 +475,6 @@ mod imp {
     // Same repair as *Start*: this runs elevated and the core needs the
     // directory as soon as it starts at the next logon.
     ensure_machine_dir()?;
-    harden_machine_dir(None)?;
     harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     sc(&["config", CORE_SERVICE, "start=", "auto"])?;
     Ok(())
@@ -606,43 +589,7 @@ mod imp {
 
   fn harden_machine_dir(service: Option<&str>) -> Result<(), String> {
     let dir = crate::config::machine_dir();
-    // Prefer the SID: a virtual account name depends on the account database,
-    // while the SID is what the service token actually contains. The name is
-    // only a fallback for a clean install, before the service exists.
-    let service_ace = service.map(|name| {
-      service_sid()
-        .map(|sid| format!("*{sid}:(OI)(CI)F"))
-        .unwrap_or_else(|| format!("{name}:(OI)(CI)F"))
-    });
-    let icacls = |args: &[&str]| {
-      std::process::Command::new(system32("icacls.exe"))
-        .arg(&dir)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("icacls: {e}"))
-    };
-    let take_ownership = || {
-      let _ = std::process::Command::new(system32("takeown.exe"))
-        .arg("/F")
-        .arg(&dir)
-        .arg("/R")
-        .arg("/A")
-        .arg("/D")
-        .arg("Y")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    };
-
-    // A previous install (or a service that ran as another account) may have
-    // left explicit ACEs — including a deny — or files this administrator
-    // cannot open for WRITE_DAC. `/grant:r` alone does not remove a deny and
-    // stops at the first inaccessible file, so reset the tree first: that
-    // discards explicit ACEs and lets the grants below decide the result.
-    take_ownership();
-    let _ = icacls(&["/reset", "/T", "/C"]);
-    let _ = std::fs::remove_file(dir.join("core.log"));
-
+    let service_ace = service.map(|name| format!("{name}:(OI)(CI)F"));
     let mut args = vec![
       "/inheritance:r",
       "/grant:r",
@@ -653,24 +600,41 @@ mod imp {
       args.push(ace);
     }
     args.push("/T");
-    args.push("/C");
-    let first = icacls(&args)?;
-    if first.status.success() {
+    let apply = || {
+      std::process::Command::new(system32("icacls.exe"))
+        .arg(&dir)
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("icacls: {e}"))
+    };
+    let out = apply()?;
+    if out.status.success() {
       return Ok(());
     }
 
-    // Taking ownership again covers files that were created between the two
-    // passes (the core writes `core.log` while it runs).
-    take_ownership();
-    let retry = icacls(&args)?;
+    // A previous install (or a service that ran as another account) may have
+    // left files this administrator cannot open for WRITE_DAC. `icacls` then
+    // stops at the first such file. Take ownership of the tree and retry; the
+    // log is disposable, so drop it first if it is the stubborn one.
+    let _ = std::fs::remove_file(dir.join("core.log"));
+    let _ = std::process::Command::new(system32("takeown.exe"))
+      .arg("/F")
+      .arg(&dir)
+      .arg("/R")
+      .arg("/A")
+      .arg("/D")
+      .arg("Y")
+      .creation_flags(CREATE_NO_WINDOW)
+      .output();
+    let retry = apply()?;
     if retry.status.success() {
       Ok(())
     } else {
       Err(format!(
-        "cannot secure {}: {} {}",
+        "cannot secure {}: {}",
         dir.display(),
-        decode(&retry.stderr).trim(),
-        decode(&retry.stdout).trim()
+        decode(&retry.stderr).trim()
       ))
     }
   }
@@ -1285,7 +1249,6 @@ mod imp {
       ServiceAction::Start => "start",
       ServiceAction::Stop => "stop",
       ServiceAction::Restart => "restart",
-      ServiceAction::Repair => "repair",
       ServiceAction::Status => "status",
     }
   }
@@ -1299,7 +1262,6 @@ mod imp {
       ServiceAction::Start => "core started".into(),
       ServiceAction::Stop => "core stopped".into(),
       ServiceAction::Restart => "core restarted".into(),
-      ServiceAction::Repair => "state directory permissions repaired".into(),
       ServiceAction::Status => "status".into(),
     }
   }
@@ -1343,11 +1305,6 @@ mod imp {
       ServiceAction::Restart => {
         systemctl(&["restart", CORE_UNIT])?;
         Ok("core restarted".into())
-      }
-      ServiceAction::Repair => {
-        // DynamicUser + StateDirectory owns the directory; there is no
-        // per-user ACL to repair on this platform.
-        Ok("state directory permissions repaired".into())
       }
       ServiceAction::Status => Ok(systemctl_output(&["status", "--no-pager", CORE_UNIT])),
     }
