@@ -94,6 +94,12 @@ impl Session {
     &self.cfg
   }
 
+  /// The core owns the credential, so it also maintains the flags that decide
+  /// whether that credential is read back on the next start.
+  pub fn cfg_mut(&mut self) -> &mut Config {
+    &mut self.cfg
+  }
+
   /// Query the portal and sync the local state with reality.
   pub fn refresh(&mut self) -> Result<serde_json::Value, String> {
     let v = self.client.status(&self.cfg.ac_id)?;

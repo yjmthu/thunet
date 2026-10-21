@@ -71,6 +71,9 @@ pub struct Texts {
   pub password_cleared: &'static str,
   /// "Remember" is on but the password field is empty: nothing is stored.
   pub password_missing: &'static str,
+  /// Placeholder for an empty field while the core holds a saved password: an
+  /// empty field means "keep it", not "delete it".
+  pub password_keep: &'static str,
   /// Connect was pressed while no account/password is available at all.
   pub no_credentials: &'static str,
   /// Prefix of the compile-time stamp next to the version.
@@ -114,6 +117,8 @@ pub struct Texts {
   pub service_stopped: &'static str,
   pub service_start_failed: &'static str,
   pub service_stop_failed: &'static str,
+  /// Apply was pressed while the machine service was down; a start is running.
+  pub service_starting: &'static str,
   // messages
   pub login_failed: &'static str,
   pub connect_ok: &'static str,
@@ -162,6 +167,7 @@ static ZH: Texts = Texts {
   password_saved: "密码已保存",
   password_cleared: "密码已清除",
   password_missing: "未填写密码",
+  password_keep: "已保存，留空则不修改",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
   on: "已开启",
@@ -195,6 +201,7 @@ static ZH: Texts = Texts {
   service_stopped: "后台服务已停止",
   service_start_failed: "后台服务启动失败",
   service_stop_failed: "后台服务停止失败",
+  service_starting: "正在启动后台服务，请稍候…",
   login_failed: "登录失败",
   connect_ok: "连接成功",
   connect_failed: "连接失败",
@@ -237,6 +244,7 @@ static EN: Texts = Texts {
   password_saved: "Password saved",
   password_cleared: "Password cleared",
   password_missing: "No password entered",
+  password_keep: "Saved — leave blank to keep it",
   no_credentials: "No account or password saved",
   built: "Built at",
   on: "On",
@@ -270,6 +278,7 @@ static EN: Texts = Texts {
   service_stopped: "Service stopped",
   service_start_failed: "Service failed to start",
   service_stop_failed: "Service failed to stop",
+  service_starting: "Starting the background service…",
   login_failed: "Login failed",
   connect_ok: "Connected",
   connect_failed: "Connection failed",

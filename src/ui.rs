@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::i18n::{Lang, Texts};
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
-use crate::proto::{Cmd, CoreInfo, Ev, LoginEnv, ToastKind};
+use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, LoginEnv, ToastKind};
 use crate::session::State;
 
 impl LoginEnv {
@@ -199,14 +199,14 @@ enum Page {
 /// A click on the status page's Start/Stop button whose outcome is still
 /// unknown. The toast fires once the service has actually appeared or gone
 /// away, not when the button was pressed.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ServiceRequest {
   Start,
   Stop,
 }
 
 /// How long a Start/Stop may take before the click is reported as failed.
-const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct Toast {
   msg: String,
@@ -221,6 +221,18 @@ pub struct App {
   next_link_try: Instant,
   /// Last reported state of the core itself (version, uptime, pid).
   core: Option<CoreInfo>,
+  /// What the core holds in the credential slot. The window never receives
+  /// the password, so this — not `cfg.password` — is what the *Remember
+  /// password* row and the *Unsaved* markers are based on once a core answers.
+  core_cred: Option<CredentialState>,
+  /// Result of comparing the typed password with the core's copy: `Some(true)`
+  /// means the text in the field is already the stored value, so it is not an
+  /// edit. Cleared whenever the field changes.
+  pass_matches: Option<bool>,
+  /// Debounce for [`Cmd::CheckCredentials`], and the exact text that was sent,
+  /// so one value is not compared on every frame.
+  pass_check_at: Option<Instant>,
+  pass_checked: String,
   next_core_query: Instant,
   core_version_warned: bool,
   state: State,
@@ -270,13 +282,19 @@ pub struct App {
   quit_at: Option<Instant>,
   /// Start/Stop clicked on the status page, waiting for its outcome.
   service_request: Option<(ServiceRequest, Instant)>,
+  /// Credentials entered while the machine service was down. They stay out of
+  /// `cfg` until the service accepts them, so a failed start leaves the
+  /// *Unsaved* markers visible.
+  pending_credentials: Option<Config>,
   /// A mode change running on a helper thread. On Windows its core half can
   /// wait for a UAC prompt, which must not block a frame.
   mode_rx: Option<Receiver<(Mode, Result<(), String>)>>,
   /// A Start runs on a helper thread (`systemctl` / `schtasks` can take a
-  /// moment); its outcome arrives here rather than blocking a frame.
-  start_tx: Sender<Result<(), String>>,
-  start_rx: Receiver<Result<(), String>>,
+  /// moment); its outcome arrives here rather than blocking a frame. The tag
+  /// says which click produced it, since the pending request may already have
+  /// been completed by the link appearing or dropping.
+  start_tx: Sender<(ServiceRequest, Result<(), String>)>,
+  start_rx: Receiver<(ServiceRequest, Result<(), String>)>,
   /// Executable a restart would launch (the file on disk, with the `(deleted)`
   /// suffix removed), plus its stamp when this process started. The stamp is
   /// what tells an upgrade apart from a stale copy at a fixed path.
@@ -302,7 +320,7 @@ impl App {
     // Nothing starts a core at launch: connect if one already answers, and
     // keep retrying from `logic()` (see `ensure_link`) while the status page
     // offers *Start*.
-    let link = Link::connect();
+    let link = crate::ipc::open();
     let lang = Lang::from_setting(&cfg.lang);
     let min_level = Level::from_setting(&cfg.log_level);
     let t = lang.texts();
@@ -347,8 +365,8 @@ impl App {
       "config: {}",
       crate::config::path().display()
     ))];
-    // A portable install gets the systemd unit so `systemctl --user start`
-    // works without touching the settings page.
+    // The package (or `thunet service install`) provides the system unit; this
+    // is a no-op on both platforms and kept for portable builds.
     match autostart.as_ref().map(Autostart::prepare_service) {
       Some(Ok(true)) => logs.push(Line::debug("autostart: service entry installed")),
       Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
@@ -375,6 +393,16 @@ impl App {
 
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
+    // An older package put the Start Menu entry in the installing user's
+    // profile while the current one writes it machine-wide; the duplicate is
+    // ours, so remove it once the new entry exists.
+    match crate::shortcut::remove_legacy_start_menu() {
+      Ok(true) => logs.push(Line::info(
+        "shortcut: removed the per-user Start Menu copy of an older install",
+      )),
+      Ok(false) => {}
+      Err(e) => logs.push(Line::warn(format!("shortcut: {e}"))),
+    }
     if tray.is_none() {
       logs.push(Line::warn(
         "tray: unavailable, the window stays visible and closing quits",
@@ -389,6 +417,10 @@ impl App {
       link,
       next_link_try: Instant::now(),
       core: None,
+      core_cred: None,
+      pass_matches: None,
+      pass_check_at: None,
+      pass_checked: String::new(),
       next_core_query: Instant::now(),
       core_version_warned: false,
       state: State::Offline,
@@ -423,6 +455,7 @@ impl App {
       quitting: false,
       quit_at: None,
       service_request: None,
+      pending_credentials: None,
       mode_rx: None,
       start_tx,
       start_rx,
@@ -448,9 +481,9 @@ impl App {
 
   /// Reconnect to the background core, without starting one.
   ///
-  /// Starting a core is an explicit action — autostart at login, the status
+  /// Starting a core is an explicit action — autostart at boot, the status
   /// page's *Start* button, or the CLI. A window that respawned one on its own
-  /// would make `systemctl --user stop` / `schtasks /End` look broken.
+  /// would make `systemctl stop` / `sc stop` look broken.
   fn ensure_link(&mut self) {
     if self.link.as_ref().is_some_and(Link::alive) {
       return;
@@ -462,11 +495,20 @@ impl App {
     // replaced by an upgrade). Drop the facts it reported, otherwise the status
     // page keeps claiming "running" for a process that is gone, with session
     // rows nothing updates any more.
+    let was_machine = self.link.as_ref().is_some_and(Link::is_machine);
     if self.link.take().is_some() {
+      self.push_log(Line::debug("frontend: the core link went away"));
       self.core = None;
       self.last_error = None;
       self.state = State::Offline;
       self.info = Info::default();
+      if was_machine {
+        // A machine core owned the credential; its answers are stale now, and
+        // the next one will report them again after reconnecting.
+        self.core_cred = None;
+        self.pass_matches = None;
+        self.pass_checked.clear();
+      }
       // A pending *Stop* is only done once the core has actually hung up.
       if let Some((ServiceRequest::Stop, _)) = self.service_request {
         self.service_request = None;
@@ -478,30 +520,81 @@ impl App {
       return;
     }
     self.next_link_try = Instant::now() + Duration::from_secs(2);
-    match crate::ipc::open() {
-      Some(link) => {
+    self.push_log(Line::debug(
+      "frontend: trying the machine and portable endpoints",
+    ));
+    match crate::ipc::open_result() {
+      Ok(link) => {
+        let kind = if link.is_machine() {
+          "service"
+        } else {
+          "portable"
+        };
+        self.push_log(Line::info(format!("connected to the {kind} core")));
         self.link = Some(link);
         self.last_error = None;
         self.service_warned = false;
-        self.push_log(Line::info("connected to the background service"));
         self.send(Cmd::SetLang(self.lang));
         // Ask who we are talking to on the next pass.
         self.next_core_query = Instant::now();
       }
-      None => {
+      Err(reason) => {
         // Not a login failure, so this belongs in the log rather than in the
         // red banner; the service row says "not running" by itself.
         if !self.service_warned {
           self.service_warned = true;
-          self.push_log(Line::warn("the background service is not running"));
+          self.push_log(Line::warn(format!(
+            "the background service is not running: {reason}"
+          )));
         }
       }
     }
-    // A pending *Start* is only done once a core actually answers.
+    // Credentials entered while the service was down travel with its start:
+    // once a machine core answers, hand them over and turn the pending Apply
+    // into the same toast a normal one would show.
+    let machine_ready = self
+      .link
+      .as_ref()
+      .is_some_and(|link| link.alive() && link.is_machine());
+    if machine_ready && let Some(next) = self.pending_credentials.take() {
+      // The service accepted the start: this is the point where the edits
+      // become the new baseline and the per-field markers clear.
+      self.cfg = next;
+      self.service_request = None;
+      let typed = !self.cfg.password.is_empty();
+      let (msg, kind) = self.credentials_toast(typed);
+      self.set_toast(msg.to_string(), kind);
+      self.send(Cmd::SetCredentials {
+        username: self.cfg.username.clone(),
+        password: self.cfg.password.clone(),
+        remember: self.cfg.remember_password,
+      });
+      // The machine core holds it from now on. Keeping a copy here would make
+      // the window claim a stored password it cannot verify against the core.
+      self.cfg.password.clear();
+      self.pass_edit.clear();
+      self.pass_matches = None;
+      self.pass_checked.clear();
+    }
+    // A pending *Start* is only done once the core actually answers. On
+    // Windows the only supported start target is the service, so a portable
+    // core that happens to answer first must not complete the click.
+    let start_ready = self.link.as_ref().is_some_and(|link| {
+      link.alive() && {
+        #[cfg(windows)]
+        {
+          link.is_machine()
+        }
+        #[cfg(not(windows))]
+        {
+          true
+        }
+      }
+    });
     if self
       .service_request
       .is_some_and(|(r, _)| r == ServiceRequest::Start)
-      && self.link.as_ref().is_some_and(Link::alive)
+      && start_ready
     {
       self.service_request = None;
       let msg = self.t().service_started.to_string();
@@ -536,19 +629,89 @@ impl App {
 
   /// Persist the edited credentials and hand them to the worker.
   fn apply_credentials(&mut self) {
-    self.cfg.username = self.user_edit.trim().to_string();
-    self.cfg.password = self.pass_edit.clone();
-    self.cfg.remember_password = self.remember;
-    match self.cfg.save() {
+    let next = self.edited_config();
+
+    if self.link.as_ref().is_some_and(Link::alive) {
+      self.save_credentials(next, true);
+      return;
+    }
+
+    // No core answers. On a machine-service install (and on Windows, where
+    // Start registers that service), start it and deliver the credential once
+    // it appears. Falling back to the per-user store here is wrong: the machine
+    // core would never read that file. An explicit `--state-dir` means the
+    // caller asked for portable mode, so leave that alone.
+    let portable = std::env::var_os("THUNET_STATE_DIR").is_some();
+    if crate::autostart::core_managed() || (cfg!(windows) && !portable) {
+      if let Err(e) = next.save_prefs() {
+        self.toast_err(e);
+        return;
+      }
+      let first = self.pending_credentials.is_none();
+      // The newest fields travel with the in-flight start, but `cfg` stays on
+      // the old values until the core actually accepts them; that is what the
+      // per-field *Unsaved* markers compare against.
+      self.pending_credentials = Some(next);
+      if !first {
+        return;
+      }
+      self.service_request = Some((ServiceRequest::Start, Instant::now()));
+      self.set_toast(self.t().service_starting.to_string(), ToastKind::Info);
+      let tx = self.start_tx.clone();
+      std::thread::spawn(move || {
+        let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core()));
+      });
+      return;
+    }
+
+    // Portable install with no core yet: keep the credential in the user store.
+    // The next `thunet core` reads it from there.
+    self.save_credentials(next, false);
+  }
+
+  /// The config a click on *Apply* would store, without touching `cfg` yet.
+  fn edited_config(&self) -> Config {
+    let mut next = self.cfg.clone();
+    next.username = self.user_edit.trim().to_string();
+    next.password = self.pass_edit.clone();
+    next.remember_password = self.remember;
+    next
+  }
+
+  /// Save the credential and hand it to a live core.
+  ///
+  /// `owned_by_core` selects the JSON-only path: a core writes the sealed blob
+  /// into its own state directory, so the window must not keep a second copy.
+  fn save_credentials(&mut self, next: Config, owned_by_core: bool) {
+    let saved = if owned_by_core {
+      next.save_prefs()
+    } else {
+      next.save()
+    };
+    match saved {
       Ok(()) => {
+        // Only now do the edits become the new baseline, so a failed save
+        // leaves the *Unsaved* markers in place.
+        let typed = !next.password.is_empty();
+        self.cfg = next;
         // Say what actually happened: unticking the checkbox deletes the stored
         // credential instead of writing one.
-        let (msg, kind) = self.credentials_toast();
+        let (msg, kind) = self.credentials_toast(typed);
         self.set_toast(msg.to_string(), kind);
         self.send(Cmd::SetCredentials {
           username: self.cfg.username.clone(),
           password: self.cfg.password.clone(),
+          remember: self.cfg.remember_password,
         });
+        if owned_by_core {
+          // The core is the only holder now; the field goes back to empty and
+          // the hint explains that the saved value is kept as long as it stays
+          // empty. `Ev::Credentials` will confirm it and fill in the state.
+          self.cfg.password.clear();
+          self.pass_edit.clear();
+          self.pass_matches = None;
+          self.pass_checked.clear();
+        }
       }
       Err(e) => {
         self.toast_err(e);
@@ -562,18 +725,75 @@ impl App {
     self.user_edit = self.cfg.username.clone();
     self.pass_edit = self.cfg.password.clone();
     self.remember = self.cfg.remember_password;
+    self.pending_credentials = None;
     self.toast = None;
   }
 
-  fn credentials_toast(&self) -> (&'static str, ToastKind) {
+  fn credentials_toast(&self, typed: bool) -> (&'static str, ToastKind) {
     let t = self.t();
-    if !self.cfg.remember_password {
+    let held = typed || self.core_cred.as_ref().is_some_and(|c| c.has_password);
+    if !self.remember {
       (t.password_cleared, ToastKind::Info)
-    } else if self.cfg.password.is_empty() {
+    } else if !held {
       (t.password_missing, ToastKind::Info)
     } else {
       (t.password_saved, ToastKind::Ok)
     }
+  }
+
+  /// Fold what the core says it holds into the form's baseline.
+  ///
+  /// A machine core is the only holder of the password, so the window takes
+  /// the account and the "saved" flag from it instead of from its own
+  /// `config.json` (which never contains the password). Fields the user is
+  /// currently editing are left alone: overwriting them would silently discard
+  /// an edit whenever a periodic `CoreInfo` answer lands.
+  fn apply_core_credential(&mut self, state: &CredentialState) {
+    let editing_user = self.user_edit.trim() != self.cfg.username;
+    let editing_remember = self.remember != self.cfg.remember_password;
+    self.cfg.username = state.username.clone();
+    self.cfg.remember_password = state.remembered;
+    // Never keep a copy: `has_password` says whether the core has one.
+    self.cfg.password.clear();
+    if !editing_user {
+      self.user_edit = state.username.clone();
+    }
+    if !editing_remember {
+      self.remember = state.remembered;
+    }
+    self.core_cred = Some(state.clone());
+  }
+
+  /// Ask the core whether the typed password is the stored one.
+  ///
+  /// Re-typing a password that is already saved should not leave an *Unsaved*
+  /// marker, and the window cannot compare on its own — only the core can open
+  /// the sealed blob. The request is debounced and only sent on a change.
+  fn check_typed_password(&mut self) {
+    if self.pass_edit != self.pass_checked {
+      self.pass_matches = None;
+      self.pass_check_at = None;
+    }
+    if self.pass_edit.is_empty() || self.pass_edit == self.pass_checked {
+      return;
+    }
+    if !self.link.as_ref().is_some_and(Link::alive)
+      || !self.core_cred.as_ref().is_some_and(|c| c.has_password)
+    {
+      return;
+    }
+    let at = *self
+      .pass_check_at
+      .get_or_insert_with(|| Instant::now() + Duration::from_millis(350));
+    if Instant::now() < at {
+      return;
+    }
+    self.pass_check_at = None;
+    self.pass_checked = self.pass_edit.clone();
+    self.send(Cmd::CheckCredentials {
+      username: self.user_edit.trim().to_string(),
+      password: self.pass_edit.clone(),
+    });
   }
 
   fn set_toast(&mut self, msg: String, kind: ToastKind) {
@@ -614,6 +834,7 @@ impl App {
     }
     // Show the requested state right away; the toast confirms or reverts it.
     self.autostart_mode = mode;
+    self.push_log(Line::debug(format!("autostart: requesting {mode:?}")));
     let (tx, rx) = mpsc::channel::<(Mode, Result<(), String>)>();
     std::thread::spawn(move || {
       let result = autostart.set_mode(mode);
@@ -632,6 +853,9 @@ impl App {
     };
     self.mode_rx = None;
     let t = self.t();
+    self.push_log(Line::debug(format!(
+      "autostart: {mode:?} returned {result:?}"
+    )));
     match result {
       Ok(()) => {
         self.autostart_mode = mode;
@@ -803,7 +1027,17 @@ impl App {
               env!("CARGO_PKG_VERSION")
             )));
           }
+          let cred = info.credential.clone();
+          self.apply_core_credential(&cred);
           self.core = Some(info);
+        }
+        Ev::Credentials(state) => {
+          // A comparison answer and/or a fresh baseline. `matches` is only
+          // present on a `CheckCredentials` reply.
+          if let Some(m) = state.matches {
+            self.pass_matches = Some(m);
+          }
+          self.apply_core_credential(&state);
         }
         // Answers to the CLI's one-off questions; the window has no use for them.
         Ev::Status(_) | Ev::AcId(_) => {}
@@ -862,17 +1096,18 @@ impl App {
         ui.add_space(8.0);
 
         if self.page == Page::Status {
-          // No core answering is the one state that makes every other action
-          // fail, so it gets a banner of its own — worded as missing service,
-          // not as a login failure. The service row further down carries the
-          // Start button.
+          // Banners are overlaid instead of taking part in the vertical layout:
+          // the log pane keeps the same height whether a warning is visible or
+          // not. They sit just below the header, over the status rows.
+          let mut banners = Vec::new();
           if !self.link.as_ref().is_some_and(Link::alive) {
-            red_banner(ui, t.service_down);
-            ui.add_space(8.0);
+            banners.push(t.service_down.to_string());
           }
           if let Some(err) = &self.last_error {
-            red_banner(ui, format!("{}: {err}", t.login_failed));
-            ui.add_space(8.0);
+            banners.push(format!("{}: {err}", t.login_failed));
+          }
+          if !banners.is_empty() {
+            banner_overlay(ui, banners.join("\n"));
           }
 
           let account = if !self.info.name.is_empty() {
@@ -968,18 +1203,38 @@ impl App {
                   t.service_start
                 };
                 if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                  self.push_log(Line::debug(format!(
+                    "frontend: {} clicked (service_request={:?})",
+                    if running { "Stop" } else { "Start" },
+                    self.service_request
+                  )));
                   if running {
-                    // The core ends itself; the toast and the row's "not
-                    // running" appear together when the link drops.
-                    self.send(Cmd::Shutdown);
                     self.service_request = Some((ServiceRequest::Stop, Instant::now()));
+                    let machine = self.link.as_ref().map_or(true, Link::is_machine);
+                    if machine {
+                      // The machine core belongs to SCM / systemd, so stopping
+                      // it is an administrator operation. The link drops when
+                      // the service actually exits.
+                      let tx = self.start_tx.clone();
+                      std::thread::spawn(move || {
+                        let r = crate::autostart::Autostart::service(
+                          crate::autostart::ServiceAction::Stop,
+                          false,
+                        )
+                        .map(|_| ());
+                        let _ = tx.send((ServiceRequest::Stop, r));
+                      });
+                    } else {
+                      // A portable core is ours: one control command, no UAC.
+                      self.send(Cmd::Shutdown);
+                    }
                   } else {
                     // Registering the start can block, so it happens off the UI
                     // thread; `logic` picks the outcome up.
                     self.service_request = Some((ServiceRequest::Start, Instant::now()));
                     let tx = self.start_tx.clone();
                     std::thread::spawn(move || {
-                      let _ = tx.send(crate::ipc::start_core());
+                      let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core()));
                     });
                   }
                 }
@@ -1123,8 +1378,20 @@ impl App {
           ui.separator();
           // Comment on each field separately: the marker belongs next to the
           // input that actually differs from what is stored.
-          let stored =
-            CredentialEdits::new(&self.user_edit, &self.pass_edit, self.remember, &self.cfg);
+          let core_password = self.core_cred.as_ref().is_some_and(|c| c.has_password);
+          // Only trust the comparison for the text that was actually sent: as
+          // soon as the field changes, the previous answer is irrelevant.
+          let match_hint = (self.pass_checked == self.pass_edit)
+            .then_some(self.pass_matches)
+            .flatten();
+          let stored = CredentialEdits::new(
+            &self.user_edit,
+            &self.pass_edit,
+            self.remember,
+            &self.cfg,
+            self.core_cred.as_ref(),
+            match_hint,
+          );
           ui.horizontal(|ui| {
             ui.label(t.account);
             ui.add(egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0));
@@ -1134,11 +1401,16 @@ impl App {
           });
           ui.horizontal(|ui| {
             ui.label(t.password);
-            ui.add(
-              egui::TextEdit::singleline(&mut self.pass_edit)
-                .password(true)
-                .desired_width(190.0),
-            );
+            let keep_hint = core_password && self.pass_edit.is_empty();
+            let mut input = egui::TextEdit::singleline(&mut self.pass_edit)
+              .password(true)
+              .desired_width(190.0);
+            if keep_hint {
+              // The core holds a password the window cannot show; an empty
+              // field means "keep it" rather than "no password".
+              input = input.hint_text(t.password_keep);
+            }
+            ui.add(input);
             if stored.password {
               unsaved_marker(ui, t);
             }
@@ -1306,11 +1578,26 @@ struct CredentialEdits {
 }
 
 impl CredentialEdits {
-  fn new(user_edit: &str, pass_edit: &str, remember: bool, cfg: &Config) -> Self {
+  fn new(
+    user_edit: &str,
+    pass_edit: &str,
+    remember: bool,
+    cfg: &Config,
+    core: Option<&CredentialState>,
+    pass_matches: Option<bool>,
+  ) -> Self {
+    let password = match core {
+      // A machine core owns the password, so the window has no plaintext to
+      // compare against. An empty field is "leave the saved one alone"; a
+      // typed value is an edit unless the core said it equals the stored pair.
+      Some(state) if state.has_password => !pass_edit.is_empty() && pass_matches != Some(true),
+      Some(_) => !pass_edit.is_empty(),
+      None => pass_edit != cfg.password,
+    };
     Self {
       // Applying trims the account, so a stray space is not a change.
       username: user_edit.trim() != cfg.username,
-      password: pass_edit != cfg.password,
+      password,
       remember: remember != cfg.remember_password,
     }
   }
@@ -1356,6 +1643,12 @@ struct LogCopyClick {
   swallow_release: bool,
   /// The log pane in global coordinates, as laid out by the previous frame.
   log_rect: egui::Rect,
+  /// Where the current primary drag started, if one is in progress.
+  drag_origin: Option<egui::Pos2>,
+  /// A drag selected label text. A plain click only leaves a caret, which
+  /// egui also reports as `has_selection` — redirecting a right click then
+  /// would show "copied" without a selection.
+  selected: bool,
 }
 
 impl Default for LogCopyClick {
@@ -1364,6 +1657,8 @@ impl Default for LogCopyClick {
       copy_pending: false,
       swallow_release: false,
       log_rect: egui::Rect::NOTHING,
+      drag_origin: None,
+      selected: false,
     }
   }
 }
@@ -1389,7 +1684,38 @@ impl egui::plugin::Plugin for LogCopyClick {
   }
 
   fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-    if !has_label_selection(ctx) {
+    for event in &input.events {
+      match event {
+        egui::Event::PointerButton {
+          pos,
+          button: egui::PointerButton::Primary,
+          pressed: true,
+          ..
+        } => {
+          // A press starts a fresh gesture; only moving far enough while it is
+          // down selects anything. This keeps a bare click (which egui counts
+          // as a selection because it leaves a caret) from hijacking the next
+          // right click.
+          self.selected = false;
+          self.drag_origin = Some(*pos);
+        }
+        egui::Event::PointerMoved(pos) => {
+          if self
+            .drag_origin
+            .is_some_and(|start| start.distance(*pos) > 3.0)
+          {
+            self.selected = true;
+          }
+        }
+        egui::Event::PointerButton {
+          button: egui::PointerButton::Primary,
+          pressed: false,
+          ..
+        } => self.drag_origin = None,
+        _ => {}
+      }
+    }
+    if !self.selected || !has_label_selection(ctx) {
       self.swallow_release = false;
       return;
     }
@@ -1621,6 +1947,51 @@ mod tests {
   }
 
   #[test]
+  fn right_click_after_a_bare_click_keeps_the_menu() {
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    let ctx = egui::Context::default();
+    ctx.add_plugin(LogCopyClick::default());
+    let run = |ctx: &egui::Context, events: Vec<Event>| {
+      let input = RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(240.0, 120.0))),
+        events,
+        ..Default::default()
+      };
+      let mut out = ctx.run_ui(input, |ui| {
+        let pane = egui::CentralPanel::default().show(ui, |ui| {
+          ui.add(log_entry(
+            ui,
+            "a single line".to_string(),
+            egui::Color32::WHITE,
+          ));
+        });
+        LogCopyClick::set_log_rect(ui.ctx(), pane.response.rect);
+      });
+      out.textures_delta.clear();
+    };
+    let button = |pressed, button, pos: Pos2| Event::PointerButton {
+      pos,
+      button,
+      pressed,
+      modifiers: Default::default(),
+    };
+
+    let _ = run(&ctx, vec![]);
+    let at = pos2(9.0, 10.0);
+    let _ = run(&ctx, vec![Event::PointerMoved(at)]);
+    // A click without dragging leaves a caret; egui counts that as a label
+    // selection, but there is nothing to copy.
+    let _ = run(&ctx, vec![button(true, PointerButton::Primary, at)]);
+    let _ = run(&ctx, vec![button(false, PointerButton::Primary, at)]);
+    let _ = run(&ctx, vec![button(true, PointerButton::Secondary, at)]);
+    assert!(
+      !LogCopyClick::take_copy(&ctx),
+      "a right click without a selection must reach the context menu"
+    );
+  }
+
+  #[test]
   fn credential_edits_flag_the_field_that_changed() {
     let cfg = Config {
       username: "alice".into(),
@@ -1628,19 +1999,55 @@ mod tests {
       remember_password: true,
       ..Config::default()
     };
-    let same = CredentialEdits::new("alice", "pw", true, &cfg);
+    let same = CredentialEdits::new("alice", "pw", true, &cfg, None, None);
     assert_eq!(same, CredentialEdits::default(), "unchanged");
     assert!(!same.any());
     // A stray space is trimmed away when applying, so it is not a change.
-    assert!(!CredentialEdits::new("  alice  ", "pw", true, &cfg).username);
+    assert!(!CredentialEdits::new("  alice  ", "pw", true, &cfg, None, None).username);
 
-    let user = CredentialEdits::new("other", "pw", true, &cfg);
+    let user = CredentialEdits::new("bob", "pw", true, &cfg, None, None);
     assert!(user.username && !user.password && !user.remember);
-    let pass = CredentialEdits::new("alice", "pw2", true, &cfg);
+    let pass = CredentialEdits::new("alice", "pw2", true, &cfg, None, None);
     assert!(!pass.username && pass.password && !pass.remember);
-    let remember = CredentialEdits::new("alice", "pw", false, &cfg);
+    let remember = CredentialEdits::new("alice", "pw", false, &cfg, None, None);
     assert!(!remember.username && !remember.password && remember.remember);
     assert!(remember.any());
+  }
+
+  #[test]
+  fn a_core_owned_password_is_only_unsaved_when_it_was_typed() {
+    // The window never receives the core's password, so the form baseline is
+    // `has_password = true` plus an empty field.
+    let cfg = Config {
+      username: "alice".into(),
+      remember_password: true,
+      ..Config::default()
+    };
+    let core = CredentialState {
+      username: "alice".into(),
+      has_password: true,
+      remembered: true,
+      revision: 2,
+      matches: None,
+    };
+    let empty = CredentialEdits::new("alice", "", true, &cfg, Some(&core), None);
+    assert_eq!(
+      empty,
+      CredentialEdits::default(),
+      "an empty field is not an edit"
+    );
+
+    // Typing the value that is already stored is not an edit once the core
+    // confirmed it; typing anything else is.
+    let same = CredentialEdits::new("alice", "pw", true, &cfg, Some(&core), Some(true));
+    assert!(!same.password, "the core said it matches");
+    let other = CredentialEdits::new("alice", "pw", true, &cfg, Some(&core), Some(false));
+    assert!(other.password, "the core said it differs");
+
+    // With nothing stored, any password is a change.
+    let none = CredentialState::default();
+    let typed = CredentialEdits::new("alice", "pw", false, &cfg, Some(&none), None);
+    assert!(typed.password);
   }
 
   /// Toasts used to break over two lines because the area is sized from the
@@ -1686,7 +2093,8 @@ mod tests {
   }
 
   /// The footer is the only place the build date shows, so pin its shape:
-  /// `THUnet <version>` on the left, `Built at YYYY-MM-DD HH:MM:SS +HH:MM` right.
+  /// `THUnet <version>` on the left, `Debug|Release · Built at YYYY-MM-DD HH:MM:SS +HH:MM`
+  /// on the right.
   #[test]
   fn build_stamp_ends_with_a_seconds_precision_local_time() {
     let version = build_version();
@@ -1701,7 +2109,8 @@ mod tests {
     );
 
     let label = build_time_label(crate::i18n::Lang::En.texts());
-    let rest = label.strip_prefix("Built at ").expect(&label);
+    let prefix = format!("{} · Built at ", build_profile());
+    let rest = label.strip_prefix(&prefix).expect(&label);
     let (date, rest) = rest.split_once(' ').expect("date first: {rest}");
     let (clock, offset) = rest.split_once(' ').expect("offset last: {rest}");
     assert_eq!(date.len(), 10, "{label}");
@@ -1813,6 +2222,20 @@ fn red_banner(ui: &mut egui::Ui, text: impl Into<String>) {
     });
 }
 
+/// Draw the status banner on the foreground layer at a fixed offset below the
+/// header. It deliberately does not allocate space: the log pane below it must
+/// keep the same height before, during and after a warning.
+fn banner_overlay(ui: &egui::Ui, text: String) {
+  let rect = ui.max_rect();
+  egui::Area::new(egui::Id::unique("status-banner"))
+    .order(egui::Order::Foreground)
+    .fixed_pos(egui::pos2(rect.left(), rect.top() + 42.0))
+    .show(ui.ctx(), |ui| {
+      ui.set_width(rect.width());
+      red_banner(ui, text);
+    });
+}
+
 impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     // GTK delivers the appindicator menu callbacks through its own event loop,
@@ -1864,27 +2287,67 @@ impl eframe::App for App {
     // task): reconnect instead of going deaf.
     self.ensure_link();
 
-    // Outcome of a Start that ran on the helper thread. Success only starts the
-    // 10 s clock (waiting for the link); a failure is reported right away.
-    while let Ok(result) = self.start_rx.try_recv() {
-      match result {
-        Ok(()) => {
+    // Outcome of a Start/Stop that ran on the helper thread. The tag matters:
+    // a successful Stop has usually already been completed by the link
+    // dropping, and treating its late `Ok` as a Start would arm a bogus
+    // pending request that disables the button forever.
+    while let Ok((request, result)) = self.start_rx.try_recv() {
+      self.push_log(Line::debug(format!(
+        "service: {request:?} helper returned {result:?}"
+      )));
+      match (request, result) {
+        (ServiceRequest::Stop, Ok(())) => {
+          // The link drop in `ensure_link` confirms and toasts it.
+        }
+        (ServiceRequest::Stop, Err(e)) => {
+          if self
+            .service_request
+            .is_some_and(|(r, _)| r == ServiceRequest::Stop)
+          {
+            self.service_request = None;
+            self.push_log(Line::error(format!("service: {e}")));
+            self.toast_err(self.t().service_stop_failed.to_string());
+          } else {
+            // The core is already gone, so the stop did take effect.
+            self.push_log(Line::warn(format!("service: {e} (the core is gone)")));
+          }
+        }
+        (ServiceRequest::Start, Ok(())) => {
           // Do not sit out the reconnect throttle: the new core is usually
           // listening before the next frame.
           self.next_link_try = Instant::now();
           // `ensure_link` ran above, so a core that already answered has
           // cleared the click and toasted "started". Re-arming the watchdog
-          // here would report a failure ten seconds later for a start that
-          // succeeded.
+          // here would report a failure later for a start that succeeded.
           if !self.link.as_ref().is_some_and(Link::alive) {
             self.service_request = Some((ServiceRequest::Start, Instant::now()));
           }
         }
-        Err(e) => {
+        (ServiceRequest::Start, Err(e)) => {
+          let cancelled = e == crate::elevate::CANCELLED;
+          let recovered = self.link.as_ref().is_some_and(|link| {
+            link.alive() && {
+              #[cfg(windows)]
+              {
+                link.is_machine()
+              }
+              #[cfg(not(windows))]
+              {
+                true
+              }
+            }
+          });
           self.service_request = None;
+          self.pending_credentials = None;
           self.push_log(Line::error(format!("service: {e}")));
-          let msg = self.t().service_start_failed.to_string();
-          self.toast_err(msg);
+          if !recovered {
+            let msg = if cancelled {
+              self.t().admin_cancelled.to_string()
+            } else {
+              self.t().service_start_failed.to_string()
+            };
+            self.toast_err(msg);
+          }
         }
       }
     }
@@ -1895,9 +2358,16 @@ impl eframe::App for App {
       && at.elapsed() > SERVICE_REQUEST_TIMEOUT
     {
       self.service_request = None;
+      self.pending_credentials = None;
       let log = match request {
-        ServiceRequest::Start => "service: no core answered after 10 s",
-        ServiceRequest::Stop => "service: the core is still running after 10 s",
+        ServiceRequest::Start => format!(
+          "service: no core answered after {} s",
+          SERVICE_REQUEST_TIMEOUT.as_secs()
+        ),
+        ServiceRequest::Stop => format!(
+          "service: the core is still running after {} s",
+          SERVICE_REQUEST_TIMEOUT.as_secs()
+        ),
       };
       self.push_log(Line::warn(log));
       let msg = match request {
@@ -1907,6 +2377,10 @@ impl eframe::App for App {
       .to_string();
       self.toast_err(msg);
     }
+
+    // Verify a typed password against the core's copy once typing pauses, so
+    // re-entering the saved value does not look like an unsaved edit.
+    self.check_typed_password();
 
     // Ask the service about itself now and then; the row it fills is advisory,
     // so a slow cadence is plenty.
@@ -2051,7 +2525,16 @@ fn should_restart(core_epoch: u64, own_epoch: u64, file_changed: bool) -> bool {
 
 /// Right half of the settings footer: what the build time actually is.
 fn build_time_label(t: &Texts) -> String {
-  format!("{} {}", t.built, build_time())
+  format!("{} · {} {}", build_profile(), t.built, build_time())
+}
+
+/// `Debug` or `Release`, from the profile Cargo used for this build.
+fn build_profile() -> &'static str {
+  match env!("THUNET_PROFILE") {
+    "debug" => "Debug",
+    "release" => "Release",
+    other => other,
+  }
 }
 
 /// Floating feedback strip so both "copied" and "saved" are visible

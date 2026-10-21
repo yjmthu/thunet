@@ -24,6 +24,7 @@ _thunet() {
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -50,6 +51,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -67,6 +69,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -84,6 +87,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -101,6 +105,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -118,6 +123,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -135,7 +141,9 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--service[Started by the Windows service manager; not for humans]' \
+'--machine[Run against the machine-wide state directory and endpoint. The Linux system unit passes this; a user-run core stays portable]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -153,6 +161,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -178,6 +187,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -203,6 +213,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -220,6 +231,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -237,6 +249,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help]' \
@@ -254,6 +267,7 @@ _arguments "${_arguments_options[@]}" : \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '-h[Print help (see more with '\''--help'\'')]' \

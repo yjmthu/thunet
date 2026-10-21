@@ -118,8 +118,22 @@
         <Directory Id="BINDIR" Name="bin" />
       </Directory>
     </StandardDirectory>
-    <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="AppMenuFolder" Name="THUnet" />
+    <!-- The machine-wide Start Menu (`%ProgramData%`). WiX v5 has no
+         `CommonProgramMenuFolder` standard directory, so the path is spelled
+         out under `CommonAppDataFolder`; using `ProgramMenuFolder` instead
+         would resolve to the profile of whoever ran the installer, which on a
+         per-machine package leaves a second, user-only copy next to the real
+         one. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="StartMenuMicrosoft" Name="Microsoft">
+        <Directory Id="StartMenuWindows" Name="Windows">
+          <Directory Id="StartMenuRoot" Name="Start Menu">
+            <Directory Id="StartMenuPrograms" Name="Programs">
+              <Directory Id="AppMenuFolder" Name="THUnet" />
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
     </StandardDirectory>
     <StandardDirectory Id="DesktopFolder" />
 
@@ -129,7 +143,7 @@
 
     <ComponentGroup Id="Binaries" Directory="BINDIR">
       <Component Id="MainExe" Guid="A0B2A2A3-1B5D-4A6E-8F10-5C1E2D3F4A5B">
-        <File Id="THUnetExe" Source="target/release/thunet.exe" KeyPath="yes">
+        <File Id="THUnetExe" Source="$(var.BinPath)" KeyPath="yes">
           <Shortcut Id="StartMenuLnk" Directory="AppMenuFolder" Name="THUnet"
                     Description="THUnet campus network client"
                     WorkingDirectory="BINDIR" Icon="AppIcon" />

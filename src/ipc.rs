@@ -6,14 +6,15 @@
 //!
 //! The endpoint is per machine, not per account:
 //!
-//! * Linux/BSD: `$XDG_RUNTIME_DIR/thunet/control.sock` (mode 0700 directory,
-//!   so no other account can talk to it),
-//! * Windows: named pipe `\\.\pipe\thunet-control`, whose DACL grants SYSTEM,
-//!   administrators and the interactive users — the core runs as SYSTEM (it is
-//!   a service, so it can start before anybody logs on) while the window runs
-//!   in the user's session.
+//! * Linux: abstract socket `@thunet-control` in machine mode (any local uid
+//!   can connect; `SO_PEERCRED` is checked), or
+//!   `$XDG_RUNTIME_DIR/thunet/control.sock` (mode 0700) in portable mode,
+//! * Windows: named pipe `\\.\pipe\thunet-control`, whose DACL grants the
+//!   service account, administrators and interactive users, while the window
+//!   runs in the user's session. The client checks the pipe's owner SID, so a
+//!   user-run process cannot impersonate the service.
 //!
-//! `interprocess` covers the Unix socket; on Windows the pipe is created through
+//! `interprocess` covers the socket/pipe; on Windows the pipe is created through
 //! the same crate's named-pipe API, which takes the security descriptor.
 
 use std::collections::VecDeque;
@@ -25,7 +26,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use interprocess::local_socket::prelude::*;
 #[cfg(unix)]
-use interprocess::local_socket::{ConnectOptions, ListenerOptions, Name};
+use interprocess::local_socket::{
+  ConnectOptions, GenericFilePath, GenericNamespaced, ListenerOptions, Name, ToFsName, ToNsName,
+};
 #[cfg(windows)]
 use interprocess::os::windows::named_pipe::{
   PipeListener, PipeListenerOptions, PipeStream, pipe_mode::Bytes,
@@ -33,6 +36,9 @@ use interprocess::os::windows::named_pipe::{
 
 use crate::config::Config;
 use crate::proto::{Cmd, Ev, Msg, VERSION, Wire};
+
+/// Whether this process serves the machine-wide endpoint. Set by [`serve`].
+static MACHINE: AtomicBool = AtomicBool::new(false);
 
 /// How many recent events a frontend that connects late gets to see. Enough to
 /// fill the log pane (which shows a handful of lines) without growing forever.
@@ -75,7 +81,13 @@ impl Duplex for Stream {
 }
 
 #[cfg(unix)]
-fn endpoint() -> String {
+fn endpoint(machine: bool) -> String {
+  if machine {
+    // Global in the network namespace, like a Windows named pipe. No
+    // filesystem node, so no per-user directory permissions are involved; the
+    // peer check in `attach` is what authorizes the client.
+    return "@thunet-control".into();
+  }
   use std::os::unix::fs::PermissionsExt as _;
 
   let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -90,36 +102,55 @@ fn endpoint() -> String {
 }
 
 #[cfg(windows)]
-fn endpoint() -> String {
-  // One name for the whole machine: the core is a service running as SYSTEM in
-  // session 0, so an account-suffixed name could never be reached from the
-  // window. Who may connect is decided by the pipe's DACL, not by the name.
-  "thunet-control".into()
+fn endpoint(machine: bool) -> String {
+  if machine {
+    // One name for the whole machine: the core is a service running as SYSTEM
+    // in session 0, so an account-suffixed name could never be reached from the
+    // window. Who may connect is decided by the pipe's DACL, not by the name.
+    return "thunet-control".into();
+  }
+  // A portable core is owned by the user who started it. Give it its own name:
+  // sharing the machine pipe would let it answer frontends while the service is
+  // stopped, and then `sc stop` would look like it did nothing.
+  format!("thunet-control-{}", user_tag())
+}
+
+fn user_tag() -> String {
+  let raw = std::env::var("USER")
+    .or_else(|_| std::env::var("LOGNAME"))
+    .or_else(|_| std::env::var("USERNAME"))
+    .unwrap_or_else(|_| "user".into());
+  let tag: String = raw
+    .chars()
+    .map(|c| {
+      if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+        c
+      } else {
+        '_'
+      }
+    })
+    .collect();
+  if tag.is_empty() { "user".into() } else { tag }
 }
 
 /// Where frontends connect; shown by `thunet status`.
 pub fn endpoint_path() -> String {
   #[cfg(windows)]
   {
-    format!(r"\\.\pipe\{}", endpoint())
+    format!(r"\\.\pipe\{}", endpoint(MACHINE.load(Ordering::Relaxed)))
   }
   #[cfg(unix)]
   {
-    endpoint()
+    endpoint(MACHINE.load(Ordering::Relaxed))
   }
-}
-
-#[cfg(unix)]
-fn user_tag() -> String {
-  std::env::var("USER")
-    .or_else(|_| std::env::var("LOGNAME"))
-    .unwrap_or_else(|_| "user".into())
 }
 
 #[cfg(unix)]
 fn name(path: &str) -> std::io::Result<Name<'_>> {
-  use interprocess::local_socket::GenericFilePath;
-  path.to_fs_name::<GenericFilePath>()
+  match path.strip_prefix('@') {
+    Some(ns) => ns.to_ns_name::<GenericNamespaced>(),
+    None => path.to_fs_name::<GenericFilePath>(),
+  }
 }
 
 // --------------------------------------------------------------------- hub
@@ -159,7 +190,7 @@ impl Hub {
       Ev::Log(line) => crate::diag::line(&line.render()),
       // Replies to one-off requests belong to the client that asked; they are
       // not part of the state a late frontend needs.
-      Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::AcId(_) => {}
+      Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::Credentials(_) | Ev::AcId(_) => {}
     }
     // Only log lines are replayed: a toast belongs to the action that raised
     // it, and replaying one to a fresh frontend would look like news.
@@ -241,15 +272,25 @@ enum BindError {
 }
 
 /// Run the core: bind the endpoint, then drive the session loop forever.
-pub fn serve(cfg: Config) -> Result<Serve, String> {
-  let path = endpoint();
-  let listener = match bind(&path) {
+///
+/// `machine` selects the machine-wide endpoint and requires the process to run
+/// as the service identity. A user-run core stays on its per-user endpoint.
+pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
+  if machine && !crate::ident::is_current_service() {
+    return Err(
+      "refusing machine mode: this process is not running as the THUnet service account".into(),
+    );
+  }
+  MACHINE.store(machine, Ordering::Relaxed);
+  let path = endpoint(machine);
+  let listener = match bind(&path, machine) {
     Ok(listener) => listener,
     Err(BindError::InUse) => return Ok(Serve::AlreadyRunning),
     Err(BindError::Other(e)) => return Err(e),
   };
+  crate::diag::line(&format!("core: listening on {path} (machine={machine})"));
   #[cfg(unix)]
-  {
+  if !path.starts_with('@') {
     // The directory is already 0700; this is belt and braces for a fallback
     // directory that happened to be world-readable.
     use std::os::unix::fs::PermissionsExt as _;
@@ -264,30 +305,105 @@ pub fn serve(cfg: Config) -> Result<Serve, String> {
   // reader and writer thread so a stalled frontend cannot block the others.
   for stream in listener.incoming() {
     match stream {
-      Ok(stream) => attach(stream, cmd_tx.clone(), hub.clone()),
-      Err(_) => continue,
+      Ok(stream) => {
+        #[cfg(windows)]
+        {
+          let cmds = cmd_tx.clone();
+          let hub = hub.clone();
+          // Impersonation only works after the server has read from the pipe,
+          // so reading the first line happens in this connection's own thread
+          // (a silent client must not block the accept loop).
+          std::thread::spawn(move || handle_windows_connection(stream, cmds, hub));
+        }
+        #[cfg(unix)]
+        {
+          let peer = peer_of(&stream);
+          crate::diag::line(&format!(
+            "core: accepted connection from {} (interactive={})",
+            peer.label, peer.interactive
+          ));
+          if !peer.interactive {
+            // Fail closed, but tell the frontend why instead of letting it
+            // reconnect every two seconds with no explanation.
+            let (_, mut out) = stream.halves();
+            let line = Wire::ev(Ev::Log(crate::logline::Line::warn(format!(
+              "core rejected frontend: {}",
+              peer.label
+            ))));
+            let _ = write_line(&mut BufWriter::new(&mut out), &line);
+            crate::diag::line(&format!("core: rejected frontend {}", peer.label));
+            continue;
+          }
+          attach(stream, peer, cmd_tx.clone(), hub.clone(), String::new());
+        }
+      }
+      Err(e) => {
+        crate::diag::line(&format!("core: accept failed: {e}"));
+        continue;
+      }
     }
   }
   Ok(Serve::Started)
 }
 
-/// End the core process from [`crate::core::worker`], in response to
-/// [`Cmd::Shutdown`].
+/// Read one newline-terminated line without consuming bytes past it.
 ///
-/// The accept loop on the main thread would otherwise keep the process (and the
-/// endpoint) alive forever, so there is nothing to unwind: unlink the socket — a
-/// named pipe disappears with its process — and exit. `bind` already treats a
-/// socket file left behind as free, so a missed unlink would be harmless too.
-pub fn exit_core() -> ! {
-  #[cfg(windows)]
-  crate::winsvc::report_stopped();
-  #[cfg(unix)]
-  let _ = std::fs::remove_file(endpoint());
-  std::process::exit(0)
+/// `ImpersonateNamedPipeClient` fails with `ERROR_CANNOT_IMPERSONATE` until the
+/// server has read from the pipe, so the identity check has to wait for the
+/// frontend's first command. Reading one byte at a time keeps the rest of the
+/// stream intact for the normal line reader.
+#[cfg(windows)]
+fn read_first_line(stream: &mut Stream) -> Result<String, String> {
+  const MAX: usize = 64 * 1024;
+  let mut bytes = Vec::new();
+  let mut byte = [0u8; 1];
+  loop {
+    match stream.read(&mut byte) {
+      Ok(0) => return Err("connection closed before the first command".into()),
+      Ok(_) if byte[0] == b'\n' => break,
+      Ok(_) if byte[0] != b'\r' => {
+        bytes.push(byte[0]);
+        if bytes.len() > MAX {
+          return Err("first command is too long".into());
+        }
+      }
+      Ok(_) => {}
+      Err(e) => return Err(format!("cannot read the first command: {e}")),
+    }
+  }
+  String::from_utf8(bytes).map_err(|e| format!("first command is not UTF-8: {e}"))
+}
+
+#[cfg(windows)]
+fn handle_windows_connection(mut stream: Stream, cmds: Sender<Cmd>, hub: Hub) {
+  let first = match read_first_line(&mut stream) {
+    Ok(first) => first,
+    Err(e) => {
+      crate::diag::line(&format!("core: {e}"));
+      return;
+    }
+  };
+  let peer = peer_of(&stream);
+  crate::diag::line(&format!(
+    "core: accepted connection from {} (interactive={})",
+    peer.label, peer.interactive
+  ));
+  if !peer.interactive {
+    let line = Wire::ev(Ev::Log(crate::logline::Line::warn(format!(
+      "core rejected frontend: {}",
+      peer.label
+    ))));
+    let mut out = BufWriter::new(&mut stream);
+    let _ = write_line(&mut out, &line);
+    let _ = out.flush();
+    crate::diag::line(&format!("core: rejected frontend {}", peer.label));
+    return;
+  }
+  attach(stream, peer, cmds, hub, first);
 }
 
 #[cfg(unix)]
-fn bind(path: &str) -> Result<Listener, BindError> {
+fn bind(path: &str, _machine: bool) -> Result<Listener, BindError> {
   let create = || -> std::io::Result<Listener> {
     let name = name(path)?;
     ListenerOptions::new().name(name).create_sync()
@@ -295,11 +411,14 @@ fn bind(path: &str) -> Result<Listener, BindError> {
   match create() {
     Ok(listener) => Ok(listener),
     Err(first) => {
-      // A live core answers a probe; a leftover socket file does not.
+      // A live core answers a probe; a leftover socket file does not. Abstract
+      // names have no filesystem node and disappear with their process.
       if connect(path).is_ok() {
         return Err(BindError::InUse);
       }
-      let _ = std::fs::remove_file(path);
+      if !path.starts_with('@') {
+        let _ = std::fs::remove_file(path);
+      }
       create().map_err(|e| {
         BindError::Other(format!(
           "cannot listen on {path}: {e} (first attempt: {first})"
@@ -312,19 +431,43 @@ fn bind(path: &str) -> Result<Listener, BindError> {
 /// Named pipe with an explicit DACL: the core owns the pipe as SYSTEM, whose
 /// default ACL (SYSTEM + administrators) would hide it from the window.
 #[cfg(windows)]
-fn pipe_options(path: &str) -> Result<PipeListenerOptions<'static>, String> {
+fn pipe_sddl(machine: bool) -> Result<String, String> {
+  // SYSTEM and administrators get everything; interactive users may read and
+  // write, which is all a frontend needs to drive the core. A portable core has
+  // no reason to expose itself to other accounts, so its pipe is owner-only.
+  const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+  if machine {
+    let mut sddl = PIPE_SDDL.to_string();
+    // `accept()` creates a new instance for every connection. Creating an
+    // instance requires FILE_CREATE_PIPE_INSTANCE on the existing pipe, so the
+    // service account needs its own ACE; without it the first client connects
+    // but is never accepted, and every later client times out.
+    let service_sids = crate::ident::service_sid_strings();
+    if service_sids.is_empty() {
+      return Err("cannot resolve the service account SID for the machine pipe".into());
+    }
+    for sid in service_sids {
+      sddl.push_str(&format!("(A;;GA;;;{sid})"));
+    }
+    Ok(sddl)
+  } else {
+    let sid = crate::ident::current_user_sid_string()
+      .ok_or("cannot determine the current user SID for the portable pipe")?;
+    Ok(format!("D:(A;;GA;;;{sid})"))
+  }
+}
+
+#[cfg(windows)]
+fn pipe_options(path: &str, machine: bool) -> Result<PipeListenerOptions<'static>, String> {
   use std::borrow::Cow;
 
   use interprocess::os::windows::security_descriptor::SecurityDescriptor;
   use widestring::U16CString;
 
-  // SYSTEM and administrators get everything; interactive users may read and
-  // write, which is all a frontend needs to drive the core.
-  const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
-
+  let sddl = pipe_sddl(machine)?;
   let full =
     U16CString::from_str(format!(r"\\.\pipe\{path}")).map_err(|e| format!("bad pipe name: {e}"))?;
-  let sddl = U16CString::from_str(PIPE_SDDL).map_err(|e| format!("bad pipe DACL: {e}"))?;
+  let sddl = U16CString::from_str(&sddl).map_err(|e| format!("bad pipe DACL: {e}"))?;
   let descriptor =
     SecurityDescriptor::deserialize(sddl.as_ucstr()).map_err(|e| format!("bad pipe DACL: {e}"))?;
 
@@ -335,8 +478,8 @@ fn pipe_options(path: &str) -> Result<PipeListenerOptions<'static>, String> {
 }
 
 #[cfg(windows)]
-fn bind(path: &str) -> Result<Listener, BindError> {
-  let options = pipe_options(path).map_err(BindError::Other)?;
+fn bind(path: &str, machine: bool) -> Result<Listener, BindError> {
+  let options = pipe_options(path, machine).map_err(BindError::Other)?;
   let create = || options.create_duplex::<Bytes>();
   match create() {
     Ok(listener) => Ok(listener),
@@ -373,45 +516,85 @@ fn connect(path: &str) -> Result<Stream, String> {
   PipeStream::<Bytes, Bytes>::connect_by_path(wide.as_ucstr()).map_err(|e| format!("{full}: {e}"))
 }
 
-fn attach(stream: impl Duplex, cmds: Sender<Cmd>, hub: Hub) {
+fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: String) {
   // Subscribe before writing the backlog, so an event published in between
   // arrives exactly once through the channel (the backlog is a snapshot).
   let (events, backlog) = hub.attach();
-  hub.publish(Ev::Log(crate::logline::Line::debug("frontend connected")));
+  crate::diag::line(&format!("core: frontend attached ({})", peer.label));
+  hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+    "core: attached frontend ({})",
+    peer.label
+  ))));
   let (recv_half, send_half) = stream.halves();
 
+  let writer_hub = hub.clone();
+  let writer_label = peer.label.clone();
   std::thread::spawn(move || {
     let mut out = BufWriter::new(send_half);
     for ev in backlog {
-      if write_line(&mut out, &Wire::ev(ev)).is_err() {
+      if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
+        // A window that was closed (or upgraded) takes its pipe with it; that
+        // is the normal end of a frontend, not a failure worth a warning.
+        crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
+        writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+          "core: frontend went away: {e}"
+        ))));
         return;
       }
     }
     for ev in events {
-      if write_line(&mut out, &Wire::ev(ev)).is_err() {
+      if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
+        crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
+        writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+          "core: frontend went away: {e}"
+        ))));
         return;
       }
     }
   });
 
+  let reader_hub = hub.clone();
+  let reader_label = peer.label.clone();
   std::thread::spawn(move || {
-    let mut lines = BufReader::new(recv_half).lines();
-    while let Some(Ok(text)) = lines.next() {
+    let mut initial = first.into_bytes();
+    if !initial.is_empty() {
+      initial.push(b'\n');
+    }
+    let mut lines = BufReader::new(std::io::Cursor::new(initial).chain(recv_half)).lines();
+    loop {
+      let text = match lines.next() {
+        Some(Ok(text)) => text,
+        Some(Err(e)) => {
+          crate::diag::line(&format!("core: reader for {reader_label} failed: {e}"));
+          reader_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+            "core: frontend read failed: {e}"
+          ))));
+          break;
+        }
+        None => {
+          crate::diag::line(&format!("core: frontend {reader_label} disconnected"));
+          break;
+        }
+      };
       if text.trim().is_empty() {
         continue;
       }
       let Ok(wire) = Wire::parse(&text) else {
+        reader_hub.publish(Ev::Log(crate::logline::Line::warn(
+          "core: malformed command from the frontend",
+        )));
         continue;
       };
       match wire.msg {
         Msg::Cmd(cmd) if wire.v == VERSION => {
           if cmds.send(cmd).is_err() {
+            crate::diag::line(&format!("core: worker gone, dropping {reader_label}"));
             return;
           }
         }
         Msg::Cmd(_) => {
           // Do not act on a message we may be reading with the wrong rules.
-          hub.publish(Ev::Log(crate::logline::Line::error(format!(
+          reader_hub.publish(Ev::Log(crate::logline::Line::error(format!(
             "frontend speaks protocol {} but the core speaks {VERSION}; upgrade both halves",
             wire.v
           ))));
@@ -432,27 +615,153 @@ fn write_line(out: &mut impl Write, wire: &Wire) -> std::io::Result<()> {
 
 // ------------------------------------------------------------------ client
 
+/// A connection's peer, reduced to what the policy needs.
+struct Peer {
+  label: String,
+  interactive: bool,
+}
+
+#[cfg(windows)]
+fn peer_of(stream: &Stream) -> Peer {
+  let label = match stream.client_process_id() {
+    Ok(pid) => crate::ident::describe(pid),
+    Err(_) => "unknown".into(),
+  };
+  // The pipe DACL already decides who may connect (INTERACTIVE for the machine
+  // pipe, owner-only for a portable one). Impersonation adds a token check
+  // without opening the client process, which the unprivileged service account
+  // cannot do. A session check is deliberately not used here: an identification
+  // token may report session 0 even for an interactive client, and the DACL is
+  // the real boundary.
+  let (interactive, how) = match stream.impersonate_client() {
+    Ok(guard) => {
+      let sid = crate::ident::current_thread_user_sid();
+      let session = crate::ident::current_thread_session();
+      drop(guard);
+      let sid_text = sid
+        .as_deref()
+        .and_then(crate::ident::sid_to_string)
+        .unwrap_or_else(|| "unknown".into());
+      match (sid, session) {
+        (Some(sid), Some(session)) => {
+          let service = crate::ident::is_service_sid(&sid);
+          (
+            !service && session != 0,
+            format!("impersonated sid={sid_text} session={session}"),
+          )
+        }
+        _ => (
+          false,
+          format!("impersonated sid={sid_text} session={session:?} could not be read"),
+        ),
+      }
+    }
+    Err(e) => (false, format!("impersonation failed: {e}")),
+  };
+  Peer {
+    label: format!("{label} [{how}]"),
+    interactive,
+  }
+}
+
+#[cfg(unix)]
+fn peer_of(stream: &Stream) -> Peer {
+  match stream.peer_creds().ok().and_then(|c| c.euid()) {
+    Some(uid) => Peer {
+      label: crate::ident::describe(uid),
+      interactive: crate::ident::is_interactive(uid),
+    },
+    None => Peer {
+      label: "unknown".into(),
+      interactive: false,
+    },
+  }
+}
+
 /// A running core, as seen from the frontend.
 pub struct Link {
   cmds: Sender<Cmd>,
   events: Receiver<Ev>,
   alive: Arc<AtomicBool>,
+  machine: bool,
+}
+
+#[cfg(windows)]
+fn trusted_stream(stream: Stream, machine: bool) -> Result<Stream, String> {
+  use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
+
+  let handle = match OwnedHandle::try_from(stream) {
+    Ok(handle) => handle,
+    Err(_) => return Err("cannot take ownership of the pipe handle".into()),
+  };
+  let raw = handle.as_raw_handle() as _;
+  // The machine pipe must belong to the service; a portable pipe must belong
+  // to this user. Accepting either owner for both names is what let a user-run
+  // `thunet core` impersonate the service.
+  let trusted = if machine {
+    crate::ident::pipe_owner_is_service(raw)
+  } else {
+    crate::ident::pipe_owner_is_current_user(raw)
+  };
+  if !trusted {
+    let owner = crate::ident::pipe_owner_sid(raw)
+      .as_deref()
+      .and_then(crate::ident::sid_to_string)
+      .unwrap_or_else(|| "unknown".into());
+    return Err(format!(
+      "pipe owner {owner} is not {}",
+      if machine { "the service" } else { "this user" }
+    ));
+  }
+  Stream::try_from(handle).map_err(|_| "cannot reconstruct the pipe stream".into())
+}
+
+#[cfg(unix)]
+fn trusted_stream(stream: Stream, machine: bool) -> Result<Stream, String> {
+  let creds = stream
+    .peer_creds()
+    .map_err(|e| format!("peer_creds: {e}"))?;
+  let uid = creds.euid().ok_or("peer has no effective uid")?;
+  let trusted = if machine {
+    crate::ident::expected_service_uid() == Some(uid)
+  } else {
+    crate::ident::is_current_user(uid)
+  };
+  if trusted {
+    Ok(stream)
+  } else {
+    Err(format!("peer uid {uid} is not trusted for this endpoint"))
+  }
 }
 
 impl Link {
-  /// `None` when no core is listening.
-  pub fn connect() -> Option<Link> {
-    let stream = connect(&endpoint()).ok()?;
+  /// `None` when no core is listening, or when the process behind the endpoint
+  /// is not the trusted core for this mode.
+  #[allow(dead_code)] // kept for tests and callers that do not need a reason
+  pub fn connect(machine: bool) -> Option<Link> {
+    Self::connect_result(machine).ok()
+  }
+
+  /// Like [`Link::connect`], but the refusal reason is preserved for logging.
+  pub fn connect_result(machine: bool) -> Result<Link, String> {
+    let path = endpoint(machine);
+    let stream = connect(&path).map_err(|e| format!("cannot connect to {path}: {e}"))?;
+    let stream = trusted_stream(stream, machine)?;
     let (recv_half, send_half) = stream.halves();
     let alive = Arc::new(AtomicBool::new(true));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (ev_tx, ev_rx) = channel::<Ev>();
 
     let writer_alive = alive.clone();
+    let writer_events = ev_tx.clone();
     std::thread::spawn(move || {
       let mut out = BufWriter::new(send_half);
       for cmd in cmd_rx {
-        if write_line(&mut out, &Wire::cmd(cmd)).is_err() {
+        let wire = Wire::cmd(cmd);
+        if let Err(e) = write_line(&mut out, &wire) {
+          let _ = writer_events.send(Ev::Log(crate::logline::Line::warn(format!(
+            "frontend: cannot send to the core: {e}"
+          ))));
           break;
         }
       }
@@ -462,7 +771,22 @@ impl Link {
     let reader_alive = alive.clone();
     std::thread::spawn(move || {
       let mut lines = BufReader::new(recv_half).lines();
-      while let Some(Ok(text)) = lines.next() {
+      loop {
+        let text = match lines.next() {
+          Some(Ok(text)) => text,
+          Some(Err(e)) => {
+            let _ = ev_tx.send(Ev::Log(crate::logline::Line::warn(format!(
+              "frontend: the core connection failed: {e}"
+            ))));
+            break;
+          }
+          None => {
+            let _ = ev_tx.send(Ev::Log(crate::logline::Line::debug(
+              "frontend: the core closed the connection",
+            )));
+            break;
+          }
+        };
         if text.trim().is_empty() {
           continue;
         }
@@ -491,10 +815,11 @@ impl Link {
       reader_alive.store(false, Ordering::Relaxed);
     });
 
-    Some(Link {
+    Ok(Link {
       cmds: cmd_tx,
       events: ev_rx,
       alive,
+      machine,
     })
   }
 
@@ -510,15 +835,46 @@ impl Link {
   pub fn alive(&self) -> bool {
     self.alive.load(Ordering::Relaxed)
   }
+
+  /// Whether this link goes to the machine service rather than a portable core.
+  pub fn is_machine(&self) -> bool {
+    self.machine
+  }
+}
+
+/// Whether this process serves the machine-wide endpoint.
+pub fn is_machine() -> bool {
+  MACHINE.load(Ordering::Relaxed)
 }
 
 /// Try to reach the core without starting anything.
 ///
 /// This is what a running frontend uses when reconnecting, so a core that was
-/// stopped on purpose (`systemctl --user stop`, `schtasks /End`) stays stopped
-/// instead of being resurrected by the window every two seconds.
+/// stopped on purpose (`systemctl stop`, `sc stop`) stays stopped instead of
+/// being resurrected by the window every two seconds. The machine endpoint is
+/// tried first; the per-user endpoint is the portable fallback.
 pub fn open() -> Option<Link> {
-  Link::connect()
+  open_result().ok()
+}
+
+/// Like [`open`], but reports why neither endpoint answered.
+pub fn open_result() -> Result<Link, String> {
+  #[cfg(windows)]
+  {
+    match Link::connect_result(true) {
+      Ok(link) => Ok(link),
+      Err(machine) => Link::connect_result(false)
+        .map_err(|portable| format!("machine: {machine}; portable: {portable}")),
+    }
+  }
+  #[cfg(unix)]
+  {
+    match Link::connect_result(true) {
+      Ok(link) => Ok(link),
+      Err(machine) => Link::connect_result(false)
+        .map_err(|portable| format!("machine: {machine}; portable: {portable}")),
+    }
+  }
 }
 
 /// Ask for a core without waiting for it to answer.
@@ -529,14 +885,26 @@ pub fn open() -> Option<Link> {
 /// reconnect cadence, and registering a start (`systemctl` / `schtasks`) runs
 /// synchronously, so this is a click-sized call, not a request to poll.
 pub fn start_core() -> Result<(), String> {
-  if crate::autostart::core_managed() {
-    crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)?;
-    Ok(())
-  } else {
-    spawn_core()
+  #[cfg(windows)]
+  {
+    // Windows has one supported core: the service. `Start` also registers it
+    // on first use, so a fresh MSI install never falls back to a user-run
+    // process that would own the machine endpoint.
+    return crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)
+      .map(|_| ());
+  }
+  #[cfg(not(windows))]
+  {
+    if crate::autostart::core_managed() {
+      crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)?;
+      Ok(())
+    } else {
+      spawn_core()
+    }
   }
 }
 
+#[cfg(not(windows))]
 fn spawn_core() -> Result<(), String> {
   let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
   let mut cmd = std::process::Command::new(exe);
@@ -545,13 +913,6 @@ fn spawn_core() -> Result<(), String> {
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
-  #[cfg(windows)]
-  {
-    use std::os::windows::process::CommandExt as _;
-    // No console flash; the binary is GUI-subsystem anyway.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-  }
   cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -563,6 +924,70 @@ mod tests {
   use crate::logline::Line;
   use crate::proto::{LoginEnv, ToastKind};
   use crate::session::State;
+
+  #[test]
+  fn portable_and_machine_endpoints_are_distinct() {
+    assert_ne!(
+      endpoint(true),
+      endpoint(false),
+      "a portable core must not own the machine endpoint"
+    );
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn the_machine_pipe_grants_the_service_create_instance_right() {
+    let sddl = pipe_sddl(true).expect("machine SDDL");
+    for sid in crate::ident::service_sid_strings() {
+      assert!(
+        sddl.contains(&format!("(A;;GA;;;{sid})")),
+        "the service SID must own a full-access ACE: {sddl}"
+      );
+    }
+    // Also prove the composed SDDL is accepted by the pipe API.
+    pipe_options("thunet-test", true).expect("machine pipe options");
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn a_listener_can_serve_more_than_one_client() {
+    use std::borrow::Cow;
+
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
+
+    let name = format!(
+      "thunet-test-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    );
+    let sid = crate::ident::current_user_sid_string().expect("current user SID");
+    let sddl = format!("D:(A;;GA;;;{sid})");
+    let sddl = U16CString::from_str(&sddl).unwrap();
+    let mut options = PipeListenerOptions::new();
+    options.path = Cow::Owned(U16CString::from_str(&format!(r"\\.\pipe\{name}")).unwrap());
+    options.security_descriptor = Some(SecurityDescriptor::deserialize(sddl.as_ucstr()).unwrap());
+    let listener = options.create_duplex::<Bytes>().expect("listener");
+
+    let mut first = connect(&name).expect("first client");
+    let mut accepted = listener.accept().expect("accept first client");
+    // Impersonation requires the server to have read from the pipe first, so
+    // send the same kind of handshake line a real frontend sends.
+    use std::io::Write as _;
+    writeln!(first, "{{\"v\":1}}").expect("handshake write");
+    let line = read_first_line(&mut accepted).expect("handshake read");
+    assert_eq!(line, "{\"v\":1}");
+    let peer = peer_of(&accepted);
+    assert!(peer.interactive, "peer rejected: {}", peer.label);
+    // `accept` creates the next instance; if the DACL denied the server that
+    // right, this second connection would block until it timed out.
+    let second = connect(&name).expect("second client");
+    drop(second);
+    drop(first);
+  }
 
   #[test]
   fn a_late_frontend_gets_the_current_state_and_the_log_tail() {
@@ -615,13 +1040,13 @@ mod tests {
   #[ignore = "binds the live core endpoint; run by hand"]
   fn a_frontend_can_talk_to_a_core() {
     std::thread::spawn(|| {
-      let _ = serve(crate::config::Config::load());
+      let _ = serve(crate::config::Config::load(), false);
     });
 
     let mut link = None;
     for _ in 0..40 {
       std::thread::sleep(Duration::from_millis(100));
-      if let Some(l) = Link::connect() {
+      if let Some(l) = Link::connect(false) {
         link = Some(l);
         break;
       }

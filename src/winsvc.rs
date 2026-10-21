@@ -34,25 +34,14 @@ pub fn run() -> Result<(), String> {
 }
 
 fn service_main(_args: Vec<OsString>) {
+  crate::diag::line("service: service_main entered");
   if let Err(e) = body() {
     crate::diag::line(&format!("service: {e}"));
     std::process::exit(1);
   }
 }
 
-/// The SCM's status handle, kept so a shutdown that starts in the session
-/// worker (`Cmd::Shutdown`) can still report a clean stop.
-static STATUS: std::sync::OnceLock<StatusHandle> = std::sync::OnceLock::new();
-
-struct StatusHandle(windows_service::service_control_handler::ServiceStatusHandle);
-
-// SAFETY: `ServiceStatusHandle` wraps a plain Win32 `SERVICE_STATUS_HANDLE`
-// (a raw pointer, hence neither `Send` nor `Sync` by itself). It is only used
-// through `set_service_status`, which is a thread-safe call on a handle that is
-// valid for the life of the process.
-unsafe impl Send for StatusHandle {}
-unsafe impl Sync for StatusHandle {}
-
+/// A clean stop status, used when the SCM asks the process to exit.
 fn stopped() -> ServiceStatus {
   ServiceStatus {
     service_type: ServiceType::OWN_PROCESS,
@@ -62,13 +51,6 @@ fn stopped() -> ServiceStatus {
     checkpoint: 0,
     wait_hint: Duration::default(),
     process_id: None,
-  }
-}
-
-/// Report a clean stop before the process ends; a no-op outside a service.
-pub fn report_stopped() {
-  if let Some(handle) = STATUS.get() {
-    let _ = handle.0.set_service_status(stopped());
   }
 }
 
@@ -84,6 +66,7 @@ fn body() -> Result<(), String> {
   };
   let status =
     service_control_handler::register(SERVICE_NAME, handler).map_err(|e| e.to_string())?;
+  crate::diag::line("service: control handler registered");
 
   let running = ServiceStatus {
     service_type: ServiceType::OWN_PROCESS,
@@ -97,17 +80,23 @@ fn body() -> Result<(), String> {
   status
     .set_service_status(running)
     .map_err(|e| e.to_string())?;
-  let _ = STATUS.set(StatusHandle(status));
+  crate::diag::line("service: status running");
 
   // There is no stderr in a service, and the interesting part of a boot-time
   // failure happens before anybody can look at it.
   crate::diag::set_file(crate::config::dir().join("core.log"));
+  crate::diag::line(&format!(
+    "service: state dir {}, pid {}",
+    crate::config::dir().display(),
+    std::process::id()
+  ));
 
   // `serve` never returns: it owns the accept loop and the session worker.
   std::thread::spawn(|| {
-    let cfg = crate::config::Config::load();
-    match crate::ipc::serve(cfg) {
-      Ok(crate::ipc::Serve::Started) => {}
+    crate::diag::line("service: starting core serve loop");
+    let cfg = crate::config::Config::load_machine();
+    match crate::ipc::serve(cfg, true) {
+      Ok(crate::ipc::Serve::Started) => crate::diag::line("service: serve returned started"),
       Ok(crate::ipc::Serve::AlreadyRunning) => {
         crate::diag::line("core: another core already owns the control pipe");
       }
@@ -117,6 +106,7 @@ fn body() -> Result<(), String> {
 
   // The SCM only asks us to stop; the session loop has no unwinding to do.
   let _ = stop_rx.recv();
+  crate::diag::line("service: stop requested");
   let _ = status.set_service_status(stopped());
   std::process::exit(0);
 }

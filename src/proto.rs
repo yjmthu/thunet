@@ -1,8 +1,8 @@
 //! Wire protocol between the background core and the window/tray frontend.
 //!
-//! The two processes are the same executable; they talk over a per-user local
-//! socket (a Unix domain socket, or a named pipe on Windows) one JSON document
-//! per line:
+//! The two processes are the same executable; they talk over a machine-wide
+//! local socket (a named pipe on Windows, an abstract Unix socket on Linux; a
+//! per-user endpoint in portable mode), one JSON document per line:
 //!
 //! ```text
 //! {"v":1,"msg":{"t":"cmd","m":"Connect"}}
@@ -34,21 +34,28 @@ pub enum Cmd {
   SetCredentials {
     username: String,
     password: String,
+    /// Persist the pair in the core's state directory. `false` keeps it in
+    /// memory only and removes any stored entry.
+    #[serde(default)]
+    remember: bool,
   },
   SetAutoConnect(bool),
+  /// Ask what credential the core holds without asking for the password
+  /// itself. When `username`/`password` are supplied, the answer also says
+  /// whether they are the stored pair, so a frontend can clear an *Unsaved*
+  /// marker without ever seeing the plaintext.
+  CheckCredentials {
+    username: String,
+    password: String,
+  },
   /// Ask for one status dump (the CLI `status` command).
   Status,
   /// Ask for the core's own status only (no portal query).
   CoreInfo,
   /// Report the access-controller id the core is currently using.
   AcId,
-  /// The frontend wants the core to stop: the status page's *Stop* button was
-  /// used (tray *Quit* deliberately only ends the window). The core ends the
-  /// session itself instead of lingering unseen.
-  ///
-  /// Additive on purpose, so [`VERSION`] stays put: a core built before this
-  /// variant existed skips the line it cannot parse, which is exactly the old
-  /// "keep running" behaviour.
+  /// Ask a portable core to exit. A machine core refuses: stopping the service
+  /// is the service manager's job, not a frontend's.
   Shutdown,
 }
 
@@ -95,11 +102,37 @@ pub struct CoreInfo {
   pub env: LoginEnv,
   pub ac_id: String,
   pub host: String,
+  /// What the core would log in with. The password itself never leaves it.
+  #[serde(default)]
+  pub credential: CredentialState,
   pub auto_connect: bool,
   pub wanted_online: bool,
   pub failures: u32,
   pub frontends: usize,
   pub endpoint: String,
+}
+
+/// What the core holds, without the password itself.
+///
+/// A machine core is the only holder of the sealed credential, so the window
+/// has to be able to tell "saved" from "not saved" (and whether the text in
+/// the field is the stored value) without ever receiving the plaintext. Every
+/// field here is something the core can answer without revealing the secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialState {
+  /// Account the core would log in with.
+  pub username: String,
+  /// A password is in memory, so a login can be attempted right now.
+  pub has_password: bool,
+  /// A sealed copy is on disk, so a restarted core keeps it.
+  pub remembered: bool,
+  /// Increments whenever the pair is replaced; lets a frontend notice an edit
+  /// made by another frontend without seeing the password.
+  pub revision: u64,
+  /// Answer to [`Cmd::CheckCredentials`]: whether the candidate equals the
+  /// stored pair. `None` for an unsolicited state report.
+  #[serde(default)]
+  pub matches: Option<bool>,
 }
 
 /// What the core tells the frontend.
@@ -122,6 +155,8 @@ pub enum Ev {
   Status(Value),
   /// Answer to [`Cmd::CoreInfo`].
   Core(CoreInfo),
+  /// Answer to [`Cmd::CheckCredentials`] and to every [`Cmd::SetCredentials`].
+  Credentials(CredentialState),
   /// Answer to [`Cmd::AcId`].
   AcId(String),
 }
@@ -176,30 +211,23 @@ mod tests {
     let wire = Wire::cmd(Cmd::SetCredentials {
       username: "alice".into(),
       password: "secret".into(),
+      remember: true,
     });
     let text = wire.line().unwrap();
     assert!(!text.contains('\n') || text.ends_with('\n'));
     assert!(text.starts_with("{\"v\":1,"), "{text}");
     match Wire::parse(text.trim_end()).unwrap().msg {
-      Msg::Cmd(Cmd::SetCredentials { username, password }) => {
+      Msg::Cmd(Cmd::SetCredentials {
+        username,
+        password,
+        remember,
+      }) => {
         assert_eq!(username, "alice");
         assert_eq!(password, "secret");
+        assert!(remember);
       }
       other => panic!("wrong variant: {other:?}"),
     }
-  }
-
-  #[test]
-  fn shutdown_is_a_plain_command_older_cores_skip() {
-    let text = Wire::cmd(Cmd::Shutdown).line().unwrap();
-    assert_eq!(
-      text.trim_end(),
-      r#"{"v":1,"msg":{"t":"cmd","m":"Shutdown"}}"#
-    );
-    assert!(matches!(
-      Wire::parse(text.trim_end()).unwrap().msg,
-      Msg::Cmd(Cmd::Shutdown)
-    ));
   }
 
   #[test]
@@ -241,6 +269,13 @@ mod tests {
       env: LoginEnv::Campus,
       ac_id: "169".into(),
       host: "auth4.tsinghua.edu.cn".into(),
+      credential: CredentialState {
+        username: "alice".into(),
+        has_password: true,
+        remembered: true,
+        revision: 3,
+        matches: None,
+      },
       auto_connect: true,
       wanted_online: true,
       failures: 0,
@@ -254,6 +289,27 @@ mod tests {
         assert_eq!(back.ac_id, "169");
         assert_eq!(back.state, State::Online);
         assert_eq!(back.frontends, 1);
+        assert_eq!(back.credential.revision, 3);
+      }
+      other => panic!("wrong variant: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn a_credential_answer_names_no_secret() {
+    let state = CredentialState {
+      username: "alice".into(),
+      has_password: true,
+      remembered: true,
+      revision: 4,
+      matches: Some(true),
+    };
+    let text = Wire::ev(Ev::Credentials(state)).line().unwrap();
+    assert!(!text.contains("hunter2"), "{text}");
+    match Wire::parse(text.trim_end()).unwrap().msg {
+      Msg::Ev(Ev::Credentials(back)) => {
+        assert!(back.has_password && back.remembered);
+        assert_eq!(back.matches, Some(true));
       }
       other => panic!("wrong variant: {other:?}"),
     }

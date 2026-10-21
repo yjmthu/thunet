@@ -101,7 +101,7 @@ _thunet() {
 
     case "${cmd}" in
         thunet)
-            opts="-u -p -h -V --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help --version selftest ac-id status login logout core service service-admin service-resume config shortcut completions help"
+            opts="-u -p -h -V --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help --version selftest ac-id status login logout core service service-admin service-resume config shortcut completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -143,6 +143,10 @@ _thunet() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --admin-error)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -151,7 +155,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__ac__subcmd__id)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -190,6 +194,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -201,7 +209,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__completions)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help bash elvish fish powershell zsh"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -240,6 +248,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -251,7 +263,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__config)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -290,6 +302,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -301,7 +317,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__core)
-            opts="-u -p -h --service --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --service --machine --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -340,6 +356,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -547,7 +567,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__login)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -586,6 +606,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -597,7 +621,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__logout)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -636,6 +660,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -647,7 +675,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__selftest)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -686,6 +714,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -697,7 +729,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help install uninstall enable disable start stop restart status"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -736,6 +768,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -747,7 +783,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__admin)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help install uninstall enable disable start stop restart status"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -786,6 +822,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -797,7 +837,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__resume)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -836,6 +876,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -847,7 +891,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__shortcut)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -886,6 +930,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -897,7 +945,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__status)
-            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --help"
+            opts="-u -p -h --host --http --timeout --username --password --ip --ac-id --minimized --state-dir --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -936,6 +984,10 @@ _thunet() {
                     return 0
                     ;;
                 --state-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --admin-error)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

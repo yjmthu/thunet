@@ -56,8 +56,14 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_System_Console",
+  # `SHELLEXECUTEINFOW` (used by the UAC elevation path) embeds an `HKEY`
+  # field, so windows-sys gates it behind the Registry module.
   "Win32_System_Registry",
+  # `ProcessIdToSessionId`: identify an interactive pipe client without opening
+  # its process, which the unprivileged service account cannot do.
+  "Win32_System_RemoteDesktop",
   "Win32_System_Services",
   "Win32_System_Threading",
   "Win32_UI_Shell",
@@ -71,11 +77,12 @@ windows-service = "0.8"
 # running as the user can talk to a core running as SYSTEM (`ipc.rs`).
 widestring = "1"
 
-# Autostart on Linux (XDG entry) and macOS (LaunchAgent). On Windows the tray
-# is a Task Scheduler logon task and the core is a service, both in
-# `src/autostart.rs`.
+# Autostart on Linux and macOS. On Windows the tray is a per-user Task
+# Scheduler logon task and the core is a service; on Linux the core is a system
+# systemd unit. All of it lives in `src/autostart.rs`.
 [target."cfg(not(windows))".dependencies]
 auto-launch = "0.6.0"
+libc = "0.2"
 
 # `tray-icon` builds its Linux menu with gtk-rs, whose constructors panic unless
 # `gtk::init()` ran first. eframe/winit never initialises GTK, so the app has to
@@ -97,6 +104,7 @@ name = "thunet"
 maintainer = "THUnet contributors"
 section = "net"
 priority = "optional"
+maintainer-scripts = "packaging/debian"
 # libgtk-3 drives the tray; libappindicator is dlopen()ed at startup and
 # panics when absent, so both are hard dependencies. Alternatives cover
 # Debian <= 12 (libgtk-3-0 / libappindicator3-1) and Ubuntu >= 24.04
@@ -108,6 +116,7 @@ SRun portal, keeps the session alive, shows the assigned addresses and traffic,
 and can start with the desktop."""
 assets = [
   ["target/release/thunet", "usr/bin/", "755"],
+  ["assets/thunet.service", "usr/lib/systemd/system/thunet.service", "644"],
   ["assets/thunet.desktop", "usr/share/applications/", "644"],
   ["assets/thunet.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
   ["README.md", "usr/share/doc/thunet/README.md", "644"],

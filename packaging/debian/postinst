@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+  systemctl enable thunet.service || true
+  # Start it now as well; without a stored credential it simply idles.
+  systemctl restart thunet.service || true
+fi
+
+exit 0

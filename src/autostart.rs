@@ -1,22 +1,18 @@
 //! Autostart registration.
 //!
-//! Two things are registered: the window/tray entry, and the background core
-//! that owns the network session (`thunet core`). The core needs no display, so
-//! it is the half that can start before anybody logs in.
+//! Two things are registered: a **machine-wide service** that owns the network
+//! session (`thunet core --machine`), and a **per-user tray** entry. The core
+//! needs no display, so it can start before anybody logs in; the tray starts
+//! with the user's desktop.
 //!
-//! Both platforms call the core entry `thunet` and the frontend `thunet-tray`,
-//! so the mental model is the same everywhere: on Linux that is
-//! `thunet.service` plus `~/.config/autostart/thunet.desktop`, on Windows two
-//! Task Scheduler logon tasks.
+//! Both platforms use the same mental model: the core is `thunet.service` on
+//! Linux and the `thunet` service on Windows, while the frontend is the XDG
+//! autostart file / a per-user Task Scheduler logon task
+//! (`thunet-tray-<user>`).
 //!
-//! Linux and macOS use the `auto-launch` crate (XDG autostart file and
-//! LaunchAgent) for the tray; on Linux the core gets a `systemd --user` unit.
-//! Windows registers **per-user Task Scheduler logon tasks** instead of `Run`
-//! values: the Task Scheduler service fires logon tasks before `explorer.exe`
-//! walks `Run`, so the app is up noticeably earlier. Both tasks run as
-//! `InteractiveToken` + `LeastPrivilege`, i.e. with the user's own token and no
-//! elevation, which is what keeps the credential store and location permission
-//! working.
+//! Service registration, the start type and start/stop need administrator
+//! rights on both platforms; the tray entry is always per user and never needs
+//! elevation.
 
 use std::path::PathBuf;
 
@@ -100,17 +96,23 @@ impl Autostart {
   pub fn set_mode(&self, mode: Mode) -> Result<(), String> {
     // The core half goes first: on Windows it may raise a UAC prompt, and
     // cancelling that must leave the settings exactly as they were.
+    // Enabling or disabling the tray alone never needs elevation once the
+    // machine service is already in the requested state.
     match mode {
       Mode::Off => {
         imp::disable_core()?;
         imp::disable_tray(self)
       }
       Mode::Core => {
-        imp::enable_core(self)?;
+        if !imp::core_starts_at_boot() {
+          imp::enable_core(self)?;
+        }
         imp::disable_tray(self)
       }
       Mode::All => {
-        imp::enable_core(self)?;
+        if !imp::core_starts_at_boot() {
+          imp::enable_core(self)?;
+        }
         imp::enable_tray(self)
       }
     }
@@ -172,16 +174,8 @@ impl Autostart {
 /// (`thunet service-admin <action>`); it must not ask for elevation again, or
 /// the prompt would never end.
 pub fn service_admin(action: ServiceAction) -> Result<(), String> {
-  #[cfg(not(windows))]
-  {
-    let _ = action;
-    Err("this platform has no elevation step".into())
-  }
-  #[cfg(windows)]
-  {
-    let me = Autostart::new(false).ok_or("cannot determine the executable path")?;
-    imp::service_direct(action, &me).map(|_| ())
-  }
+  let me = Autostart::new(false).ok_or("cannot determine the executable path")?;
+  imp::service_direct(action, &me).map(|_| ())
 }
 
 /// Is the core registered with the OS as something that starts on its own?
@@ -212,19 +206,24 @@ mod imp {
 
   /// Service Control Manager key of the background core. The same name as the
   /// Linux unit (`thunet.service`), so the mental model is identical on both
-  /// platforms: `thunet` *is* the service, `thunet-tray` is the frontend.
+  /// platforms: `thunet` *is* the service, `thunet-tray-<user>` is the frontend.
   const CORE_SERVICE: &str = "thunet";
-  /// Task Scheduler location of the window/tray process.
-  const TRAY_TASK: &str = "thunet-tray";
+  /// Virtual service account. It has no profile and no interactive logon; the
+  /// machine state directory is the only place it can write.
+  const SERVICE_ACCOUNT: &str = r"NT SERVICE\thunet";
 
-  /// Service DACL. Interactive users may query, start and stop the core, so
-  /// the status page's buttons never raise a UAC prompt; creating, deleting and
-  /// reconfiguring the service stays administrator-only.
+  /// Base service DACL. Interactive users may only query status; starting,
+  /// stopping and reconfiguring stay administrator-only. The service SID is
+  /// appended at install time.
   const SERVICE_SDDL: &str = concat!(
     "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)",
     "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)",
-    "(A;;CCLCSWRPWPLOCRRC;;;IU)"
+    "(A;;CCLCSWLOCRRC;;;IU)",
+    "(A;;CCLCSWLOCRRC;;;SU)"
   );
+
+  /// The tray task is per user: `thunet-tray-<USERNAME>`. A fixed name would
+  /// let one user's `/Create /F` overwrite another user's entry.
 
   /// Never flash a console window: this binary uses the GUI subsystem.
   const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -236,8 +235,13 @@ mod imp {
   const ALREADY_RUNNING: u32 = 1056;
   const NOT_ACTIVE: u32 = 1062;
 
+  fn tray_task_name() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+    format!("thunet-tray-{}", user.replace('\\', "_"))
+  }
+
   pub fn tray_registered(_a: &Autostart) -> bool {
-    task_exists(TRAY_TASK)
+    task_exists(&tray_task_name())
   }
 
   /// The core is a service: the window asks the SCM to start it instead of
@@ -262,20 +266,20 @@ mod imp {
   }
 
   pub fn enable_tray(a: &Autostart) -> Result<(), String> {
-    register(&a.exe, a.args(), TRAY_TASK)
+    register(&a.exe, a.args(), &tray_task_name())
   }
 
   pub fn disable_tray(_a: &Autostart) -> Result<(), String> {
-    delete_task(TRAY_TASK)
+    delete_task(&tray_task_name())
   }
 
   /// Rewrite the tray task after its command line changed (`--minimized`).
   /// The core entry has no such argument, so it is deliberately left alone.
   pub fn refresh_tray(a: &Autostart) -> Result<(), String> {
-    if !task_exists(TRAY_TASK) {
+    if !task_exists(&tray_task_name()) {
       return Ok(());
     }
-    register(&a.exe, a.args(), TRAY_TASK)
+    register(&a.exe, a.args(), &tray_task_name())
   }
 
   /// Register the core as a boot-time service and keep it running.
@@ -307,10 +311,18 @@ mod imp {
   /// Start the core again after the installer replaced the binary, after
   /// making sure the registration points at the build that was just installed.
   pub fn resume_after_update() -> Result<(), String> {
-    if crate::elevate::is_elevated()
-      && let Some(me) = Autostart::new(false)
-    {
-      sync_image_path(&me)?;
+    if crate::elevate::is_elevated() {
+      if let Some(me) = Autostart::new(false) {
+        sync_image_path(&me)?;
+      }
+      // The package is the one place that always runs elevated after the
+      // files were replaced, so it is also the reliable point to repair the
+      // state-directory ACL. A service registered by an older build may have
+      // been created before the virtual account existed; the directory then
+      // belongs to SYSTEM/Administrators only, and the core can log in but
+      // cannot read `key.bin` or save a credential.
+      ensure_machine_dir()?;
+      harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     }
     if !core_starts_at_boot() {
       return Ok(());
@@ -343,7 +355,7 @@ mod imp {
   /// process may run as a different administrator, whose `%APPDATA%` is not
   /// the one the window writes to.
   fn elevate(action: &str) -> Result<(), String> {
-    let dir = crate::config::dir();
+    let dir = crate::config::machine_dir();
     crate::elevate::run_as_admin(&[
       "service-admin",
       action,
@@ -364,7 +376,7 @@ mod imp {
         // The tray logon task is the other registration this application
         // creates. The installer calls this action on uninstall, and a task
         // that outlives the package would point at a deleted executable.
-        delete_task(TRAY_TASK)?;
+        let _ = delete_task(&tray_task_name());
         Ok("core service and tray autostart removed".into())
       }
       ServiceAction::Enable => {
@@ -376,6 +388,21 @@ mod imp {
         Ok("core no longer starts with the machine".into())
       }
       ServiceAction::Start => {
+        // `Start` is also the first-use path on Windows: a fresh installation
+        // has no service yet, and falling back to a user-run core would let it
+        // own the machine endpoint while looking like the service.
+        if service_open(SERVICE_QUERY_STATUS).is_none() {
+          install(a)?;
+        }
+        // This action runs elevated (see `needs_admin`), and starting is the
+        // moment the core needs the state directory. Re-apply the ACL every
+        // time: an earlier install may have registered the service before the
+        // virtual account existed, so the directory can be readable only by
+        // SYSTEM/Administrators even though the service starts fine. Without
+        // the repair the core can log in but cannot read `key.bin` or save a
+        // credential ("cannot read ... key.bin").
+        ensure_machine_dir()?;
+        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core started".into())
       }
@@ -385,6 +412,8 @@ mod imp {
       }
       ServiceAction::Restart => {
         let _ = stop();
+        ensure_machine_dir()?;
+        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
         start()?;
         Ok("core restarted".into())
       }
@@ -399,6 +428,9 @@ mod imp {
         | ServiceAction::Uninstall
         | ServiceAction::Enable
         | ServiceAction::Disable
+        | ServiceAction::Start
+        | ServiceAction::Stop
+        | ServiceAction::Restart
     )
   }
 
@@ -423,13 +455,27 @@ mod imp {
       ServiceAction::Install => "core registered as a service (start type demand)",
       ServiceAction::Uninstall => "core service and tray autostart removed",
       ServiceAction::Enable => "core starts with the machine",
-      _ => "core no longer starts with the machine",
+      ServiceAction::Disable => "core no longer starts with the machine",
+      ServiceAction::Start => "core started",
+      ServiceAction::Stop => "core stopped",
+      ServiceAction::Restart => "core restarted",
+      ServiceAction::Status => "status",
     }
     .into()
   }
 
   fn enable_direct(a: &Autostart) -> Result<(), String> {
-    install(a)?;
+    // The service may already be registered (for example by a first click on
+    // *Start*). Enabling autostart only needs the start type; re-running the
+    // installer path here would rewrite the DACL and ACLs of a live service
+    // for no reason.
+    if service_open(SERVICE_QUERY_STATUS).is_none() {
+      install(a)?;
+    }
+    // Same repair as *Start*: this runs elevated and the core needs the
+    // directory as soon as it starts at the next logon.
+    ensure_machine_dir()?;
+    harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     sc(&["config", CORE_SERVICE, "start=", "auto"])?;
     Ok(())
   }
@@ -448,49 +494,63 @@ mod imp {
   /// settings and the sealed credential stay where the user's window writes
   /// them.
   fn install(a: &Autostart) -> Result<(), String> {
-    if service_open(SERVICE_QUERY_STATUS).is_some() {
-      return Ok(());
-    }
-    let manager =
-      open_manager(SC_MANAGER_CREATE_SERVICE).ok_or("cannot open the service manager")?;
+    ensure_machine_dir()?;
+    // First close the directory to ordinary users. The service SID does not
+    // exist yet on a clean install; it is added after creation. If that second
+    // step fails, the service simply cannot read the secret (fail closed).
+    harden_machine_dir(None)?;
     let name = wide(CORE_SERVICE);
     let display = wide("THUnet background service");
     let binary = wide(&binary_path(a));
-    // SAFETY: every string outlives the call; the returned handle is closed
-    // below. A null account name means LocalSystem, which is what can start
-    // before anyone logs on.
-    let service = unsafe {
-      CreateServiceW(
-        manager,
-        name.as_ptr(),
-        display.as_ptr(),
-        SERVICE_ALL_ACCESS,
-        SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_DEMAND_START,
-        SERVICE_ERROR_NORMAL,
-        binary.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null_mut(),
-        std::ptr::null(),
-        std::ptr::null(),
-        std::ptr::null(),
-      )
-    };
-    let err = unsafe { GetLastError() };
-    unsafe {
-      CloseServiceHandle(manager);
+    let account = wide(SERVICE_ACCOUNT);
+
+    if service_open(SERVICE_QUERY_STATUS).is_none() {
+      let manager =
+        open_manager(SC_MANAGER_CREATE_SERVICE).ok_or("cannot open the service manager")?;
+      // SAFETY: every string outlives the call; the returned handle is closed
+      // below. The virtual account has no password and no profile.
+      let service = unsafe {
+        CreateServiceW(
+          manager,
+          name.as_ptr(),
+          display.as_ptr(),
+          SERVICE_ALL_ACCESS,
+          SERVICE_WIN32_OWN_PROCESS,
+          SERVICE_DEMAND_START,
+          SERVICE_ERROR_NORMAL,
+          binary.as_ptr(),
+          std::ptr::null(),
+          std::ptr::null_mut(),
+          std::ptr::null(),
+          account.as_ptr(),
+          std::ptr::null(),
+        )
+      };
+      let err = unsafe { GetLastError() };
+      unsafe {
+        CloseServiceHandle(manager);
+      };
+      if service.is_null() {
+        return Err(format!(
+          "cannot create the {CORE_SERVICE} service (error {err})"
+        ));
+      }
+      unsafe {
+        CloseServiceHandle(service);
+      };
+    } else {
+      // The service may already exist but point at an older image; rewrite the
+      // command line, not only on first creation.
+      sc(&["config", CORE_SERVICE, "binPath=", &binary_path(a)])?;
     }
-    if service.is_null() {
-      return Err(format!(
-        "cannot create the {CORE_SERVICE} service (error {err})"
-      ));
-    }
-    unsafe {
-      CloseServiceHandle(service);
-    }
-    // Both are best effort: the service works without them, it is just less
-    // convenient (a UAC prompt per button, no restart after a crash).
-    let _ = sc(&["sdset", CORE_SERVICE, SERVICE_SDDL]);
+
+    // The service SID is created with the service; grant it the service DACL,
+    // then lock the state directory to that SID and Administrators.
+    let _ = sc(&["sidtype", CORE_SERVICE, "unrestricted"]);
+    let _ = sc(&["sdset", CORE_SERVICE, &service_sddl()]);
+    harden_machine_dir(Some(SERVICE_ACCOUNT))?;
+
+    // Best effort: restart after a crash, and describe the service.
     let _ = sc(&[
       "failure",
       CORE_SERVICE,
@@ -505,6 +565,93 @@ mod imp {
       "Keeps the THUNet portal session online, starting with the machine.",
     ]);
     Ok(())
+  }
+
+  /// `%ProgramData%\thunet`, but never with `%ProgramData%`'s inherited
+  /// `Users: read` ACE.
+  fn ensure_machine_dir() -> Result<(), String> {
+    let dir = crate::config::machine_dir();
+    // `%ProgramData%` lets Users create folders; a user could have planted a
+    // junction before the installer ran. Refuse to follow one.
+    if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+      use std::os::windows::fs::MetadataExt as _;
+      const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+      if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!(
+          "{} is a reparse point; refusing to use it for machine state",
+          dir.display()
+        ));
+      }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(())
+  }
+
+  fn harden_machine_dir(service: Option<&str>) -> Result<(), String> {
+    let dir = crate::config::machine_dir();
+    let service_ace = service.map(|name| format!("{name}:(OI)(CI)F"));
+    let mut args = vec![
+      "/inheritance:r",
+      "/grant:r",
+      "*S-1-5-18:(OI)(CI)F",
+      "*S-1-5-32-544:(OI)(CI)F",
+    ];
+    if let Some(ace) = &service_ace {
+      args.push(ace);
+    }
+    args.push("/T");
+    let apply = || {
+      std::process::Command::new(system32("icacls.exe"))
+        .arg(&dir)
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("icacls: {e}"))
+    };
+    let out = apply()?;
+    if out.status.success() {
+      return Ok(());
+    }
+
+    // A previous install (or a service that ran as another account) may have
+    // left files this administrator cannot open for WRITE_DAC. `icacls` then
+    // stops at the first such file. Take ownership of the tree and retry; the
+    // log is disposable, so drop it first if it is the stubborn one.
+    let _ = std::fs::remove_file(dir.join("core.log"));
+    let _ = std::process::Command::new(system32("takeown.exe"))
+      .arg("/F")
+      .arg(&dir)
+      .arg("/R")
+      .arg("/A")
+      .arg("/D")
+      .arg("Y")
+      .creation_flags(CREATE_NO_WINDOW)
+      .output();
+    let retry = apply()?;
+    if retry.status.success() {
+      Ok(())
+    } else {
+      Err(format!(
+        "cannot secure {}: {}",
+        dir.display(),
+        decode(&retry.stderr).trim()
+      ))
+    }
+  }
+
+  fn service_sddl() -> String {
+    match service_sid() {
+      Some(sid) => format!("{SERVICE_SDDL}(A;;GA;;;{sid})"),
+      None => SERVICE_SDDL.to_string(),
+    }
+  }
+
+  fn service_sid() -> Option<String> {
+    let text = decode(&sc_output(&["showsid", CORE_SERVICE]).ok()?.stdout);
+    text
+      .split(|c: char| c.is_whitespace() || c == '=' || c == '[' || c == ']')
+      .find(|t| t.starts_with("S-1-5-80-"))
+      .map(str::to_string)
   }
 
   fn delete() -> Result<(), String> {
@@ -654,7 +801,7 @@ mod imp {
     format!(
       "\"{}\" core --service --state-dir \"{}\"",
       a.exe.display(),
-      crate::config::dir().display()
+      crate::config::machine_dir().display()
     )
   }
 
@@ -776,11 +923,7 @@ mod imp {
   /// `sc.exe`, used for the operations whose Win32 form takes a dozen
   /// arguments (DACL, failure actions, description, start type).
   fn sc(args: &[&str]) -> Result<(), String> {
-    let out = std::process::Command::new(system32("sc.exe"))
-      .args(args)
-      .creation_flags(CREATE_NO_WINDOW)
-      .output()
-      .map_err(|e| format!("sc: {e}"))?;
+    let out = sc_output(args)?;
     if out.status.success() {
       return Ok(());
     }
@@ -790,6 +933,14 @@ mod imp {
     } else {
       err
     })
+  }
+
+  fn sc_output(args: &[&str]) -> Result<std::process::Output, String> {
+    std::process::Command::new(system32("sc.exe"))
+      .args(args)
+      .creation_flags(CREATE_NO_WINDOW)
+      .output()
+      .map_err(|e| format!("sc: {e}"))
   }
 
   fn delete_task(name: &str) -> Result<(), String> {
@@ -999,12 +1150,12 @@ mod imp {
   /// Name of the XDG desktop entry (`auto-launch` writes `thunet.desktop`).
   const APP_NAME: &str = "thunet";
 
-  /// The background core as a systemd *user* unit. It needs no display, so it
-  /// can start with the user manager (`WantedBy=default.target`) and — with
-  /// `loginctl enable-linger` — at boot, before anybody logs in.
+  /// The background core as a systemd **system** unit. It needs no display, so
+  /// it can start with the machine, before anybody logs in, and it is shared by
+  /// every account.
   ///
-  /// Named `thunet.service` so the habitual
-  /// `systemctl --user start|stop|status thunet` works without the suffix.
+  /// Named `thunet.service` so `systemctl start|stop|status thunet` works
+  /// without the suffix.
   const CORE_UNIT: &str = "thunet.service";
 
   fn launcher(a: &Autostart) -> Result<AutoLaunch, String> {
@@ -1023,10 +1174,10 @@ mod imp {
   }
 
   pub fn core_registered() -> bool {
-    unit_enabled()
+    unit_present()
   }
 
-  /// Whether the user manager starts it at login/boot.
+  /// Whether the system manager starts it at boot.
   pub fn core_starts_at_boot() -> bool {
     unit_enabled()
   }
@@ -1041,9 +1192,12 @@ mod imp {
     launcher(a)?.disable().map_err(|e| e.to_string())
   }
 
-  /// Write the unit (if needed) and put it in the boot/login path.
+  /// Write the unit (if needed) and put it in the boot path. Both steps need
+  /// administrator rights; `Autostart::service` elevates before calling this.
   pub fn enable_core(a: &Autostart) -> Result<(), String> {
-    install_unit(a)?;
+    if !unit_present() {
+      install_unit(a)?;
+    }
     enable_unit()
   }
 
@@ -1068,28 +1222,61 @@ mod imp {
     Ok(())
   }
 
-  /// A portable install has no unit, so `thunet service start` would have
-  /// nothing to drive: write it (without enabling autostart) the first time.
-  ///
-  /// macOS has no service manager for the core at all — the LaunchAgent starts
-  /// the tray, and the core is started on demand.
-  pub fn prepare_service(a: &Autostart) -> Result<bool, String> {
-    #[cfg(target_os = "linux")]
-    {
-      if unit_installed() {
-        return Ok(false);
-      }
-      install_unit(a)?;
-      Ok(true)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-      let _ = a;
-      Ok(false)
-    }
+  /// The package ships the unit. A portable install uses
+  /// `thunet service install`, which needs administrator rights.
+  pub fn prepare_service(_a: &Autostart) -> Result<bool, String> {
+    Ok(false)
   }
 
   pub fn service(action: ServiceAction, a: &Autostart) -> Result<String, String> {
+    if needs_admin(action) && !crate::elevate::is_elevated() {
+      elevate(action_name(action))?;
+      return Ok(already_done(action));
+    }
+    service_direct(action, a)
+  }
+
+  fn needs_admin(action: ServiceAction) -> bool {
+    !matches!(action, ServiceAction::Status)
+  }
+
+  fn action_name(action: ServiceAction) -> &'static str {
+    match action {
+      ServiceAction::Install => "install",
+      ServiceAction::Uninstall => "uninstall",
+      ServiceAction::Enable => "enable",
+      ServiceAction::Disable => "disable",
+      ServiceAction::Start => "start",
+      ServiceAction::Stop => "stop",
+      ServiceAction::Restart => "restart",
+      ServiceAction::Status => "status",
+    }
+  }
+
+  fn already_done(action: ServiceAction) -> String {
+    match action {
+      ServiceAction::Install => format!("installed {CORE_UNIT} (not enabled)"),
+      ServiceAction::Uninstall => format!("removed {CORE_UNIT}"),
+      ServiceAction::Enable => "autostart enabled for the core".into(),
+      ServiceAction::Disable => "autostart disabled for the core".into(),
+      ServiceAction::Start => "core started".into(),
+      ServiceAction::Stop => "core stopped".into(),
+      ServiceAction::Restart => "core restarted".into(),
+      ServiceAction::Status => "status".into(),
+    }
+  }
+
+  fn elevate(action: &str) -> Result<(), String> {
+    let dir = crate::config::machine_dir();
+    crate::elevate::run_as_admin(&[
+      "service-admin",
+      action,
+      "--state-dir",
+      &dir.to_string_lossy(),
+    ])
+  }
+
+  pub fn service_direct(action: ServiceAction, a: &Autostart) -> Result<String, String> {
     match action {
       ServiceAction::Install => {
         install_unit(a)?;
@@ -1125,10 +1312,12 @@ mod imp {
 
   #[cfg(target_os = "linux")]
   fn unit_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-      .map(PathBuf::from)
-      .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("systemd").join("user").join(CORE_UNIT))
+    Some(PathBuf::from("/etc/systemd/system").join(CORE_UNIT))
+  }
+
+  #[cfg(target_os = "linux")]
+  fn package_unit_path() -> PathBuf {
+    PathBuf::from("/usr/lib/systemd/system").join(CORE_UNIT)
   }
 
   #[cfg(target_os = "linux")]
@@ -1136,28 +1325,40 @@ mod imp {
     format!(
       "[Unit]\n\
        Description=THUnet campus network client (background core)\n\
-       After=network.target\n\
+       After=network-online.target\n\
+       Wants=network-online.target\n\
        \n\
        [Service]\n\
        Type=simple\n\
-       ExecStart=\"{}\" core\n\
-       Restart=on-failure\n\
+       DynamicUser=yes\n\
+       StateDirectory=thunet\n\
+       StateDirectoryMode=0700\n\
+       UMask=0077\n\
+       ExecStart=\"{}\" core --machine\n\
+       Restart=always\n\
        RestartSec=3\n\
+       NoNewPrivileges=true\n\
+       PrivateTmp=true\n\
+       ProtectHome=true\n\
+       ProtectSystem=strict\n\
+       RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n\
+       CapabilityBoundingSet=\n\
+       LimitCORE=0\n\
        \n\
        [Install]\n\
-       WantedBy=default.target\n",
+       WantedBy=multi-user.target\n",
       a.exe.display()
     )
   }
 
   #[cfg(target_os = "linux")]
-  fn unit_installed() -> bool {
-    unit_path().map(|p| p.exists()).unwrap_or(false)
+  fn unit_present() -> bool {
+    unit_path().is_some_and(|p| p.exists()) || package_unit_path().exists()
   }
 
   #[cfg(target_os = "linux")]
   fn install_unit(a: &Autostart) -> Result<(), String> {
-    let path = unit_path().ok_or("cannot locate ~/.config")?;
+    let path = unit_path().ok_or("cannot locate /etc/systemd/system")?;
     if let Some(dir) = path.parent() {
       std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1178,16 +1379,8 @@ mod imp {
   #[cfg(target_os = "linux")]
   fn enable_unit() -> Result<(), String> {
     // Deliberately not `--now`: this switch is about what happens at the next
-    // boot, exactly like the Windows service start type. The window never
-    // starts a core on its own, so a running session stays a separate,
-    // deliberate *Start* (`thunet service start`).
-    systemctl(&["enable", CORE_UNIT])?;
-    // Best effort: without linger the unit starts at login instead of at boot.
-    // Granting it may need a policy prompt, so a failure is not an error here.
-    let _ = std::process::Command::new("loginctl")
-      .arg("enable-linger")
-      .output();
-    Ok(())
+    // boot, exactly like the Windows service start type.
+    systemctl(&["enable", CORE_UNIT])
   }
 
   #[cfg(target_os = "linux")]
@@ -1208,7 +1401,6 @@ mod imp {
   #[cfg(target_os = "linux")]
   fn systemctl(args: &[&str]) -> Result<(), String> {
     let out = std::process::Command::new("systemctl")
-      .arg("--user")
       .args(args)
       .output()
       .map_err(|e| format!("systemctl: {e}"))?;
@@ -1223,11 +1415,7 @@ mod imp {
   /// unit exits non-zero, which is information rather than an error here.
   #[cfg(target_os = "linux")]
   fn systemctl_output(args: &[&str]) -> String {
-    match std::process::Command::new("systemctl")
-      .arg("--user")
-      .args(args)
-      .output()
-    {
+    match std::process::Command::new("systemctl").args(args).output() {
       Ok(out) => {
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -1235,6 +1423,21 @@ mod imp {
       }
       Err(e) => format!("systemctl: {e}"),
     }
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn unit_present() -> bool {
+    false
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn systemctl(_args: &[&str]) -> Result<(), String> {
+    Err("this platform has no system service manager".into())
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn systemctl_output(_args: &[&str]) -> String {
+    "this platform has no system service manager".into()
   }
 
   /// macOS: there is no service manager for the core (a LaunchAgent has no
@@ -1265,10 +1468,5 @@ mod imp {
   #[cfg(not(target_os = "linux"))]
   fn remove_unit() -> Result<(), String> {
     Ok(())
-  }
-
-  #[cfg(not(target_os = "linux"))]
-  fn systemctl_output(_args: &[&str]) -> String {
-    "no service manager on this platform".into()
   }
 }

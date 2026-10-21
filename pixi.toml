@@ -76,6 +76,13 @@ winget = { cmd = "pwsh -NoProfile -File scripts/winget_manifest.ps1", depends-on
 # `release` is platform specific: only Linux needs the rpath fixup.
 [feature.package.target.win-64.tasks]
 release = "cargo build --release"
+debug = "cargo build"
+# Local debugging: package the debug executable without the release profile's
+# LTO; the settings footer shows `Debug` so the two cannot be confused.
+msi-debug = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1 -BinPath target/debug/thunet.exe -Suffix -debug", depends-on = [
+  "wix-tool",
+  "debug",
+] }
 
 
 [feature.package.target.linux-64.tasks]

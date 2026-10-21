@@ -5,8 +5,8 @@
 //! the outside world through [`crate::ipc`]: commands arrive over a channel,
 //! every event is published to whichever frontends are attached. It never
 //! touches a window, a tray icon or a display server, so the same code runs at
-//! boot (`thunet core` from a systemd user unit or a logon task) with nobody
-//! logged in.
+//! boot (`thunet core` from a systemd system unit or the Windows service) with
+//! nobody logged in.
 
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ fn core_info(
   login_env: &LoginEnv,
   wanted_online: bool,
   frontends: usize,
+  credential: crate::proto::CredentialState,
 ) -> crate::proto::CoreInfo {
   crate::proto::CoreInfo {
     version: env!("CARGO_PKG_VERSION").to_string(),
@@ -60,6 +61,7 @@ fn core_info(
     env: login_env.clone(),
     ac_id: session.cfg().ac_id.clone(),
     host: session.cfg().host.clone(),
+    credential,
     auto_connect: session.cfg().auto_connect,
     wanted_online,
     failures: session.failures,
@@ -68,10 +70,35 @@ fn core_info(
   }
 }
 
+/// What the core holds right now, with no way to read the password back out.
+///
+/// `remembered` is tracked by the worker rather than re-read from disk: it says
+/// whether a sealed copy exists *and* [`Config::remember_password`] asks for it
+/// to be loaded on the next start.
+fn credential_state(
+  session: &Session,
+  remembered: bool,
+  revision: u64,
+  matches: Option<bool>,
+) -> crate::proto::CredentialState {
+  crate::proto::CredentialState {
+    username: session.cfg().username.clone(),
+    has_password: !session.cfg().password.is_empty(),
+    remembered,
+    revision,
+    matches,
+  }
+}
+
 pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
   let keepalive = Duration::from_secs(cfg.keepalive_interval_secs.max(30));
   let mut lang = Lang::from_setting(&cfg.lang);
+  // `load_machine` only fills `password` when `remember_password` is set and a
+  // sealed blob could be opened, so this pair is exactly "the next start will
+  // find a credential".
+  let mut remembered = cfg.remember_password && !cfg.password.is_empty();
+  let mut credential_rev = u64::from(remembered);
   let mut session = Session::new(cfg);
   let has_creds = !session.cfg().username.is_empty() && !session.cfg().password.is_empty();
   let mut want_online = session.cfg().auto_connect && has_creds;
@@ -194,13 +221,77 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         Cmd::SetLang(l) => {
           lang = l;
         }
-        Cmd::SetCredentials { username, password } => {
+        Cmd::SetCredentials {
+          username,
+          password,
+          remember,
+        } => {
+          let before = (
+            session.cfg().username.clone(),
+            session.cfg().password.clone(),
+            session.cfg().remember_password,
+          );
           let ready = !username.is_empty() && !password.is_empty();
-          session.set_credentials(username, password);
+          if ready {
+            session.set_credentials(username.clone(), password.clone());
+          } else if !remember {
+            // An empty form with "remember" still ticked is almost certainly
+            // the window reopening without the password; do not wipe a stored
+            // credential. Unticking the box is the explicit clear.
+            session.set_credentials(String::new(), String::new());
+          }
+          // The sealed blob alone is not enough: the core also has to record
+          // that it wants it read back. Without `remember_password` in its own
+          // `config.json` a restarted core ignores the blob and comes up with
+          // no credential at all (the window would then show an empty, unsaved
+          // password even though Apply had worked).
+          session.cfg_mut().remember_password = remember;
+          let dir = crate::config::dir();
+          match session.cfg().save_to(&dir) {
+            Ok(()) => remembered = remember && !session.cfg().password.is_empty(),
+            Err(e) => {
+              tx.send(Ev::Error(Some(format!("cannot save the credential: {e}"))))
+                .ok();
+            }
+          }
+          let after = (
+            session.cfg().username.clone(),
+            session.cfg().password.clone(),
+            session.cfg().remember_password,
+          );
+          if before != after {
+            credential_rev += 1;
+          }
+          // Answer even when the request was a no-op: the window uses the
+          // reply to learn whether the value it typed is the stored one.
+          tx.send(Ev::Credentials(credential_state(
+            &session,
+            remembered,
+            credential_rev,
+            None,
+          )))
+          .ok();
           if ready && session.cfg().auto_connect && session.state != State::Online {
             want_online = true;
             last_status = Instant::now() - Duration::from_secs(60);
           }
+        }
+        Cmd::CheckCredentials { username, password } => {
+          let matches = if session.cfg().password.is_empty() {
+            None
+          } else {
+            Some(
+              session.cfg().username.trim() == username.trim()
+                && session.cfg().password == password,
+            )
+          };
+          tx.send(Ev::Credentials(credential_state(
+            &session,
+            remembered,
+            credential_rev,
+            matches,
+          )))
+          .ok();
         }
         Cmd::SetAutoConnect(on) => {
           want_online = on;
@@ -212,7 +303,14 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         Cmd::Status => {
           // One dump with both halves: what the core is doing, and what the
           // portal says. A failed portal query still returns the core part.
-          let info = core_info(started, &session, &last_env, want_online, tx.frontends());
+          let info = core_info(
+            started,
+            &session,
+            &last_env,
+            want_online,
+            tx.frontends(),
+            credential_state(&session, remembered, credential_rev, None),
+          );
           let mut dump = serde_json::json!({ "core": info });
           match session.refresh() {
             Ok(v) => dump["portal"] = v,
@@ -225,24 +323,30 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           tx.send(Ev::Status(dump)).ok();
         }
         Cmd::CoreInfo => {
-          let info = core_info(started, &session, &last_env, want_online, tx.frontends());
+          let info = core_info(
+            started,
+            &session,
+            &last_env,
+            want_online,
+            tx.frontends(),
+            credential_state(&session, remembered, credential_rev, None),
+          );
           tx.send(Ev::Core(info)).ok();
         }
         Cmd::AcId => {
           tx.send(Ev::AcId(session.cfg().ac_id.clone())).ok();
         }
         Cmd::Shutdown => {
-          // The user asked for the service to stop (the status page's *Stop*
-          // button; tray *Quit* only ends the window). End the process itself:
-          // the accept loop would otherwise keep the session, its keepalive and
-          // the endpoint alive for nobody. A clean exit is what both service
-          // managers expect — `Restart=on-failure` / `RestartOnFailure` leave
-          // it alone.
-          tx.send(Ev::Log(Line::info(
-            "service stopping at the frontend's request",
-          )))
-          .ok();
-          crate::ipc::exit_core();
+          if crate::ipc::is_machine() {
+            tx.send(Ev::Log(Line::warn(
+              "ignoring Shutdown: the machine core is stopped through the service manager",
+            )))
+            .ok();
+          } else {
+            // A portable core belongs to the user who started it; exiting here
+            // is the same as `systemctl --user stop` / closing its terminal.
+            std::process::exit(0);
+          }
         }
       }
     }

@@ -1,11 +1,10 @@
-//! One-shot administrator elevation (Windows).
+//! One-shot administrator elevation.
 //!
-//! The window never runs elevated. The few operations the Service Control
-//! Manager refuses to an ordinary caller — creating the core service, changing
-//! its start type, deleting it — re-launch this executable with the `runas`
-//! verb, which shows the UAC prompt. The elevated copy performs exactly one SCM
-//! call and exits, so the privilege is held for the length of that call and not
-//! by anything that keeps running.
+//! Windows uses the `runas` verb (UAC); Unix uses `pkexec`, the graphical
+//! counterpart of `sudo`, which talks to the desktop's polkit agent. The window
+//! never runs elevated: the elevated copy performs exactly one service-manager
+//! operation and exits, so the privilege is held for the length of that call
+//! and not by anything that keeps running.
 
 /// Error string returned when the user dismisses the UAC prompt. Callers that
 /// show a message can translate it instead of reporting a failure.
@@ -40,6 +39,30 @@ pub fn is_elevated() -> bool {
   }
 }
 
+/// Where the elevated copy writes its error. It has no console, so the parent
+/// passes this path as `--admin-error` and reads the file after a failure.
+#[cfg(any(windows, unix))]
+fn admin_log() -> std::path::PathBuf {
+  let stamp = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0);
+  std::env::temp_dir().join(format!("thunet-admin-{}-{stamp}.log", std::process::id()))
+}
+
+#[cfg(any(windows, unix))]
+fn helper_failure(code: impl std::fmt::Display, log: &std::path::Path) -> String {
+  let detail = std::fs::read_to_string(log)
+    .ok()
+    .map(|text| text.trim().to_string())
+    .filter(|text| !text.is_empty());
+  let _ = std::fs::remove_file(log);
+  match detail {
+    Some(detail) => format!("the elevated helper failed (exit code {code}): {detail}"),
+    None => format!("the elevated helper failed (exit code {code})"),
+  }
+}
+
 /// Run this executable again as administrator and wait for it to finish.
 ///
 /// `args` are the command-line arguments of the second process, e.g.
@@ -60,9 +83,14 @@ pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
   let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
   let verb = wide("runas");
   let file = wide(&exe.to_string_lossy());
+  let log = admin_log();
+  let log_text = log.to_string_lossy().into_owned();
+  let mut all = args.to_vec();
+  all.push("--admin-error");
+  all.push(&log_text);
   // `lpParameters` is one command line, not an argument vector: a state
   // directory with a space in it has to be quoted or the child sees two.
-  let line = args
+  let line = all
     .iter()
     .map(|a| {
       if a.contains(' ') {
@@ -88,6 +116,7 @@ pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
   unsafe {
     if ShellExecuteExW(&mut info) == 0 {
       let err = GetLastError();
+      let _ = std::fs::remove_file(&log);
       return Err(if err == ERROR_CANCELLED {
         CANCELLED.into()
       } else {
@@ -96,6 +125,7 @@ pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
     }
     if info.hProcess.is_null() {
       // The child was handed off without a handle; nothing left to wait for.
+      let _ = std::fs::remove_file(&log);
       return Ok(());
     }
     WaitForSingleObject(info.hProcess, INFINITE);
@@ -103,9 +133,54 @@ pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
     GetExitCodeProcess(info.hProcess, &mut code);
     CloseHandle(info.hProcess);
     if code == 0 {
+      let _ = std::fs::remove_file(&log);
       Ok(())
     } else {
-      Err(format!("the elevated helper failed (exit code {code})"))
+      Err(helper_failure(code, &log))
+    }
+  }
+}
+
+/// `true` when this process is already root.
+#[cfg(unix)]
+pub fn is_elevated() -> bool {
+  // SAFETY: geteuid has no preconditions.
+  unsafe { libc::geteuid() == 0 }
+}
+
+/// Run this executable through `pkexec` and wait for it to finish.
+///
+/// `pkexec` clears most of the environment, so every argument the elevated half
+/// needs (notably `--state-dir`) has to be on the command line.
+#[cfg(unix)]
+pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
+  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
+  let log = admin_log();
+  let log_text = log.to_string_lossy().into_owned();
+  let status = std::process::Command::new("pkexec")
+    .arg(exe)
+    .args(args)
+    .args(["--admin-error", &log_text])
+    .status()
+    .map_err(|e| format!("pkexec: {e}"))?;
+  match status.code() {
+    Some(0) => {
+      let _ = std::fs::remove_file(&log);
+      Ok(())
+    }
+    // 126: the user dismissed the authentication dialog.
+    Some(126) => {
+      let _ = std::fs::remove_file(&log);
+      Err(CANCELLED.into())
+    }
+    Some(127) => {
+      let _ = std::fs::remove_file(&log);
+      Err("pkexec is not available on this system".into())
+    }
+    Some(code) => Err(helper_failure(code, &log)),
+    None => {
+      let _ = std::fs::remove_file(&log);
+      Err("the elevated helper was terminated".into())
     }
   }
 }

@@ -16,7 +16,12 @@
 #>
 param(
     [string]$Version = "",
-    [string]$Arch = "x64"
+    [string]$Arch = "x64",
+    # Which cargo profile's executable to package. The default is the release
+    # build used by CI; `-BinPath target/debug/thunet.exe -Suffix -debug` makes
+    # a local test package without waiting for LTO.
+    [string]$BinPath = "target/release/thunet.exe",
+    [string]$Suffix = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,11 +42,11 @@ if (-not (Test-Path $wix)) {
 
 $dist = Join-Path $root "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$out = Join-Path $dist "thunet-$Version-$Arch.msi"
+$out = Join-Path $dist "thunet-$Version-$Arch$Suffix.msi"
 
 & $wix build (Join-Path $root "packaging/thunet.wxs") `
     -ext WixToolset.Util.wixext `
-    -d "Version=$Version" -arch $Arch -o $out
+    -d "Version=$Version" -d "BinPath=$BinPath" -arch $Arch -o $out
 if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
 
 Write-Host "built $out"

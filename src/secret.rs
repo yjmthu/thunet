@@ -1,22 +1,24 @@
 //! Credential storage: one sealed blob, identical on every platform.
 //!
-//! The account/password pair is encrypted with ChaCha20-Poly1305 under a key
-//! derived from this machine's identity, and written to `credential.bin` in the
-//! config directory (mode 600). `config.json` never holds the password.
+//! The account/password pair is encrypted with ChaCha20-Poly1305 under a random
+//! per-install key (`key.bin`) and written to `credential.bin` in the machine
+//! state directory (mode 600 / service-only ACL). `config.json` never holds the
+//! password.
 //!
 //! Why not the OS keyrings (Windows Credential Manager, macOS Keychain, Secret
 //! Service)? All three belong to a logged-on interactive user, but the core has
-//! to log in *before* anyone logs in, and it may run under a different account
-//! than the window (a system service, a lingering systemd user manager). A
-//! machine-bound key is the only form that works in all of those cases, and one
-//! code path is easier to keep honest than three.
+//! to log in *before* anyone logs in, and it runs under a different account than
+//! the window (a system service). A machine-scoped random key is the form that
+//! works in all of those cases without a passphrase.
 //!
-//! What this buys: the blob is useless once it leaves this machine (backups,
-//! dotfile repositories, a synced config directory) and never contains
-//! plaintext. What it does not buy: protection from code already running on
-//! this machine — that code can read the same machine identity and decrypt the
-//! blob itself. Only a user-supplied passphrase or a TPM would stop that, and
-//! both cost unattended startup.
+//! What this buys: the blob is useless without `key.bin`, and both files are
+//! readable only by the service account and administrators. What it does not
+//! buy: protection from root/Administrators (they can read the key or the core's
+//! memory), or from a full-disk image that includes the key. Only a
+//! user-supplied passphrase or a TPM would stop those, and both cost unattended
+//! startup.
+//!
+//! There is only one format; a blob whose magic does not match is ignored.
 
 use std::path::Path;
 
@@ -28,12 +30,14 @@ use sha2::{Digest, Sha256};
 /// File magic. Also fed to the AEAD as associated data, so a truncated or
 /// foreign file is rejected instead of decrypted into garbage.
 const MAGIC: &[u8; 8] = b"THUNET-1";
-/// Domain separation: this machine identity must not yield the same key in
-/// some other feature.
+/// Domain separation for the random data key.
 const DOMAIN: &[u8] = b"thunet/credential/v1";
 const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
 /// Sealed credential file in the config directory.
 const CREDENTIAL_FILE: &str = "credential.bin";
+/// Random data key. Lives next to the blob and is protected by the same ACL.
+const KEY_FILE: &str = "key.bin";
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
@@ -41,74 +45,142 @@ struct Entry {
   password: String,
 }
 
-/// Save or overwrite the stored credential.
-pub fn save(username: &str, password: &str) -> Result<(), String> {
-  save_in(&crate::config::dir(), username, password)
-}
-
-/// Load `(username, password)`; `None` when nothing is stored or when the blob
-/// was written by another machine and cannot be opened.
-pub fn load() -> Option<(String, String)> {
-  load_in(&crate::config::dir())
-}
-
-/// Remove the stored credential (best effort).
-pub fn delete() {
-  delete_in(&crate::config::dir())
-}
-
-fn save_in(dir: &Path, username: &str, password: &str) -> Result<(), String> {
-  let id = machine_id().ok_or("cannot identify this machine, refusing to store the password")?;
+pub fn save_in(dir: &Path, username: &str, password: &str) -> Result<(), String> {
   let plain = serde_json::to_vec(&Entry {
     username: username.to_string(),
     password: password.to_string(),
   })
   .map_err(|e| e.to_string())?;
-  let blob = seal(&id, &plain)?;
-
   std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-  let file = dir.join(CREDENTIAL_FILE);
-  std::fs::write(&file, blob).map_err(|e| e.to_string())?;
-  // Still worth setting: other users have no business reading the ciphertext.
+  private_dir(dir)?;
+  let key = data_key(dir)?;
+  let blob = seal(&key, &plain)?;
+  write_atomic(&dir.join(CREDENTIAL_FILE), &blob)
+}
+
+pub fn delete_in(dir: &Path) {
+  let _ = std::fs::remove_file(dir.join(CREDENTIAL_FILE));
+}
+
+pub fn load_in(dir: &Path) -> Option<(String, String)> {
+  let blob = std::fs::read(dir.join(CREDENTIAL_FILE)).ok()?;
+  if !blob.starts_with(MAGIC.as_slice()) {
+    return None;
+  }
+  let plain = unseal(&read_key(dir).ok().flatten()?, &blob)?;
+  let entry: Entry = serde_json::from_slice(&plain).ok()?;
+  Some((entry.username, entry.password))
+}
+
+/// Read `key.bin` without creating it.
+///
+/// `Ok(None)` means "there is no usable key": the file is absent (first save)
+/// or has the wrong length (a truncated write). A permission error is returned
+/// instead of being folded into `None`, so the caller can say *why* the key
+/// could not be used rather than reporting it as missing.
+fn read_key(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, String> {
+  let path = dir.join(KEY_FILE);
+  match std::fs::read(&path) {
+    Ok(bytes) if bytes.len() == KEY_LEN => Ok(Some(bytes.try_into().expect("length checked"))),
+    Ok(_) => Ok(None),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(e) => Err(format!("{}: {e}", path.display())),
+  }
+}
+
+/// Read `key.bin`, creating it if this is the first save. The key is random:
+/// unlike the machine id it is not derivable from public information, so a
+/// copied `credential.bin` alone is useless.
+fn data_key(dir: &Path) -> Result<[u8; KEY_LEN], String> {
+  if let Some(key) = read_key(dir)? {
+    return Ok(key);
+  }
+  let path = dir.join(KEY_FILE);
+  // A wrong-length file is not a key. It may be the remains of an interrupted
+  // first write; the blob it would have opened is unusable either way, so drop
+  // both and start over instead of failing every subsequent save.
+  if path.exists() {
+    std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    delete_in(dir);
+  }
+  let mut key = [0u8; KEY_LEN];
+  getrandom::fill(&mut key).map_err(|e| format!("rng: {e}"))?;
+  std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+  private_dir(dir)?;
+  // `create_new` avoids clobbering a key that appeared in between; if it did,
+  // re-read it so two concurrent first saves use the same key.
+  match write_new(&path, &key) {
+    Ok(()) => Ok(key),
+    Err(e) => read_key(dir)?.ok_or_else(|| format!("cannot create {}: {e}", path.display())),
+  }
+}
+
+fn private_dir(dir: &Path) -> Result<(), String> {
   #[cfg(unix)]
   {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+      .map_err(|e| e.to_string())?;
+  }
+  let _ = dir;
+  Ok(())
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+  let mut options = std::fs::OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.mode(0o600);
+  }
+  let mut file = options.open(path).map_err(|e| e.to_string())?;
+  use std::io::Write as _;
+  file.write_all(bytes).map_err(|e| e.to_string())?;
+  file.sync_all().map_err(|e| e.to_string())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+  let tmp = path.with_extension("tmp");
+  let _ = std::fs::remove_file(&tmp);
+  write_new(&tmp, bytes)?;
+  #[cfg(unix)]
+  std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+  #[cfg(not(unix))]
+  {
+    // Windows refuses to rename over an existing file; Unix replaces it
+    // atomically and keeps the old blob on a crash.
+    let _ = std::fs::remove_file(path);
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
       .map_err(|e| e.to_string())?;
   }
   Ok(())
 }
 
-fn load_in(dir: &Path) -> Option<(String, String)> {
-  let blob = std::fs::read(dir.join(CREDENTIAL_FILE)).ok()?;
-  let plain = unseal(&machine_id()?, &blob)?;
-  let entry: Entry = serde_json::from_slice(&plain).ok()?;
-  Some((entry.username, entry.password))
-}
-
-fn delete_in(dir: &Path) {
-  let _ = std::fs::remove_file(dir.join(CREDENTIAL_FILE));
-}
-
-/// 32-byte key for `identity`, domain-separated from every other use.
-fn derive(identity: &str) -> [u8; 32] {
+/// 32-byte key derived from the random `key.bin` material.
+fn derive(key: &[u8]) -> [u8; 32] {
   let mut h = Sha256::new();
   h.update(DOMAIN);
   h.update([0u8]);
-  h.update(identity.as_bytes());
+  h.update(key);
   h.finalize().into()
 }
 
-fn cipher(identity: &str) -> ChaCha20Poly1305 {
+fn cipher(key: &[u8]) -> ChaCha20Poly1305 {
   // The only failure mode of `new_from_slice` is a wrong key length.
-  ChaCha20Poly1305::new_from_slice(&derive(identity)).expect("32-byte key")
+  ChaCha20Poly1305::new_from_slice(&derive(key)).expect("32-byte key")
 }
 
 /// `MAGIC ‖ nonce ‖ ciphertext`.
-fn seal(identity: &str, plain: &[u8]) -> Result<Vec<u8>, String> {
+fn seal(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, String> {
   let mut nonce = [0u8; NONCE_LEN];
   getrandom::fill(&mut nonce).map_err(|e| format!("rng: {e}"))?;
-  let ct = cipher(identity)
+  let ct = cipher(key)
     .encrypt(
       Nonce::from_slice(&nonce),
       Payload {
@@ -124,10 +196,10 @@ fn seal(identity: &str, plain: &[u8]) -> Result<Vec<u8>, String> {
   Ok(out)
 }
 
-fn unseal(identity: &str, blob: &[u8]) -> Option<Vec<u8>> {
+fn unseal(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
   let rest = blob.strip_prefix(MAGIC.as_slice())?;
   let (nonce, ct) = rest.split_at_checked(NONCE_LEN)?;
-  cipher(identity)
+  cipher(key)
     .decrypt(
       Nonce::from_slice(nonce),
       Payload {
@@ -138,141 +210,77 @@ fn unseal(identity: &str, blob: &[u8]) -> Option<Vec<u8>> {
     .ok()
 }
 
-/// Something stable and machine-specific to derive the key from.
-fn machine_id() -> Option<String> {
-  platform_id().or_else(hostname)
-}
-
-/// Linux keeps a random 128-bit id in a file, Windows keeps the same thing in
-/// the registry; macOS has neither, so `hostname` stands in until a release
-/// actually needs more (IOKit's `IOPlatformUUID` would mean linking IOKit).
-#[cfg(target_os = "linux")]
-fn platform_id() -> Option<String> {
-  first_line(&["/etc/machine-id", "/var/lib/dbus/machine-id"])
-}
-
-#[cfg(windows)]
-fn platform_id() -> Option<String> {
-  registry_string(r"SOFTWARE\Microsoft\Cryptography", "MachineGuid")
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn platform_id() -> Option<String> {
-  None
-}
-
-fn hostname() -> Option<String> {
-  first_line(&["/proc/sys/kernel/hostname", "/etc/hostname"])
-    .or_else(|| std::env::var("COMPUTERNAME").ok())
-    .or_else(|| std::env::var("HOSTNAME").ok())
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-}
-
-/// First non-empty line of the first readable file in `paths`.
-fn first_line(paths: &[&str]) -> Option<String> {
-  for path in paths {
-    let Ok(text) = std::fs::read_to_string(path) else {
-      continue;
-    };
-    if let Some(line) = text.lines().next() {
-      let line = line.trim();
-      if !line.is_empty() {
-        return Some(line.to_string());
-      }
-    }
-  }
-  None
-}
-
-/// Read a `REG_SZ` value from `HKLM\<subkey>`, 64-bit view: a 32-bit build would
-/// otherwise be redirected to `WOW6432Node`, where `MachineGuid` is not
-/// guaranteed to exist.
-#[cfg(windows)]
-fn registry_string(subkey: &str, value: &str) -> Option<String> {
-  use std::mem::{size_of, size_of_val};
-
-  use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, RRF_RT_REG_SZ, RegGetValueW,
-  };
-
-  fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-  }
-
-  let key = wide(subkey);
-  let name = wide(value);
-  let mut buf = [0u16; 128];
-  let mut len = size_of_val(&buf) as u32;
-  // SAFETY: both strings are NUL-terminated and outlive the call; `buf` is
-  // valid for `len` bytes and the call updates `len` to what it wrote.
-  let status = unsafe {
-    RegGetValueW(
-      HKEY_LOCAL_MACHINE,
-      key.as_ptr(),
-      name.as_ptr(),
-      RRF_RT_REG_SZ | KEY_WOW64_64KEY,
-      std::ptr::null_mut(),
-      buf.as_mut_ptr().cast(),
-      &mut len,
-    )
-  };
-  if status != 0 {
-    return None;
-  }
-  let written = (len as usize / size_of::<u16>()).min(buf.len());
-  let text = String::from_utf16_lossy(&buf[..written]);
-  let text = text.trim_end_matches('\0').trim();
-  (!text.is_empty()).then(|| text.to_string())
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
   fn a_sealed_blob_round_trips() {
-    let blob = seal("machine-a", b"hello").unwrap();
-    assert_eq!(unseal("machine-a", &blob).as_deref(), Some(&b"hello"[..]));
+    let key = [7u8; KEY_LEN];
+    let blob = seal(&key, b"hello").unwrap();
+    assert_eq!(unseal(&key, &blob).as_deref(), Some(&b"hello"[..]));
   }
 
   #[test]
-  fn another_machine_cannot_open_it() {
-    let blob = seal("machine-a", b"hello").unwrap();
-    assert!(unseal("machine-b", &blob).is_none());
+  fn another_key_cannot_open_it() {
+    let blob = seal(&[7u8; KEY_LEN], b"hello").unwrap();
+    assert!(unseal(&[8u8; KEY_LEN], &blob).is_none());
   }
 
   #[test]
   fn tampering_and_truncation_are_rejected() {
-    let mut blob = seal("machine-a", b"hello").unwrap();
+    let key = [7u8; KEY_LEN];
+    let mut blob = seal(&key, b"hello").unwrap();
     let last = blob.len() - 1;
     blob[last] ^= 1;
-    assert!(unseal("machine-a", &blob).is_none(), "flipped byte");
+    assert!(unseal(&key, &blob).is_none(), "flipped byte");
 
-    let blob = seal("machine-a", b"hello").unwrap();
+    let blob = seal(&key, b"hello").unwrap();
     for cut in [0, MAGIC.len() - 1, MAGIC.len(), MAGIC.len() + NONCE_LEN - 1] {
-      assert!(unseal("machine-a", &blob[..cut]).is_none(), "cut at {cut}");
+      assert!(unseal(&key, &blob[..cut]).is_none(), "cut at {cut}");
     }
   }
 
   #[test]
+  fn a_blob_with_a_foreign_key_is_ignored() {
+    let dir = scratch("foreign");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(CREDENTIAL_FILE), b"THUNET-1junk").unwrap();
+    std::fs::write(dir.join(KEY_FILE), [7u8; KEY_LEN]).unwrap();
+    assert_eq!(load_in(&dir), None);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn a_truncated_key_is_replaced_instead_of_blocking_saves() {
+    let dir = scratch("badkey");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(KEY_FILE), b"short").unwrap();
+
+    save_in(&dir, "alice", "hunter2").expect("a corrupt key must not block a save");
+    assert_eq!(
+      std::fs::read(dir.join(KEY_FILE)).unwrap().len(),
+      KEY_LEN,
+      "a fresh key is written"
+    );
+    assert_eq!(
+      load_in(&dir),
+      Some(("alice".to_string(), "hunter2".to_string()))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
   fn every_save_uses_a_fresh_nonce() {
-    let a = seal("machine-a", b"same").unwrap();
-    let b = seal("machine-a", b"same").unwrap();
+    let key = [7u8; KEY_LEN];
+    let a = seal(&key, b"same").unwrap();
+    let b = seal(&key, b"same").unwrap();
     assert_ne!(a, b, "a reused nonce would break the cipher");
   }
 
   #[test]
-  fn the_key_depends_on_the_identity() {
-    assert_ne!(derive("machine-a"), derive("machine-b"));
-  }
-
-  #[test]
-  fn this_machine_has_an_identity() {
-    assert!(
-      machine_id().is_some(),
-      "storing a password would be impossible here"
-    );
+  fn the_derived_key_depends_on_the_key_file() {
+    assert_ne!(derive(&[7u8; KEY_LEN]), derive(&[8u8; KEY_LEN]));
   }
 
   /// Scratch directory per test: tests in a crate share one process, so the
@@ -286,41 +294,36 @@ mod tests {
   #[test]
   fn the_stored_file_is_sealed_and_round_trips() {
     let dir = scratch("roundtrip");
-    save_in(&dir, "1234567890", "hunter2").expect("save should succeed");
+    save_in(&dir, "alice", "hunter2").expect("save should succeed");
 
     let file = dir.join(CREDENTIAL_FILE);
     let raw = std::fs::read(&file).expect("the file should exist");
-    assert!(raw.starts_with(MAGIC), "magic prefix");
+    assert!(raw.starts_with(MAGIC), "current magic prefix");
     assert!(
       !raw.windows(7).any(|w| w == b"hunter2"),
       "the password must not be readable in the file"
     );
+    assert!(dir.join(KEY_FILE).exists(), "a random data key is written");
     #[cfg(unix)]
     {
       use std::os::unix::fs::PermissionsExt as _;
       let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
       assert_eq!(mode, 0o600, "only the owner may read the ciphertext");
+      let key_mode = std::fs::metadata(dir.join(KEY_FILE))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+      assert_eq!(key_mode, 0o600, "only the owner may read the key");
     }
 
     assert_eq!(
       load_in(&dir),
-      Some(("1234567890".to_string(), "hunter2".to_string()))
+      Some(("alice".to_string(), "hunter2".to_string()))
     );
 
     delete_in(&dir);
     assert_eq!(load_in(&dir), None, "delete should remove the file");
-    let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  /// A blob from another machine is treated as "nothing stored", which is what
-  /// makes the file safe to copy around and useless when stolen.
-  #[test]
-  fn a_blob_from_another_machine_reads_as_empty() {
-    let dir = scratch("foreign");
-    std::fs::create_dir_all(&dir).unwrap();
-    let blob = seal("some-other-machine", br#"{"username":"u","password":"p"}"#).unwrap();
-    std::fs::write(dir.join(CREDENTIAL_FILE), blob).unwrap();
-    assert_eq!(load_in(&dir), None);
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

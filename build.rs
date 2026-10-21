@@ -13,6 +13,10 @@ fn main() {
     .map(|d| d.as_secs())
     .unwrap_or(0);
   println!("cargo:rustc-env=THUNET_BUILD_EPOCH={epoch}");
+  // Cargo sets `PROFILE` for build scripts (`debug` for `cargo build`, `release`
+  // for `--release`). Stamping it makes it obvious which binary is on screen.
+  let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+  println!("cargo:rustc-env=THUNET_PROFILE={profile}");
 
   #[cfg(windows)]
   {

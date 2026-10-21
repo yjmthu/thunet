@@ -15,6 +15,13 @@ mod windows;
 pub use linux::create_desktop_shortcut;
 #[cfg(windows)]
 pub use windows::create_desktop_shortcut;
+#[cfg(windows)]
+pub use windows::remove_legacy_start_menu;
+
+#[cfg(not(windows))]
+pub fn remove_legacy_start_menu() -> Result<bool, String> {
+  Ok(false)
+}
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn create_desktop_shortcut() -> Result<(), String> {

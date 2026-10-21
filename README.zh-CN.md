@@ -2,14 +2,11 @@
 
 [English](README.md) | **简体中文**
 
-一个跨平台的小托盘程序：登录清华校园网（`auth4.tsinghua.edu.cn`，SRun3K 门户），
-并让连接一直保持在线。
+一个跨平台的小托盘程序：登录清华校园网（`auth4.tsinghua.edu.cn`，SRun3K 门户），并让连接一直保持在线。
 
-只有一个可执行文件，没有运行时依赖，没有控制台窗口，可在 Windows、Linux 和 macOS
-上运行，界面支持中文和英文。
+只有一个可执行文件，没有运行时依赖，没有控制台窗口，可在 Windows、Linux 和 macOS 上运行，界面支持中文和英文。
 
-> **第一次使用？** 直接看 [1. 快速开始](#1-快速开始) —— 只需要 TUNET 账号和密码。
-> 协议细节在文档最后，日常使用完全不需要了解。
+> **第一次使用？** 直接看 [1. 快速开始](#1-快速开始) —— 只需要 TUNET 账号和密码。协议细节在文档最后，日常使用完全不需要了解。
 
 ## 目录
 
@@ -33,14 +30,14 @@
 10. [从源码构建](#10-从源码构建)
 11. [项目结构](#11-项目结构)
 12. [限制与说明](#12-限制与说明)
-13. [许可证](#13-许可证)
+13. [共享机器：多用户设计](#13-共享机器多用户设计)
+14. [许可证](#14-许可证)
 
 ---
 
 ## 1. 快速开始
 
-1. **拿到可执行文件。** 推荐直接用安装包，或者自己构建（见
-   [从源码构建](#10-从源码构建)）：
+1. **拿到可执行文件。** 推荐直接用安装包，或者自己构建（见 [从源码构建](#10-从源码构建)）：
 
    | 系统 | 文件 | 安装方式 |
    | --- | --- | --- |
@@ -48,13 +45,10 @@
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | 其他 Linux | `thunet-<version>-linux-x64.tar.gz` | 解压后运行 `./thunet`（可选 `./thunet shortcut` 生成桌面图标） |
 
-2. **运行。** 从开始菜单 / 应用菜单打开 `THUnet`，或在终端里执行 `thunet`。
-   会弹出一个小窗口，程序做的每件事都会写到窗口底部的日志条里。
+2. **运行。** 从开始菜单 / 应用菜单打开 `THUnet`，或在终端里执行 `thunet`。会弹出一个小窗口，程序做的每件事都会写到窗口底部的日志条里。
 3. **打开设置。** 点窗口右上角的按钮。
-4. **填写账号密码。** 输入 TUNET 账号（例如 `1234567890`）和密码，勾选
-   **记住密码**，再点 **应用**。密码会先用与本机绑定的密钥加密再落盘，绝不会写进设置文件。
-5. **连接。** 回到状态页点 **连接**（如果"连接时自动连接"已经打开，等几秒即可）。
-   标题处的圆点变成绿色就表示在线。
+4. **填写账号密码。** 输入 TUNET 账号（例如 `1234567890`）和密码，勾选 **记住密码**，再点 **应用**。密码会先用随机生成的每安装密钥加密再落盘，绝不会写进设置文件；密钥和密文都由 core 持有，窗口从不读回。
+5. **连接。** 回到状态页点 **连接**（如果"连接时自动连接"已经打开，等几秒即可）。标题处的圆点变成绿色就表示在线。
 
 ## 2. 界面一览
 
@@ -83,15 +77,11 @@
 [2026-10-20 12:56:41] [DEBUG] portal: auth4.tsinghua.edu.cn
 ```
 
-每个级别（`DEBUG`、`INFO`、`WARN`、`ERROR`、`FATAL`）都有自己的颜色。日志正文
-始终是英文 —— 它是给开发者看的诊断信息，因此不跟随*语言*设置；窗口里的其他内容
-都会跟随。日志条显示最新的若干行，可以滚动。
+每个级别（`DEBUG`、`INFO`、`WARN`、`ERROR`、`FATAL`）都有自己的颜色。日志正文始终是英文 —— 它是给开发者看的诊断信息，因此不跟随*语言*设置；窗口里的其他内容都会跟随。日志条显示最新的若干行，可以滚动。
 
-*设置 → 日志级别* 会隐藏低于所选级别的行（`DEBUG` 显示全部，然后是 `INFO`、
-`WARN`、`ERROR`）。隐藏只影响显示：日志并没有被丢弃，把级别调低后还会回来。
+*设置 → 日志级别* 会隐藏低于所选级别的行（`DEBUG` 显示全部，然后是 `INFO`、`WARN`、`ERROR`）。隐藏只影响显示：日志并没有被丢弃，把级别调低后还会回来。
 
-在选中的日志文本上右键可以直接复制到剪贴板。没有选中任何内容时，右键会弹出一个小
-菜单，包含 **复制本行** 和 **全部复制**（两者都只复制当前级别可见的内容）。
+在选中的日志文本上右键可以直接复制到剪贴板。没有选中任何内容时，右键会弹出一个小菜单，包含 **复制本行** 和 **全部复制**（两者都只复制当前级别可见的内容）。
 
 ### 设置页
 
@@ -101,76 +91,48 @@
 
 | 设置项 | 作用 |
 | --- | --- |
-| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——托盘自己不会拉起 core，那样的图标只会一直显示"未运行"。Windows 上这一行是唯一会弹 UAC 的地方：注册或修改服务需要一次管理员授权，启停不需要 |
+| 开机自启 | 三档并列一行：关闭 / 服务 / 服务 + 托盘（见 [7](#7-安装卸载快捷方式)）。不提供"只启动托盘"——托盘自己不会拉起 core，那样的图标只会一直显示"未运行"。两个平台上这一行都需要管理员权限：注册或修改服务、启停服务都是；服务已启用时，只切换托盘部分不需要提权 |
 | 启动时最小化到托盘 | 与上一项相互独立：可以自启但隐藏，也可以手动启动时打开窗口，反之亦然。在"服务"档位下置灰（根本没有托盘要最小化） |
 | 启动时自动连接 | 一检测到可用网络就登录 |
 | 创建桌面快捷方式 | 为当前运行的可执行文件在桌面生成一个启动器（等同于 `thunet shortcut`） |
-| 账号 / 密码 / 记住密码 / 应用 / 还原 | 这是唯一一行不会边输入边保存的设置：内容与已保存值不同时会变成强调色并出现 *未保存* 标记。应用会把密码加密写入 `credential.bin`（不会写进 JSON），并立刻交给正在运行的会话；还原会丢弃修改，恢复已保存的账号、密码和勾选状态（关闭*记住密码*时它是灰的，因为没有可恢复的内容） |
+| 账号 / 密码 / 记住密码 / 应用 / 还原 | 这是唯一一行不会边输入边保存的设置：内容与已保存值不同时会变成强调色并出现 *未保存* 标记。应用会把密码加密写入 `credential.bin`（不会写进 JSON），并立刻交给正在运行的会话；如果服务未运行，应用会先请求启动服务（需要管理员），等服务应答后再写入。窗口之后不再保留副本：密码框会清空，占位文字说明已保存的值会继续生效；重新输入已保存的密码会由 core 比对（`CheckCredentials`），因此不会显示成未保存。还原会丢弃修改，恢复已保存的账号、密码和勾选状态（关闭*记住密码*时它是灰的，因为没有可恢复的内容） |
 | 语言 | 跟随系统（默认）、中文、English |
 | 日志级别 | `DEBUG` / `INFO` / `WARN` / `ERROR`：日志页显示的最低级别（默认 `INFO`，存在 `config.json` 里） |
-| 版本 | 左边是版本号，右边是构建时间（本地时钟，精确到秒，并带 UTC 偏移）；版本号右侧的 GitHub 图标会打开本仓库 |
+| 版本 | 左边是版本号，右边是构建时间（本地时钟，精确到秒，并带 UTC 偏移）；前缀标明这是 `Release` 还是 `Debug` 构建，本地测试包不会和发布包混淆；版本号右侧的 GitHub 图标会打开本仓库 |
 
-三个开关在切换后会用一个提示条确认当前状态（*开机自启：开*），因为页面上没有别的
-东西会随之变化。
+三个开关在切换后会用一个提示条确认当前状态（*开机自启：开*），因为页面上没有别的东西会随之变化。
 
-**连接**用的是后台工作线程持有的密码：启动时是从 `credential.bin` 解出的值（必须保存过*记住
-密码*），之后是最后一次应用的值 —— 在点 **应用** 之前，输入框里的文字不会生效，
-*未保存* 标记提醒的正是这件事。取消*记住密码*并应用会删除已保存的条目，但刚刚输入
-的密码在程序退出前仍然可用。完全没有任何密码时，**连接** 会直接报告这一点，而不是
-向门户发送一次空登录。
+**连接**用的是后台工作线程持有的密码：启动时是从 `credential.bin` 解出的值（必须保存过*记住密码*），之后是最后一次应用的值 —— 在点 **应用** 之前，输入框里的文字不会生效，*未保存* 标记提醒的正是这件事。因为密码只在 core 里，窗口不会把它显示回来：启动时密码框是空的，并带有「已保存，留空则不修改」的提示，*记住密码* 反映的是 core 下次启动是否还会读回这个值。取消*记住密码*并应用会删除已保存的条目，但刚刚输入的密码在程序退出前仍然可用。完全没有任何密码时，**连接** 会直接报告这一点，而不是向门户发送一次空登录。
 
-没有保存密码并不等于离线：客户端无论有没有密码都会向门户查询会话状态，所以已经
-存在的会话（今天建立的，或者本网络里另一台设备建立的）依然会显示为在线，并带有
-账号、地址和流量。
+没有保存密码并不等于离线：客户端无论有没有密码都会向门户查询会话状态，所以已经存在的会话（今天建立的，或者本网络里另一台设备建立的）依然会显示为在线，并带有账号、地址和流量。
 
-构建标记左边是版本，右边是编译这个二进制时的本地时间及其 UTC 偏移
-（`构建于 2026-10-20 19:23:23 +08:00`）。两者都是构建期嵌入的（`build.rs`），
-所以标记永远与正在运行的可执行文件一致 —— 当你拿不准更新有没有生效时很有用。
-时间是按查看者所在时区渲染的，所以同一个二进制在别的时区机器上读出来不一样；
-偏移量说明了当前看到的是哪个时区。
+构建标记左边是版本，右边是编译这个二进制时的本地时间及其 UTC 偏移（`Release · 构建于 2026-10-20 19:23:23 +08:00`）。两者都是构建期嵌入的（`build.rs`），所以标记永远与正在运行的可执行文件一致 —— 当你拿不准更新有没有生效时很有用。时间是按查看者所在时区渲染的，所以同一个二进制在别的时区机器上读出来不一样；偏移量说明了当前看到的是哪个时区。前缀来自编译时的 `PROFILE`，本地调试构建会显示 `Debug`。
 
-**不在校园网内时，连接按钮是灰的。** 登录只有在校园门户后面才能成功，所以客户端
-每隔几秒探测一次网络，在以下情况禁用该按钮（鼠标悬停会给出原因）：机器接在
-`Tsinghua-Secure` 这类 802.1X 网络上、完全没有链路、处在别人的认证门户后面，
-或者已经能直接上网而不需要门户。**刷新** 在任何情况下都可用，**断开** 只看会话
-状态，所以已有会话总能被结束。
+**不在校园网内时，连接按钮是灰的。** 登录只有在校园门户后面才能成功，所以客户端每隔几秒探测一次网络，在以下情况禁用该按钮（鼠标悬停会给出原因）：机器接在 `Tsinghua-Secure` 这类 802.1X 网络上、完全没有链路、处在别人的认证门户后面，或者已经能直接上网而不需要门户。**刷新** 在任何情况下都可用，**断开** 只看会话状态，所以已有会话总能被结束。
 
 ### 托盘图标
 
-**左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。
-区分两者需要固定等 300 ms，所以单击会在该延迟后生效。
+**左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。区分两者需要固定等 300 ms，所以单击会在该延迟后生效。
 
 **右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`退出`。
 
-关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务
-照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或
-`thunet service stop`。
+关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或 `thunet service stop`。
 
 ### 提示消息
 
-每个操作都会在窗口底部用一条彩色消息回应：**绿色**表示成功，**红色**表示失败，
-**蓝色**表示信息，例如"已经在线"、"已复制"，或某个开关刚切换到的状态
-（*开机自启：开*）。没有任何操作是静默成功的。
+每个操作都会在窗口底部用一条彩色消息回应：**绿色**表示成功，**红色**表示失败，**蓝色**表示信息，例如"已经在线"、"已复制"，或某个开关刚切换到的状态（*开机自启：开*）。没有任何操作是静默成功的。
 
 ## 3. 日常操作
 
-**启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它
-右边的 **启动**（或执行 `thunet service start`）。在服务重新应答之前，状态页顶部
-会一直有一条红色横幅说明这一点。**停止** 会结束服务，但窗口保持打开。
+**启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它右边的 **启动**（或执行 `thunet service start`）。Windows 上如果服务还没注册，**启动** 会先注册服务（一次管理员授权），再让 SCM 启动它，不会另起一个用户进程。在服务重新应答之前，状态页顶部会一直有一条红色横幅说明这一点。**停止** 会结束整机服务（便携 core 则通过控制通道退出），但窗口保持打开。
 
-**登录与注销** —— 用状态页的按钮、托盘菜单，或者 `thunet login` / `thunet logout`。
-如果会话已经存在，客户端会直接告诉你，而不是重复认证。
+**登录与注销** —— 用状态页的按钮、托盘菜单，或者 `thunet login` / `thunet logout`。如果会话已经存在，客户端会直接告诉你，而不是重复认证。
 
-**查看地址** —— 在线时 IPv4/IPv6 行每 15 秒自动刷新。点 **复制** 会出现一条确认
-提示。
+**查看地址** —— 在线时 IPv4/IPv6 行每 15 秒自动刷新。点 **复制** 会出现一条确认提示。
 
-**不显示窗口也要保持在线** —— 关掉窗口即可。托盘图标保留，日志继续记录，每 5 分钟
-向校园主页发一次请求来保持会话。
+**不显示窗口也要保持在线** —— 关掉窗口即可。托盘图标保留，日志继续记录，每 5 分钟向校园主页发一次请求来保持会话。
 
-**开机自启** —— 设置 → *开机自启*。如果希望启动时窗口保持隐藏，同时打开
-*启动时最小化到托盘*（自启项随后会带上 `--minimized`）。Windows 上这个开关会
-弹一次管理员授权，因为后台服务必须注册给服务管理器；Linux 上整个过程都在你的
-用户账号内完成。
+**开机自启** —— 设置 → *开机自启*。如果希望启动时窗口保持隐藏，同时打开 *启动时最小化到托盘*（自启项随后会带上 `--minimized`）。两个平台上服务部分都会要求一次管理员授权：后台 core 是整机服务，不是每用户进程。托盘部分是每用户的。
 
 **切换语言** —— 设置 → *语言*。选择会存进配置文件并立即生效。
 
@@ -208,12 +170,9 @@ thunet completions <shell>   # 输出 bash/zsh/fish/elvish/powershell 补全脚�
 thunet selftest              # 注意：真正的测试向量在 `cargo test` 里
 ```
 
-Windows 上 MSI 把可执行文件放在 `C:\Program Files\THUnet\bin`，并把该目录追加到
-系统 `PATH`，所以安装之后新开的终端里可以直接用 `thunet`；`.deb` 装的是
-`/usr/bin/thunet`。
+Windows 上 MSI 把可执行文件放在 `C:\Program Files\THUnet\bin`，并把该目录追加到系统 `PATH`，所以安装之后新开的终端里可以直接用 `thunet`；`.deb` 装的是 `/usr/bin/thunet`。
 
-补全脚本由解析器使用的同一份 `clap` 定义生成，所以每个子命令（含
-`service <action>`）和每个全局参数都能补全：
+补全脚本由解析器使用的同一份 `clap` 定义生成，所以每个子命令（含 `service <action>`）和每个全局参数都能补全：
 
 ```
 thunet completions bash > ~/.local/share/bash-completion/completions/thunet
@@ -221,19 +180,11 @@ thunet completions zsh  > ~/.zfunc/_thunet        # 需配合 fpath=(~/.zfunc $f
 thunet completions fish > ~/.config/fish/completions/thunet.fish
 ```
 
-`.deb` 已经把 bash、zsh、fish 的补全装到 `/usr/share` 下，所以在
-Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
+`.deb` 已经把 bash、zsh、fish 的补全装到 `/usr/share` 下，所以在 Debian/Ubuntu 上 `apt install` 之后无需任何配置即可生效。
 
-窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过本地套接字通信
-（Windows 上是命名管道）。窗口不会自己拉起 core：它来自开机自启、
-`thunet service start`，或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有
-core 这一半能在开机时起——Linux 是 systemd user unit，Windows 是一个真正的
-**服务**，都由设置页的「随系统启动」创建。Windows 上这个开关也是唯一会弹 UAC 的
-地方：注册或修改服务需要管理员权限，之后启停都不需要。
+窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过本地套接字通信（Windows 上是命名管道）。窗口不会自己拉起 core：它来自开机自启、`thunet service start`，或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有 core 这一半能在开机时起——Linux 是 systemd **系统**单元，Windows 是一个真正的 **服务**，都由设置页的「随系统启动」注册。两个平台上注册、启动和停止服务都需要管理员权限。
 
-`status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行
-的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，
-并提示该用哪个命令启动——**绝不会**退回自己去开第二个连接。
+`status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，并提示该用哪个命令启动——**绝不会**退回自己去开第二个连接。
 
 `thunet status` 输出一个对象，两半都在：
 
@@ -242,143 +193,118 @@ core 这一半能在开机时起——Linux 是 systemd user unit，Windows 是�
   "core":   { "version": "0.1.4", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
-              "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
+              "host": "auth4.tsinghua.edu.cn",
+              "credential": { "username": "1234567890", "has_password": true,
+                              "remembered": true, "revision": 2, "matches": null },
+              "auto_connect": true,
               "wanted_online": true, "failures": 0, "frontends": 1,
               "endpoint": "/run/user/1000/thunet/control.sock" },
   "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
 }
 ```
 
-`core` 描述服务自身（`uptime_secs`、`env` 里的网络判定、当前接入的 frontend 数）。
-门户查询失败时 `portal` 为 `null`、原因在 `portal_error` 里，命令以非零退出。
+`core` 描述服务自身（`uptime_secs`、`env` 里的网络判定、当前接入的 frontend 数）。门户查询失败时 `portal` 为 `null`、原因在 `portal_error` 里，命令以非零退出。
 
 在已经运行时再次启动 `thunet` **不会**启动第二个副本：只会把已有窗口带回前台。
 
-全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`-u/--username`、
-`-p/--password`、`--ip <addr>`、`--ac-id <id>`。
+全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`-u/--username`、`-p/--password`、`--ip <addr>`、`--ac-id <id>`。
 
-优先级是 **命令行 > 配置文件 > 凭据存储**。`-u` / `-p` 会在 `login` 时交给服务
-（只在内存里，不落盘），`--host` / `--http` / `--timeout` 则决定 `thunet core`
-连谁：`thunet -u 1234567890 -p secret login`。
+优先级是 **命令行 > 配置文件 > 凭据存储**。`-u` / `-p` 会在 `login` 时交给服务（只在内存里，不落盘），`--host` / `--http` / `--timeout` 则决定 `thunet core` 连谁：`thunet -u 1234567890 -p secret login`。
+
+共享机器上不要把密码放进 `argv`：Linux 的 `/proc/<pid>/cmdline` 对其他用户可读（除非 `hidepid=2`）。用窗口，或者用已保存的凭据执行 `thunet login`。
 
 ## 6. 数据存在哪里
 
-| 系统 | 配置目录 |
-| --- | --- |
-| Windows | `%APPDATA%\thunet\` |
-| macOS | `~/Library/Application Support/thunet/` |
-| Linux | `$XDG_CONFIG_HOME/thunet/`（通常是 `~/.config/thunet/`） |
+现在有两个目录：窗口的每用户偏好，以及 core 的整机状态。
 
-该目录中的文件：
+| | 每用户（窗口） | 整机（core） |
+| --- | --- | --- |
+| Windows | `%APPDATA%\thunet\` | `%ProgramData%\thunet\` |
+| macOS | `~/Library/Application Support/thunet/` | 与每用户相同（无服务） |
+| Linux | `$XDG_CONFIG_HOME/thunet/`（通常是 `~/.config/thunet/`） | `/var/lib/thunet/`，权限 `0700`，属主是服务用户 |
+
+每用户文件：
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 账号、门户主机、开机自启 / 最小化 / 自动连接标志、保活设置、语言。**没有密码** —— 序列化时该字段会被跳过。 |
-| `credential.bin` | 加密保存的账号密码，权限 `0600`；每次应用时重写，拷到别的机器上解不开。 |
-| `crash.log` | 仅在程序 panic 时追加。 |
+| `config.json` | 语言、日志级别、启动时最小化，以及*记住密码*开关的副本。**没有密码** —— 序列化时该字段会被跳过；真正的开关以 core 的副本为准。 |
+| `crash.log` | 仅在窗口 panic 时追加。 |
 
-密码存储在所有平台上只有一套实现：`credential.bin` 里是
-`MAGIC ‖ nonce ‖ 密文`（ChaCha20-Poly1305），权限 `0600`，密钥为
-`SHA-256("thunet/credential/v1" ‖ 0 ‖ 机器标识)`。
+整机文件：
 
-| 系统 | 机器标识来源 |
+| 文件 | 内容 |
 | --- | --- |
-| Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
-| Linux | `/etc/machine-id`（或 `/var/lib/dbus/machine-id`） |
-| macOS | 主机名；将来需要更强的标识再改用 IOKit 的 `IOPlatformUUID` |
+| `config.json` | 账号、门户主机、自动连接、保活设置，以及下次启动是否读回加密凭据。**没有密码。** |
+| `credential.bin` | 加密保存的账号密码，权限 `0600` / 仅服务 ACL。 |
+| `key.bin` | 随机 32 字节数据密钥，权限 `0600` / 仅服务 ACL。 |
+| `core.log` | 后台 core 的诊断日志。 |
 
-用机器密钥的目的就是无人值守启动：核心必须在没人登录时就登录，所以不能要求
-已登录用户来解锁。这也划定了它的边界 —— 文件离开本机（备份、dotfiles 仓库、
-同步的配置目录）就没用，但以你的身份运行的程序能读到同样的机器标识并解密。
-要挡住后者只能靠密码短语或 TPM，而两者都会牺牲无人值守启动。
+密码存储在所有平台上只有一套实现：`credential.bin` 里是 `MAGIC "THUNET-1" ‖ nonce ‖ 密文`（ChaCha20-Poly1305），权限 `0600`，密钥是 `key.bin` 里的**随机 32 字节**，从不由机器标识派生。没有旧格式兼容：magic 不是 `THUNET-1` 的文件一律当作不存在。
 
-删除 `config.json` 会重置所有设置。卸载安装包**不会**删除这个目录，所以重装后账号
-和偏好在；想彻底重来，就删掉这个目录。
+窗口从不打开这两个文件：它发送 `SetCredentials`，只拿回 `{ username, has_password }`。这样每个交互用户都能改共享凭据，却读不到它。
+
+真正起作用的边界是目录 ACL，不是加密：
+
+- Windows：`%ProgramData%\thunet` 使用显式 DACL 并关闭继承，只授予服务 SID、`SYSTEM` 和 Administrators。
+- Linux：`StateDirectory=thunet` 以 `0700` 创建 `/var/lib/thunet`，属主是动态服务用户。
+
+如果整盘镜像把 `key.bin`（以及 Linux 上的 systemd host key）也带走了，仍然可以解密；只有 TPM 绑定密钥或口令能改变这一点。管理员/root 无论如何都能读密钥或 dump core 的内存。
+
+删除每用户目录只会重置窗口偏好；整机目录属于服务，重装后仍在。只有想彻底忘记共享账号时才删它。
 
 ## 7. 安装、卸载、快捷方式
 
-**THUnet 的安装与卸载只由操作系统负责** —— Windows 上是 `.msi`，Debian/Ubuntu 上
-是 `.deb`。程序本身从不复制文件、不写卸载项；它唯一会注册的东西是自启（托盘的
-登录任务、core 的服务），而且只在你主动开启时才注册。没有"为我安装"按钮，
-也没有 `thunet install` 命令。这样每次安装只有一个所有者，不会出现两份注册信息
-争抢同一批文件。
+**THUnet 的安装与卸载只由操作系统负责** —— Windows 上是 `.msi`，Debian/Ubuntu 上是 `.deb`。程序本身从不复制文件、不写卸载项；它唯一会注册的东西是自启（托盘的登录任务、core 的服务），而且只在你主动开启时才注册。没有"为我安装"按钮，也没有 `thunet install` 命令。这样每次安装只有一个所有者，不会出现两份注册信息争抢同一批文件。
 
 | 系统 | 安装后的可执行文件 | 注册信息（由安装包创建） |
 | --- | --- | --- |
-| Windows | `C:\Program Files\THUnet\bin\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、开始菜单里的 `THUnet`、桌面快捷方式，以及追加到系统 `PATH` 的 `C:\Program Files\THUnet\bin` |
-| Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`、`/usr/share/icons/hicolor/scalable/apps/` 下的图标 |
+| Windows | `C:\Program Files\THUnet\bin\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、整机开始菜单里的 `%ProgramData%\Microsoft\Windows\Start Menu\Programs\THUnet`、每用户桌面快捷方式，以及追加到系统 `PATH` 的 `C:\Program Files\THUnet\bin` |
+| Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`、`/usr/share/icons/hicolor/scalable/apps/` 下的图标，均为整机范围 |
 
-MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级
-状态，所以它能在替换文件前停掉 core 服务、卸载时删除它——而每用户的包以普通权限
-运行，两件事都做不到，只能留下一个指向已删除 exe 的服务条目。代价是安装、升级和
-卸载各需一次管理员授权。
+MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级状态，所以它能在替换文件前停掉 core 服务、卸载时删除它——而每用户的包以普通权限运行，两件事都做不到，只能留下一个指向已删除 exe 的服务条目。代价是安装、升级和卸载各需一次管理员授权。开始菜单条目同样是整机的（在 `CommonAppDataFolder` 即 `%ProgramData%` 下逐级写出路径）：WiX 的 `ProgramMenuFolder` 会解析成运行安装程序那个用户的配置目录，每机器安装就会在旁边多出一份只属于该用户的副本。旧安装包留下的用户级文件夹，会在托盘从安装目录启动且整机条目已存在时被清理掉。
 
-设置仍然是**每用户**的（`%APPDATA%\thunet`），服务也仍然由应用在开启自启时自行
-注册，因为它必须指向**你自己的**配置目录。
+窗口偏好是**每用户**的（`%APPDATA%\thunet`），而 core 的账号、门户主机和加密凭据在整机目录（`%ProgramData%\thunet`）。服务由应用在第一次选择服务档位或第一次点状态页的 **启动** 时注册（需要管理员），而不是由 MSI 直接创建；MSI 在升级时会停掉、改写路径并重启它。
 
-程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，
-并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe
-/F`），在真正的卸载时删除服务，然后才删除文件、快捷方式、开始菜单文件夹和安装
-目录。主版本升级同样会停服务，但保留注册，并把注册的镜像路径改到刚装上的可执行
-文件——这样换了安装位置也不会让 SCM 去启动旧路径；托盘登录任务则在下次启动时重写。
+程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe /F`），在真正的卸载时删除服务，然后才删除文件、快捷方式、开始菜单文件夹和安装目录。主版本升级同样会停服务，但保留注册，并把注册的镜像路径改到刚装上的可执行文件——这样换了安装位置也不会让 SCM 去启动旧路径；托盘登录任务则在下次启动时重写。
 
-因为这个 `taskkill` 在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）
-在事务结束后会重新启动程序。启动走的是桌面外壳自己的 `ShellExecute`（WiX util 扩展
-的 `WixUnelevatedShellExec`），托盘拿到的是用户自己的令牌，而不是安装程序的提权令牌；
-早先让它去调用 `explorer.exe`，在部分机器上会弹出资源管理器窗口而不是启动程序。
-静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，
-在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
+因为这个 `taskkill` 在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）在事务结束后会重新启动程序。启动走的是桌面外壳自己的 `ShellExecute`（WiX util 扩展的 `WixUnelevatedShellExec`），托盘拿到的是用户自己的令牌，而不是安装程序的提权令牌；早先让它去调用 `explorer.exe`，在部分机器上会弹出资源管理器窗口而不是启动程序。静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
 
-开机自启**不属于**安装包 —— 程序自己注册条目，状态再直接从系统读回来（不写进
-`config.json`）。条目有两个（托盘、后台服务），模式有三档：
+开机自启的注册按平台分工：Linux 安装包自带并启用 **系统**单元，所以 `apt install` 之后 core 就已存在；Windows 上则在第一次选择服务档位或第一次点 **启动** 时由应用注册服务（需要管理员），托盘条目始终是每用户的。状态都直接从系统读回来，不写进 `config.json`。条目有两个（托盘、后台服务），模式有三档：
 
 | 模式 | Linux | Windows |
 | --- | --- | --- |
 | **关闭** | 不注册任何条目 | 不注册任何条目 |
-| **服务** | 启用 systemd 用户单元 `thunet.service`；配合 `loginctl enable-linger` 可**在登录前**起飞 | `thunet` **服务**（LocalSystem，启动类型 `auto`）：登录界面出现前就已在线，没有托盘图标 |
-| **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 该服务 + `thunet-tray` 登录任务 |
+| **服务** | 启用 systemd **系统**单元 `thunet.service`，开机即起，早于任何人登录 | `thunet` **服务**（虚拟账号 `NT SERVICE\thunet`，启动类型 `auto`）：登录界面出现前就已在线，没有托盘图标 |
+| **服务 + 托盘** | 单元 + `~/.config/autostart/thunet.desktop` | 该服务 + 每用户 `thunet-tray-<用户>` 登录任务 |
 
 没有提供"只启动托盘"：托盘自己不会拉起 core，单独一个图标只能一直报"未运行"。
 
 | 系统 | 自启项 |
 | --- | --- |
-| Windows | core 是一个 **服务**（`thunet`，LocalSystem，`SERVICE_WIN32_OWN_PROCESS`），由服务控制管理器在开机时拉起——比任何人登录都早，这是登录任务做不到的。托盘仍是每用户登录任务（`schtasks /Create /XML`，无延迟、`InteractiveToken` + `LeastPrivilege`），这也是定位权限还能用的原因。注册或重新配置服务需要管理员权限（一次 UAC）；启停不需要。 |
-| Linux | 托盘：`~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart），所有桌面都认；后台服务：systemd 用户单元，按用户 enable，不需要 root。 |
+| Windows | core 是一个 **服务**（`thunet`，虚拟账号 `NT SERVICE\thunet`，`SERVICE_WIN32_OWN_PROCESS`），由服务控制管理器在开机时拉起——比任何人登录都早，这是登录任务做不到的。状态在 `%ProgramData%\thunet`。托盘仍是每用户登录任务（`thunet-tray-<用户>`，无延迟、`InteractiveToken` + `LeastPrivilege`），这也是定位权限还能用的原因。注册、启动和停止服务都需要管理员权限。 |
+| Linux | 托盘：`~/.config/autostart/thunet.desktop`，由桌面会话自己启动（XDG autostart），所有桌面都认；后台服务：systemd **系统**单元（`DynamicUser=yes`、`StateDirectory=thunet`），注册、启动和停止都需要管理员权限（pkexec/polkit）。 |
 | macOS | 由 `auto-launch` crate 管理的 LaunchAgent；core 本身用 `thunet core`、`thunet service start` 或状态页的「启动」按需拉起。 |
 
-即使在关闭档位，第一次运行也会把 unit 文件写上，所以
-`systemctl --user start|stop|status thunet` 不用进设置页就能用。
-`thunet service <action>` 把两个平台包成同一套动词：
+安装包自带系统单元；便携安装可以用 `thunet service install`（管理员）写入。`systemctl start|stop|status thunet` 不用进设置页就能用。`thunet service <action>` 把两个平台包成同一套动词：
 
 | 动作 | Linux | Windows |
 | --- | --- | --- |
-| `install` / `uninstall` | 写入 / 删除 unit | 创建 / 删除服务，需要管理员 |
-| `enable` / `disable` | 挂进登录/开机路径（并尽力 `enable-linger`） | 把启动类型设为 `auto` / `demand`，需要管理员 |
-| `start` / `stop` / `restart` | `systemctl --user …` | `StartServiceW` / `ControlService`，登录用户即可 |
-| `status` | `systemctl --user status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
+| `install` / `uninstall` | 写入 / 删除系统单元 | 创建 / 删除服务，需要管理员 |
+| `enable` / `disable` | 挂进开机路径 | 把启动类型设为 `auto` / `demand`，需要管理员 |
+| `start` / `stop` / `restart` | `systemctl …`，需要管理员 | `StartServiceW` / `ControlService`，需要管理员 |
+| `status` | `systemctl status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
 
-core 一旦注册，就属于 systemd / 服务控制管理器管：窗口只会重连它，绝不在后台
-自己再 spawn 一个。`enable` / `disable` 只决定**下次开机**是否自动起，不改变当前
-是否在运行 —— 那是 `start` / `stop` 的事。
+core 一旦注册，就属于 systemd / 服务控制管理器管：窗口只会重连它，绝不在后台自己再 spawn 一个。`enable` / `disable` 只决定**下次开机**是否自动起，不改变当前是否在运行 —— 那是 `start` / `stop` 的事。
 
-Linux 上即使没开开机自启，第一次启动也会写入 unit，所以 `thunet service
-start|stop|status` 立刻可用。Windows 上服务由 `thunet service install`（或选择任一
-服务档位）创建，之后 `start|stop|status` 都不再需要授权。
+Linux 上服务由安装包提供，`thunet service start|stop|status` 立刻可用；便携安装需要先执行 `thunet service install`（管理员）。Windows 上服务由第一次选择服务档位、第一次点 **启动**（或 `thunet service install`）创建，之后 `start|stop|status` 都需要管理员授权。
 
-剩下的唯一自助操作就是桌面快捷方式：设置页的 **创建桌面快捷方式**，或
-`thunet shortcut`，它会为当前运行的可执行文件在桌面生成启动器（Linux 上还会把
-`.desktop` 标记为可信，以便 GNOME 直接启动）。
+剩下的唯一自助操作就是桌面快捷方式：设置页的 **创建桌面快捷方式**，或 `thunet shortcut`，它会为当前运行的可执行文件在桌面生成启动器（Linux 上还会把 `.desktop` 标记为可信，以便 GNOME 直接启动）。
 
-卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上
-`sudo apt remove thunet`。`%APPDATA%\thunet` 里的设置会保留；想要干净状态就删掉该
-目录。Windows 上卸载不需要提前准备：安装包会结束托盘与 core 服务、删掉两份注册
-（服务和 `thunet-tray` 登录任务），并移除 `PATH` 条目。先关掉 *开机自启* 也无妨，
-但已经不是必需步骤。
+卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的窗口偏好会保留；整机状态在 `%ProgramData%\thunet`，需要干净状态时单独删除。Windows 上卸载不需要提前准备：安装包会结束托盘与 core 服务、删掉注册（服务和本用户的 `thunet-tray-<用户>` 登录任务），并移除 `PATH` 条目。
 
 ## 8. 用 winget 安装
 
-只要存在对应的清单，winget 就能安装 THUnet。从"只给我自己用"到"所有人都能装"，
-分三个层次：
+只要存在对应的清单，winget 就能安装 THUnet。从"只给我自己用"到"所有人都能装"，分三个层次：
 
 ### 8.1 已发布（什么都不用做）
 
@@ -414,50 +340,31 @@ pwsh -File scripts/winget_manifest.ps1 -BaseUrl https://github.com/<you>/thunet/
 
 ### 8.3 发布出去，让任何人都能 `winget install THUnet.THUnet`
 
-1. 把 `dist/thunet-<version>-x64.msi` 上传到 Release；保持资产名稳定 —— 清单里的
-   hash 必须与字节完全一致。
+1. 把 `dist/thunet-<version>-x64.msi` 上传到 Release；保持资产名稳定 —— 清单里的 hash 必须与字节完全一致。
 2. 用真实的 `-BaseUrl` 重新生成清单，让 `InstallerSha256` 与上传的文件一致。
-3. 提交清单，可以用
-   [`wingetcreate`](https://github.com/microsoft/winget-create)：
-   `wingetcreate submit --token <GitHub PAT> dist/winget`，或者直接向
-   [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) 提 PR，
-   在 `manifests/t/THUnet/THUnet/<version>/` 下加入三个 YAML 文件。
-4. 自动验证通过、PR 合并后，`winget search THUnet` 就能找到这个包，安装/升级/卸载
-   与 8.1 一致。
+3. 提交清单，可以用 [`wingetcreate`](https://github.com/microsoft/winget-create)：`wingetcreate submit --token <GitHub PAT> dist/winget`，或者直接向 [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) 提 PR，在 `manifests/t/THUnet/THUnet/<version>/` 下加入三个 YAML 文件。
+4. 自动验证通过、PR 合并后，`winget search THUnet` 就能找到这个包，安装/升级/卸载与 8.1 一致。
 
-社区仓库会检查：安装包 URL 必须是公开 HTTPS、SHA256 必须匹配、必须能**静默**安装
-**和**卸载（`/qn`，MSI 已满足），`Publisher` / `PackageName` 要与安装包写进
-*已安装的应用* 的值一致（`THUnet contributors` / `THUnet`）。
+社区仓库会检查：安装包 URL 必须是公开 HTTPS、SHA256 必须匹配、必须能**静默**安装 **和**卸载（`/qn`，MSI 已满足），`Publisher` / `PackageName` 要与安装包写进 *已安装的应用* 的值一致（`THUnet contributors` / `THUnet`）。
 
 以下两处只服务于安装验证步骤，删掉它们会让 `Validation-Executable-Error` 标签回归：
 
-- `packaging/thunet.wxs` 通过 `ARPINSTALLLOCATION` 让 *已安装的应用* 记录
-  `InstallLocation`；MSI 自己从不写这个值，没有它就无法定位已安装的可执行文件。
-- `scripts/winget_manifest.ps1` 把 `thunet.exe` 声明为 `InstallationMetadata` 的
-  `launch` 文件，并带上 `InvocationParameter: --version`。THUnet 是托盘客户端：
-  不带参数启动会一直驻留到用户退出，对任何"执行已安装二进制"的检查来说都像是
-  卡死或失败。`--version` 会打印版本并在远小于一秒内以 0 退出。
+- `packaging/thunet.wxs` 通过 `ARPINSTALLLOCATION` 让 *已安装的应用* 记录 `InstallLocation`；MSI 自己从不写这个值，没有它就无法定位已安装的可执行文件。
+- `scripts/winget_manifest.ps1` 把 `thunet.exe` 声明为 `InstallationMetadata` 的 `launch` 文件，并带上 `InvocationParameter: --version`。THUnet 是托盘客户端：不带参数启动会一直驻留到用户退出，对任何"执行已安装二进制"的检查来说都像是卡死或失败。`--version` 会打印版本并在远小于一秒内以 0 退出。
 
 > 一个版本的产物必须先可访问才能发布清单，所以请**先**上传 Release，再开 PR。
 
-步骤 1–3 由 [`.github/workflows/release.yml`](.github/workflows/release.yml)
-自动化：推送与 `Cargo.toml` 一致的标签（`git tag v0.1.1 && git push origin v0.1.1`），
-工作流会构建 MSI、连同生成的清单一起发布，并在配置了 `WINGET_TOKEN` secret
-（带 `public_repo` 的 classic PAT）时自动向 `winget-pkgs` 提 PR。
+步骤 1–3 由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 自动化：推送与 `Cargo.toml` 一致的标签（`git tag v0.1.1 && git push origin v0.1.1`），工作流会构建 MSI、连同生成的清单一起发布，并在配置了 `WINGET_TOKEN` secret （带 `public_repo` 的 classic PAT）时自动向 `winget-pkgs` 提 PR。
 
 ## 9. 网络登录到底怎么做的
 
-全部是对门户的普通 HTTP(S) 请求 —— 没有浏览器，也没有 JavaScript。完整流程在
-**[docs/protocol.md](docs/protocol.md)** 里：网络探测、`ac_id` 发现、challenge
-token、`{MD5}` / `{SRBX1}` 编码、校验和、会话校验、保活以及门户错误码。
+全部是对门户的普通 HTTP(S) 请求 —— 没有浏览器，也没有 JavaScript。完整流程在 **[docs/protocol.md](docs/protocol.md)** 里：网络探测、`ac_id` 发现、challenge token、`{MD5}` / `{SRBX1}` 编码、校验和、会话校验、保活以及门户错误码。
 
-实现位于 `src/srun.rs`（协议）和 `src/session.rs`（状态机）；`src/crypto.rs` 里是
-MD5/SHA-1/XXTEA。使用这个程序不需要了解其中任何细节。
+实现位于 `src/srun.rs`（协议）和 `src/session.rs`（状态机）；`src/crypto.rs` 里是 MD5/SHA-1/XXTEA。使用这个程序不需要了解其中任何细节。
 
 ## 10. 从源码构建
 
-前置条件：Rust 1.90 或更高（edition 2024），以及用于窗口依赖的 C 工具链。仓库用
-[pixi](https://pixi.sh) 固定全部依赖：
+前置条件：Rust 1.90 或更高（edition 2024），以及用于窗口依赖的 C 工具链。仓库用 [pixi](https://pixi.sh) 固定全部依赖：
 
 ```
 pixi run -e dev cargo build --release
@@ -465,9 +372,7 @@ pixi run -e dev cargo test
 pixi run -e dev cargo fmt
 ```
 
-release profile 使用 `lto`、`opt-level = "z"`、`codegen-units = 1`、
-`panic = "abort"` 和 `strip`，产物是单个自包含的可执行文件，不需要任何运行时资源
-—— 窗口、托盘图标和字体都在运行时创建。
+release profile 使用 `lto`、`opt-level = "z"`、`codegen-units = 1`、`panic = "abort"` 和 `strip`，产物是单个自包含的可执行文件，不需要任何运行时资源 —— 窗口、托盘图标和字体都在运行时创建。
 
 ### 构建安装包
 
@@ -475,6 +380,7 @@ release profile 使用 `lto`、`opt-level = "z"`、`codegen-units = 1`、
 
 ```
 pixi run -e package msi        # Windows: thunet-<version>-x64.msi       (WiX v5)
+pixi run -e package msi-debug  # Windows: thunet-<version>-x64-debug.msi（debug 二进制，快）
 pixi run -e package deb        # Debian/Ubuntu: thunet_<version>-1_amd64.deb
 pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 ```
@@ -495,15 +401,10 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 
 注意事项：
 
-- **版本号只有一个来源：`Cargo.toml`。** 打包脚本读取它并向下传递
-  （`wix build -d Version=…`、`cargo deb`、tarball 文件名），所以升级版本号时不需要
-  手改别处。临时构建可以覆盖：
-  `pwsh -File scripts/build_msi.ps1 -Version 0.2.0` 或
-  `bash scripts/build_tarball.sh 0.2.0`。
-- `dotnet` 和 WiX 安装在 `.pixi/` 里 —— 不会加到你的全局 .NET 工具列表，也不需要
-  管理员权限。
-- 二进制没有签名；在使用代码签名证书（`signtool sign /fd sha256 ...`）之前，
-  Windows SmartScreen 会在首次运行时提示。
+- **版本号只有一个来源：`Cargo.toml`。** 打包脚本读取它并向下传递（`wix build -d Version=…`、`cargo deb`、tarball 文件名），所以升级版本号时不需要手改别处。临时构建可以覆盖：`pwsh -File scripts/build_msi.ps1 -Version 0.2.0` 或 `bash scripts/build_tarball.sh 0.2.0`。
+- **`msi-debug` 打包的是 `target/debug/thunet.exe`**（`build_msi.ps1 -BinPath … -Suffix -debug`），跳过 release 的 LTO，本地迭代因此快得多。它的产品标识和安装位置与正式包相同，所以安装它会替换掉已安装的版本；设置页面的构建标记会显示 `Debug`，避免混淆。
+- `dotnet` 和 WiX 安装在 `.pixi/` 里 —— 不会加到你的全局 .NET 工具列表，也不需要管理员权限。
+- 二进制没有签名；在使用代码签名证书（`signtool sign /fd sha256 ...`）之前，Windows SmartScreen 会在首次运行时提示。
 
 ## 11. 项目结构
 
@@ -527,28 +428,130 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 ## 12. 限制与说明
 
 - 只实现了校园门户协议；不支持 802.1X 或 VPN。
-- 保存的密码用与本机绑定的密钥加密（`credential.bin`，权限 `0600`）：离开本机就没用，
-  但以你的身份运行的程序仍能解密，所以请把本机上的这个账号当作可信环境。
-- **"登录前联网"假设家目录在开机时就可用**：文件权限只看 uid，与有没有登录会话无关，
-  所以 `systemd --user`（靠 `enable-linger` 开机启动）能以你的身份读到
-  `~/.config/thunet/credential.bin`。但如果家目录本身要到登录时才解锁或挂载
-  （`systemd-homed`、ecryptfs / gocryptfs、靠 autofs 挂载的网络家目录），开机时这个文件
-  根本不存在，核心只能退化成"登录后再联网"。
+- 保存的密码用**随机生成的每安装密钥**（`key.bin`）加密，密钥和 `credential.bin` 都放在只有服务账号和管理员可读的目录里：其他用户读不到、也复制不到，控制通道也没有读回命令。管理员/root 能读密钥或 dump core 内存；没有 TPM 绑定的整盘镜像也能解密。第 13 节给出威胁模型和 ACL 要求。
+- **“登录前联网”不再依赖某个用户的家目录。** core 的状态在 `%ProgramData%\thunet` / `/var/lib/thunet`，由安装器或 systemd 的 `StateDirectory=` 在 core 启动前创建。加密家目录与整机服务无关。
 - 客户端信任门户的 TLS 证书；`--http` 只用于调试。
-- 基于 `netsh` 的 SSID 探测需要 Windows 定位权限。没有该权限时客户端仍可工作，
-  但无法区分 `Tsinghua-Secure` 与需要认证的 Wi-Fi —— 此时由外网探测来决定。
-- Windows 上 core 以 **服务**（LocalSystem）运行，因为只有服务能比登录更早启动。
-  它读的仍是你自己的 `%APPDATA%\thunet`（路径通过 `--state-dir` 传进去），控制管道
-  是整机范围的，DACL 允许已登录用户驱动它：能本机登录的人都能启停这个会话；注册服务
-  本身仍然只有管理员能做。
-- 单实例保护在各平台都会把已有窗口叫回来：Windows 上通过会话内的命名事件，
-  Linux/macOS 上第二次启动会留下一个标记文件，由正在运行的实例自己轮询并显示窗口。
-- 升级后用新版本重启服务（`systemctl --user restart thunet`）时，仍在跑旧构建的
-  窗口会比较两边的构建时间戳，自动重启到磁盘上的新二进制；版本/构建相同、或自己
-  那份文件根本没被替换时，窗口保持不动。
+- 基于 `netsh` 的 SSID 探测需要 Windows 定位权限。没有该权限时客户端仍可工作，但无法区分 `Tsinghua-Secure` 与需要认证的 Wi-Fi —— 此时由外网探测来决定。
+- Windows 上 core 以 **服务**（虚拟账号 `NT SERVICE\thunet`）运行，因为只有服务能比登录更早启动。它读 `%ProgramData%\thunet`（路径通过 `--state-dir` 传进去），控制管道是整机范围的：交互用户可以读状态、驱动会话，但启动/停止和注册服务只允许管理员。
+- 单实例保护在各平台都会把已有窗口叫回来：Windows 上通过会话内的命名事件，Linux/macOS 上第二次启动会留下一个标记文件，由正在运行的实例自己轮询并显示窗口。
+- 升级后用新版本重启服务（`systemctl restart thunet`）时，仍在跑旧构建的窗口会比较两边的构建时间戳，自动重启到磁盘上的新二进制；版本/构建相同、或自己那份文件根本没被替换时，窗口保持不动。
 - 日志条里右键复制的是整行；自由选择复制用常规的 `Ctrl+C`。
 
-## 13. 许可证
+## 13. 共享机器：多用户设计
 
-MIT —— 见 [LICENSE](LICENSE)。"THUnet" 这个名字指的是校园网，与清华大学没有隶属
-关系。
+### 13.1 一台机器一个 core
+
+网络会话是机器级的（门户按出口 IP 认证），所以 core 也必须是机器级的。每个登录用户都有自己的托盘/窗口，但它们都连同一个 core。
+
+```mermaid
+flowchart LR
+  subgraph M["机器"]
+    core["thunet core<br/>Windows: 服务账号<br/>Linux: User=thunet"]
+    state[("机器状态<br/>%ProgramData%/thunet<br/>/var/lib/thunet")]
+    core --> state
+  end
+  subgraph A["用户 A 会话"]
+    ta["托盘 / 窗口 A"]
+    pa[("A 的偏好<br/>%APPDATA% / ~/.config")]
+    ta --> pa
+  end
+  subgraph B["用户 B 会话"]
+    tb["托盘 / 窗口 B"]
+    pb[("B 的偏好")]
+    tb --> pb
+  end
+  ta <-->|"全局端点 + 对端身份"| core
+  tb <-->|"全局端点 + 对端身份"| core
+```
+
+不变量：
+
+- 每台机器只有一个 core，它属于机器，而不是安装或启用它的那个用户；
+- 任何交互用户都能驱动会话：连接、断开、刷新、读状态、修改共享凭据；
+- 只有 core 能读写凭据，任何前端都读不回来；
+- 安装/卸载、开机启用/禁用、启动/停止服务需要管理员权限；
+- 托盘自启是每用户自己的事，不需要提权。
+
+### 13.2 端点与对端身份
+
+| | Windows | Linux |
+| --- | --- | --- |
+| 端点 | 服务：`\\.\pipe\thunet-control`（全局命名空间）；便携 core：`\\.\pipe\thunet-control-<用户>` | abstract socket `@thunet-control`（同一网络命名空间内全局） |
+| 谁可以连 | 服务管道：`SYSTEM`/`Administrators` 全权，`INTERACTIVE`（Windows 内置的“交互登录用户”安全标识）读写；便携管道：仅启动它的用户 | 无文件权限；任何本地 uid 都能连 |
+| 对端身份 | `ImpersonateNamedPipeClient` → token SID + session id | `SO_PEERCRED` → `ucred{pid,uid,gid}` |
+| 服务端身份 | 管道句柄的 `GetSecurityInfo` → owner SID | 已连接 socket 的 `SO_PEERCRED` → 服务端 uid |
+| 策略 | 拒绝 session 0 / 非交互 token | 拒绝系统账号 / 没有 logind 会话的 uid |
+
+两个方向都要检查：core 验证调用者是交互用户，窗口验证对面真的是服务。没有第二项检查，服务停着时任何用户都能抢占空闲端点，从其他用户的窗口里收走 `SetCredentials`。
+
+core 变成机器级之后不再使用文件 socket（`$XDG_RUNTIME_DIR/thunet/control.sock`）：它是每用户一个路径，第二个用户的 core 会 bind 到另一个文件，"单 core"规则会静默失效。abstract socket 与命名管道一样具有全局名字，但不需要一个可写的共享目录。
+
+### 13.3 哪些操作需要管理员
+
+| 操作 | Windows | Linux |
+| --- | --- | --- |
+| 安装 / 卸载 | MSI | `apt`（由 `dpkg` 执行） |
+| 注册 / 删除服务 | `sc create` / `sc delete` | `/usr/lib/systemd/system` 下的 unit 文件 |
+| 开机启用 / 禁用 | `sc config start= auto` 或 `start= demand` | `systemctl enable` / `disable` |
+| 启动 / 停止 | SCM（`SERVICE_START` / `SERVICE_STOP`），**管理员** | `systemctl start` / `stop`（polkit），**管理员** |
+| 改 core 的运行身份或状态目录 | `sc config binPath=` | unit 文件 |
+| 改门户 host / TLS 模式 | 只允许安装器 / 管理员 | 只允许安装器 / 管理员 |
+| 改共享账号 / 密码 | 否 | 否 |
+| 连接 / 断开 / 刷新 / 状态 | 否 | 否 |
+| "登录时启动我的托盘" | 否 | 否 |
+
+如果希望 core 被停掉后普通用户也能零提权拉起，必须同时放宽两侧：Windows 上修改 core 服务的 DACL，把启动/停止权限授予 `INTERACTIVE`（即上面提到的“交互登录用户”安全标识）；Linux 上增加一条 polkit 规则，只允许对 `thunet.service` 执行 `start` 和 `stop`。本项目选择的是更严格的一侧：**两个平台上启动、停止 core 都只允许管理员**。core 由服务管理器在开机时启动、异常退出后自动重启；窗口只能通过提权助手请求操作，控制通道本身没有停止 core 的命令。
+
+控制通道对整机 core 没有 `Shutdown` 命令：状态页的 *停止* 按钮通过提权助手调用 SCM / systemd，授权规则处处一致。便携 core 接受 `Shutdown`，因为它本来就属于启动它的用户；窗口断开后，也不会由任何前端拉起整机 core。core 自己退出（致命错误、升级）时由服务管理器重启。
+
+`host`、`https` 和 keepalive 目标是**机器配置**，不是用户偏好。允许普通用户改 `host` 等于允许他把 core 指向自己的门户并读走密码：SRun 的 `info` 是用**服务器选择的 token** 加密的，服务器永远能解开。窗口和控制通道都不提供修改这些值的入口。
+
+### 13.4 状态与凭据
+
+| | Windows | Linux |
+| --- | --- | --- |
+| 机器状态 | `%ProgramData%\thunet` | `/var/lib/thunet` |
+| 权限 | 显式 DACL，关闭继承：服务 SID + Administrators | `0700`，属主 `thunet`（`StateDirectory=thunet`、`StateDirectoryMode=0700`） |
+| 内容 | `config.json`（无密码）、`credential.bin`、`key.bin`、`core.log` | 同上 |
+| 每用户偏好 | `%APPDATA%\thunet`（语言、日志级别、托盘自启） | `~/.config/thunet` |
+
+UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个不含密码的 `CredentialState`（`{ username, has_password, remembered, revision }`），并用 `CheckCredentials` 让 core 比对刚输入的密码是否就是已保存的那个。勾选框显示的是 `remembered`，而 core 会把它写进自己的 `config.json`，所以服务重启后仍然会读回密文。这样“任何用户可改共享凭据、任何用户不可读”才成立。
+
+### 13.5 别的用户能解密密码吗？
+
+**只要权限设置正确就不能 —— 而且真正挡住他们的是文件权限，不是加密。**
+
+- 开源在这里不改变任何事（Kerckhoffs 原则）：格式本来就是公开的。保密性只能来自密钥和"谁能读这个文件"。
+- 机器目录要显式保证边界：
+  - Windows：不要依赖 `%ProgramData%` 继承下来的 ACL（它允许 `Users` 读）；创建目录时写显式 DACL 并关闭继承。用 `icacls "C:\ProgramData\thunet"` 检查。
+  - Linux：`StateDirectory=thunet` 会以 `0700` 创建 `/var/lib/thunet`；直接在 `/var/lib` 下 `create_dir_all` 会跟随 umask，通常是 `0755`。用 `ls -ld /var/lib/thunet` 检查。
+- 加密在权限之外仍然有用：
+  - `key.bin` 里的**随机** 32 字节数据密钥（`0600`，同一 ACL）让单独拷走 `credential.bin` 没有意义；
+  - 可选地用 OS 包装这个密钥：Linux 的 `systemd-creds`（host key，可加 TPM2），或 Windows 的 CNG/DPAPI。这一项尚未实现；当前边界是目录 ACL。
+
+威胁模型：
+
+| 谁 | 能读到密码吗 | 原因 |
+| --- | --- | --- |
+| 本机其他用户 | 否 | 目录/文件 ACL；控制通道没有读回命令 |
+| 运行 core 的账号 | 是 | 它必须解密后才能登录 |
+| root / 管理员 | 是 | 能读密钥、冒充服务或 dump 内存；本机加密无法阻止 |
+| 丢失的磁盘或备份 | 只有连带 `key.bin` 时才能 | 单独拿走密文没有意义；整盘镜像包含密钥则可解 |
+
+如果威胁模型包含管理员或磁盘失窃，唯一实质的提升是 TPM 绑定密钥或口令；两者都会破坏无人值守启动，而后者正是 core 作为服务运行的原因。
+
+共享机器上还有两条实践：
+
+- **不要把密码放进 `argv`。** `thunet -p secret login` 会出现在 `/proc/<pid>/cmdline`（Linux，除非 `hidepid=2`）和进程列表里，其他用户能看到。用窗口，或者用已保存的凭据执行 `thunet login`。
+- 控制通道是本地的（命名管道 / Unix socket），密码以明文经过它，但它不对网络开放，其他用户也读不到不属于自己的连接流。安全边界是对端检查加凭据文件的 ACL。
+
+### 13.6 升级与卸载
+
+- Windows：安装器用 `--state-dir %ProgramData%\thunet`、显式 DACL、`auto` 启动类型和失败重启创建服务；升级时重写 `binPath` 和 DACL，而不只是替换可执行文件。
+- Linux：包内提供带 `DynamicUser=yes` 和 `StateDirectory=thunet` 的 system unit；`postinst` 执行 `systemctl enable --now thunet.service`。
+- 本版本不迁移旧布局。如果旧版每用户安装留下了 `credential.bin`、`key.bin` 或 `systemd --user` 单元，请在启用服务前手动删除；残留文件会被直接忽略。
+- 便携/开发模式保留 `--state-dir` 和每用户 core；它不是受支持的多用户配置。
+
+## 14. 许可证
+
+MIT —— 见 [LICENSE](LICENSE)。"THUnet" 这个名字指的是校园网，与清华大学没有隶属关系。

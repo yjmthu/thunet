@@ -9,6 +9,7 @@ mod crypto;
 mod diag;
 mod elevate;
 mod i18n;
+mod ident;
 mod ipc;
 mod logline;
 mod proto;
@@ -23,11 +24,16 @@ mod wifi;
 mod winsvc;
 
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand};
 
 use proto::{Cmd as CoreCmd, Ev as CoreEv, ToastKind};
+
+/// Where the elevated helper writes the error from [`run`], when the caller
+/// passed `--admin-error`. The helper has no console of its own.
+static ADMIN_ERROR: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 /// GUI-subsystem processes own no console. When started from a terminal we
 /// attach to it so the CLI subcommands can still print; when started from
@@ -171,6 +177,9 @@ struct Cli {
   /// runs under has no profile of its own.
   #[arg(long, global = true, hide = true)]
   state_dir: Option<std::path::PathBuf>,
+  /// Internal: file where the elevated helper records a failure.
+  #[arg(long, global = true, hide = true)]
+  admin_error: Option<std::path::PathBuf>,
 
   #[command(subcommand)]
   cmd: Option<Cmd>,
@@ -190,19 +199,24 @@ enum Cmd {
   Logout,
   /// Run the background service (no window, no tray).
   ///
-  /// Normally started by the systemd user unit or the Windows service manager,
-  /// or on demand with `thunet service start` / the status page's *Start*
-  /// button.
+  /// Normally started by the systemd system unit or the Windows service
+  /// manager, or on demand with `thunet service start` / the status page's
+  /// *Start* button.
   Core {
     /// Started by the Windows service manager; not for humans.
     #[arg(long, hide = true)]
     service: bool,
+    /// Run against the machine-wide state directory and endpoint. The Linux
+    /// system unit passes this; a user-run core stays portable.
+    #[arg(long, hide = true)]
+    machine: bool,
   },
   /// Install or control the background service.
   ///
-  /// Wraps `systemctl --user` on Linux and the Service Control Manager on
-  /// Windows, so the same verbs work everywhere. Changing the registration
-  /// needs administrator rights on Windows, which this asks for once.
+  /// Wraps `systemctl` on Linux and the Service Control Manager on Windows, so
+  /// the same verbs work everywhere. Changing the registration, the start type
+  /// or the running state needs administrator rights on both platforms, which
+  /// this asks for once.
   Service {
     #[arg(value_enum)]
     action: autostart::ServiceAction,
@@ -238,7 +252,13 @@ fn main() {
   install_panic_log();
 
   let cli = Cli::parse();
+  if let Some(path) = &cli.admin_error {
+    let _ = ADMIN_ERROR.set(path.clone());
+  }
   if let Err(e) = run(cli) {
+    if let Some(path) = ADMIN_ERROR.get() {
+      let _ = std::fs::write(path, &e);
+    }
     eprintln!("error: {e}");
     std::process::exit(1);
   }
@@ -287,9 +307,9 @@ fn run(cli: Cli) -> Result<(), String> {
     // user asked for that in the settings page.
     let minimized = cli.minimized || cfg.start_minimized;
     // The window never starts a service by itself: it only talks to one that
-    // already answers (autostart at login, `thunet service start`, or the
+    // already answers (autostart at boot, `thunet service start`, or the
     // status page's *Start* button). Starting one here would make a deliberate
-    // `systemctl --user stop` look broken the next time the window opens.
+    // `systemctl stop` look broken the next time the window opens.
     return ui::run(cfg, minimized);
   };
 
@@ -363,6 +383,8 @@ fn run(cli: Cli) -> Result<(), String> {
         link.send(CoreCmd::SetCredentials {
           username: cfg.username.clone(),
           password: cfg.password.clone(),
+          // Command-line credentials are for this session only.
+          remember: false,
         });
       }
       link.send(CoreCmd::Connect);
@@ -373,14 +395,27 @@ fn run(cli: Cli) -> Result<(), String> {
       link.send(CoreCmd::Disconnect);
       settled(&link, Duration::from_secs(20))
     }
-    Cmd::Core { service } => {
+    Cmd::Core { service, machine } => {
       #[cfg(windows)]
       if service {
         return winsvc::run();
       }
       #[cfg(not(windows))]
       let _ = service;
-      match ipc::serve(cfg)? {
+      let machine = machine || cfg!(windows) && service;
+      if machine && std::env::var_os("THUNET_STATE_DIR").is_none() {
+        // The service manager passes `--state-dir`; this is the fallback for
+        // an administrator-started core that did not.
+        // SAFETY: this is the single-threaded startup path, before the worker
+        // or any frontend thread exists.
+        unsafe { std::env::set_var("THUNET_STATE_DIR", config::machine_dir()) };
+      }
+      let cfg = if machine {
+        config::Config::load_machine()
+      } else {
+        config::Config::load()
+      };
+      match ipc::serve(cfg, machine)? {
         ipc::Serve::Started => Ok(()),
         ipc::Serve::AlreadyRunning => {
           // Nothing to do: whoever owns the endpoint keeps serving the frontends.

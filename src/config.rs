@@ -4,7 +4,7 @@
 //! serde and the account/password pair is sealed into `credential.bin` (see
 //! [`crate::secret`]), and only when the user ticks "remember password".
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -74,10 +74,20 @@ fn env_path(key: &str) -> PathBuf {
 /// | macOS   | `~/Library/Application Support/thunet`  |
 /// | Linux   | `$XDG_CONFIG_HOME/thunet` (or `~/.config/thunet`) |
 ///
-/// `THUNET_STATE_DIR` overrides all of them. The Windows service needs it: it
-/// runs under SYSTEM, whose `%APPDATA%` is the system profile, while the
-/// settings and the sealed credential belong to the user who installed it.
+/// `THUNET_STATE_DIR` overrides all of them. The Windows service and the
+/// Linux system unit pass it explicitly so the core uses the machine directory
+/// while the window keeps using the user's own directory.
 pub fn dir() -> PathBuf {
+  state_dir()
+}
+
+/// Per-user settings: language, log level, tray autostart, window preferences.
+pub fn user_dir() -> PathBuf {
+  state_dir()
+}
+
+/// The user's own profile directory, or `THUNET_STATE_DIR` when set.
+fn state_dir() -> PathBuf {
   if let Some(dir) = std::env::var_os("THUNET_STATE_DIR").filter(|v| !v.is_empty()) {
     return PathBuf::from(dir);
   }
@@ -94,18 +104,50 @@ pub fn dir() -> PathBuf {
   base.join("thunet")
 }
 
+/// Machine-wide state: the shared account, the portal host and the sealed
+/// credential. Only the core (and an administrator) may read it.
+pub fn machine_dir() -> PathBuf {
+  if let Some(dir) = std::env::var_os("THUNET_STATE_DIR").filter(|v| !v.is_empty()) {
+    return PathBuf::from(dir);
+  }
+  if cfg!(windows) {
+    return env_path("ProgramData").join("thunet");
+  }
+  if cfg!(target_os = "linux") {
+    return PathBuf::from("/var/lib/thunet");
+  }
+  // macOS has no machine-wide service in this design; keep the user directory.
+  state_dir()
+}
+
 pub fn path() -> PathBuf {
   dir().join("config.json")
 }
 
+pub fn path_in(dir: &std::path::Path) -> PathBuf {
+  dir.join("config.json")
+}
+
 impl Config {
+  /// Load the per-user settings used by the window.
   pub fn load() -> Self {
-    let mut cfg: Config = std::fs::read_to_string(path())
+    Self::load_from(&user_dir())
+  }
+
+  /// Load the machine-wide settings used by the core.
+  pub fn load_machine() -> Self {
+    let dir = machine_dir();
+    let cfg = Self::load_from(&dir);
+    recover_stored(cfg, &dir)
+  }
+
+  pub fn load_from(dir: &std::path::Path) -> Self {
+    let mut cfg: Config = std::fs::read_to_string(path_in(dir))
       .ok()
       .and_then(|s| serde_json::from_str(&s).ok())
       .unwrap_or_default();
     if cfg.remember_password {
-      match secret::load() {
+      match secret::load_in(dir) {
         Some((user, pass)) => {
           if cfg.username.is_empty() {
             cfg.username = user;
@@ -117,7 +159,7 @@ impl Config {
         // and fall back to typing the password.
         None => {
           cfg.remember_password = false;
-          secret::delete();
+          secret::delete_in(dir);
         }
       }
     }
@@ -125,21 +167,63 @@ impl Config {
   }
 
   pub fn save(&self) -> Result<(), String> {
+    self.save_to(&dir())
+  }
+
+  /// Save the JSON only. The window uses this when a core owns the credential:
+  /// the password must never be written to the user's config directory.
+  pub fn save_prefs(&self) -> Result<(), String> {
     let p = path();
     if let Some(parent) = p.parent() {
       std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    if self.remember_password {
-      if !self.password.is_empty() {
-        secret::save(&self.username, &self.password)?;
-      }
-    } else {
-      // The user unticked "remember password": drop the stored entry.
-      secret::delete();
-    }
     let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
     std::fs::write(&p, body).map_err(|e| e.to_string())
   }
+
+  pub fn save_to(&self, dir: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path_in(dir).parent() {
+      std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if self.remember_password {
+      if !self.password.is_empty() {
+        secret::save_in(dir, &self.username, &self.password)?;
+      }
+    } else {
+      // The user unticked "remember password": drop the stored entry.
+      secret::delete_in(dir);
+    }
+    let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+    let path = path_in(dir);
+    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+  }
+}
+
+/// Adopt a sealed credential that the machine config does not mention.
+///
+/// A core older than the `remember_password` bookkeeping wrote `credential.bin`
+/// but never recorded the flag in its own `config.json`, so a restart ignored
+/// the credential it had just saved. The blob itself is the durable record of
+/// that intent: it is only written while the box is ticked and deleted when the
+/// box is cleared. Reading it here makes such an installation heal on the next
+/// start instead of silently asking for the password again.
+fn recover_stored(mut cfg: Config, dir: &Path) -> Config {
+  if let Some((user, pass)) = secret::load_in(dir) {
+    if cfg.username.is_empty() {
+      cfg.username = user;
+    }
+    if cfg.password.is_empty() {
+      cfg.password = pass;
+    }
+    cfg.remember_password = true;
+  }
+  cfg
 }
 
 #[cfg(test)]
@@ -166,5 +250,28 @@ mod tests {
     assert!(!cfg.start_minimized, "start-minimized is opt-in");
     assert!(cfg.password.is_empty());
     assert_eq!(cfg.log_level, "info", "debug output is opt-in");
+  }
+
+  #[test]
+  fn a_sealed_blob_survives_a_missing_remember_flag() {
+    let dir = std::env::temp_dir().join(format!("thunet-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    secret::save_in(&dir, "alice", "hunter2").unwrap();
+
+    // What an old core left behind: the blob exists, the JSON says nothing
+    // about remembering it.
+    let cfg = recover_stored(Config::default(), &dir);
+    assert_eq!(cfg.username, "alice");
+    assert_eq!(cfg.password, "hunter2");
+    assert!(cfg.remember_password, "the blob proves the intent");
+
+    // Unticking the box deletes the blob, and a later start must not bring it
+    // back.
+    secret::delete_in(&dir);
+    let cleared = recover_stored(Config::default(), &dir);
+    assert!(cleared.password.is_empty());
+    assert!(!cleared.remember_password);
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

@@ -1,0 +1,25 @@
+[Unit]
+Description=THUnet campus network client (background core)
+Documentation=https://github.com/yjmthu/thunet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=thunet
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/thunet core --machine
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

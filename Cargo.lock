@@ -3729,6 +3729,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gtk",
  "interprocess",
+ "libc",
  "md-5",
  "serde",
  "serde_json",
