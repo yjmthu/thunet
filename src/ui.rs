@@ -239,6 +239,13 @@ pub struct App {
   info: Info,
   logs: Vec<Line>,
   last_error: Option<String>,
+  /// Height the status banner occupies in this frame (0 when none is shown).
+  /// The window grows by exactly this much, so the log pane keeps its size
+  /// instead of being covered or squeezed.
+  banner_height: f32,
+  /// Extra height last sent to the viewport; keeps the resize command from
+  /// being emitted on every frame.
+  window_extra: f32,
   /// The missing-service warning is already in the log; keeps the two-second
   /// reconnect cadence from repeating it.
   service_warned: bool,
@@ -427,6 +434,8 @@ impl App {
       info: Info::default(),
       logs,
       last_error: None,
+      banner_height: 0.0,
+      window_extra: 0.0,
       service_warned: false,
       user_edit: cfg.username.clone(),
       pass_edit: cfg.password.clone(),
@@ -1068,6 +1077,25 @@ impl App {
       .fill(ui.visuals().panel_fill)
       .inner_margin(egui::Margin::same(14))
       .show(ui, |ui| {
+        // Warnings take their own space at the top of the page instead of lying
+        // over the rows below: the text stays centred, the page below keeps its
+        // layout, and `sync_window_height` grows the window by exactly this
+        // height so the log pane is not squeezed.
+        self.banner_height = 0.0;
+        if self.page == Page::Status {
+          let mut banners = Vec::new();
+          if !self.link.as_ref().is_some_and(Link::alive) {
+            banners.push(t.service_down.to_string());
+          }
+          if let Some(err) = &self.last_error {
+            banners.push(format!("{}: {err}", t.login_failed));
+          }
+          if !banners.is_empty() {
+            self.banner_height = red_banner(ui, banners.join("\n")) + 8.0;
+            ui.add_space(8.0);
+          }
+        }
+
         ui.horizontal(|ui| {
           if self.page == Page::Status {
             ui.label(
@@ -1097,20 +1125,6 @@ impl App {
         ui.add_space(8.0);
 
         if self.page == Page::Status {
-          // Banners are overlaid instead of taking part in the vertical layout:
-          // the log pane keeps the same height whether a warning is visible or
-          // not. They sit just below the header, over the status rows.
-          let mut banners = Vec::new();
-          if !self.link.as_ref().is_some_and(Link::alive) {
-            banners.push(t.service_down.to_string());
-          }
-          if let Some(err) = &self.last_error {
-            banners.push(format!("{}: {err}", t.login_failed));
-          }
-          if !banners.is_empty() {
-            banner_overlay(ui, banners.join("\n"));
-          }
-
           let account = if !self.info.name.is_empty() {
             self.info.name.clone()
           } else if !self.cfg.username.is_empty() {
@@ -2206,34 +2220,44 @@ mod tests {
 
 /// Red strip for the two states that stop everything from working: an error
 /// reported by the core, and no core answering at all.
-fn red_banner(ui: &mut egui::Ui, text: impl Into<String>) {
-  egui::Frame::new()
+///
+/// Returns the height it consumed, so the window can grow by the same amount
+/// and the page below keeps the size it has without a warning.
+fn red_banner(ui: &mut egui::Ui, text: impl Into<String>) -> f32 {
+  let frame = egui::Frame::new()
     .fill(egui::Color32::from_rgb(90, 30, 30))
     .inner_margin(egui::Margin::same(8))
     .corner_radius(6)
     .show(ui, |ui| {
       // Full width (instead of shrink-wrapping the text) and centred, so the
-      // strip reads as one band across the page rather than a small red box.
+      // strip reads as one band across the top of the page rather than a small
+      // red box.
       let width = ui.available_width();
       ui.set_width(width);
       ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new(text.into()).color(egui::Color32::from_rgb(255, 190, 190)));
       });
     });
+  frame.response.rect.height()
 }
 
-/// Draw the status banner on the foreground layer at a fixed offset below the
-/// header. It deliberately does not allocate space: the log pane below it must
-/// keep the same height before, during and after a warning.
-fn banner_overlay(ui: &egui::Ui, text: String) {
-  let rect = ui.max_rect();
-  egui::Area::new(egui::Id::unique("status-banner"))
-    .order(egui::Order::Foreground)
-    .fixed_pos(egui::pos2(rect.left(), rect.top() + 42.0))
-    .show(ui.ctx(), |ui| {
-      ui.set_width(rect.width());
-      red_banner(ui, text);
-    });
+impl App {
+  /// Grow or shrink the client area by the banner height.
+  ///
+  /// Only the banner's own height is measured; measuring the whole page would
+  /// feed the available height back into the layout (the reason the window is
+  /// otherwise a fixed size). The width never changes, so the banner wraps the
+  /// same way and the target stays stable instead of oscillating.
+  fn sync_window_height(&mut self, ctx: &egui::Context) {
+    if (self.banner_height - self.window_extra).abs() < 0.5 {
+      return;
+    }
+    self.window_extra = self.banner_height;
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+      DEFAULT_WIDTH,
+      WINDOW_HEIGHT + self.banner_height,
+    )));
+  }
 }
 
 impl eframe::App for App {
@@ -2466,6 +2490,7 @@ impl eframe::App for App {
 
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     self.paint(ui);
+    self.sync_window_height(ui.ctx());
     paint_toast(ui.ctx(), self.toast.as_ref());
   }
 }

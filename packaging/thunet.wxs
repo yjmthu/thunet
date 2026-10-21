@@ -34,6 +34,15 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
+    <!-- The Windows Installer Restart Manager prompts "the following
+         applications should be closed" while the UI sequence costs the
+         install, which happens before any custom action runs. This package
+         stops the core service and terminates the tray itself
+         (StopCoreService, then StopRunningApp before InstallValidate in the
+         execute sequence), so the prompt is redundant: disable the Restart
+         Manager integration and let those actions do the work. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
     <!-- ARP values are copied verbatim from the Property table, so a literal
          `[INSTALLFOLDER]` would end up in the registry unexpanded. Format it at
          CostFinalize instead: winget (and the repository validation) locate the
