@@ -71,6 +71,10 @@ pub struct Texts {
   pub password_cleared: &'static str,
   /// "Remember" is on but the password field is empty: nothing is stored.
   pub password_missing: &'static str,
+  /// A `SetCredentials` was sent; the core has not confirmed it yet.
+  pub password_saving: &'static str,
+  /// A credential save failed on permissions; an elevated repair is running.
+  pub repairing_permissions: &'static str,
   /// Placeholder for an empty field while the core holds a saved password: an
   /// empty field means "keep it", not "delete it".
   pub password_keep: &'static str,
@@ -168,6 +172,8 @@ static ZH: Texts = Texts {
   password_saved: "密码已保存",
   password_cleared: "密码已清除",
   password_missing: "未填写密码",
+  password_saving: "正在保存…",
+  repairing_permissions: "正在修复后台服务权限…",
   password_keep: "已保存，留空则不修改",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
@@ -245,6 +251,8 @@ static EN: Texts = Texts {
   password_saved: "Password saved",
   password_cleared: "Password cleared",
   password_missing: "No password entered",
+  password_saving: "Saving…",
+  repairing_permissions: "Repairing service permissions…",
   password_keep: "Saved — leave blank to keep it",
   no_credentials: "No account or password saved",
   built: "Built at",

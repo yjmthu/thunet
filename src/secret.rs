@@ -84,8 +84,30 @@ fn read_key(dir: &Path) -> Result<Option<[u8; KEY_LEN]>, String> {
     Ok(bytes) if bytes.len() == KEY_LEN => Ok(Some(bytes.try_into().expect("length checked"))),
     Ok(_) => Ok(None),
     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-    Err(e) => Err(format!("{}: {e}", path.display())),
+    Err(e) => {
+      // EFS is the one failure an ACL repair cannot fix: the file is
+      // encrypted to another account's certificate, so even Full Control in
+      // the DACL does not let the service decrypt it. Say so explicitly.
+      #[cfg(windows)]
+      if e.kind() == std::io::ErrorKind::PermissionDenied && is_encrypted(&path) {
+        return Err(format!(
+          "{}: the file is EFS-encrypted and the service account cannot decrypt it; \
+           decrypt it as its owner (`cipher /d`) or delete it so a fresh key is created: {e}",
+          path.display()
+        ));
+      }
+      Err(format!("{}: {e}", path.display()))
+    }
   }
+}
+
+#[cfg(windows)]
+fn is_encrypted(path: &Path) -> bool {
+  use std::os::windows::fs::MetadataExt as _;
+  const FILE_ATTRIBUTE_ENCRYPTED: u32 = 0x4000;
+  std::fs::metadata(path)
+    .map(|m| m.file_attributes() & FILE_ATTRIBUTE_ENCRYPTED != 0)
+    .unwrap_or(false)
 }
 
 /// Read `key.bin`, creating it if this is the first save. The key is random:

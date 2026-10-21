@@ -238,6 +238,13 @@ pub struct App {
   /// failed save (for example a permissions error) must not silently flip the
   /// checkbox back.
   credential_save_pending: bool,
+  /// A `service repair` runs on a helper thread (it needs UAC).
+  credential_repair: bool,
+  /// The automatic repair was already tried for the current Apply, so a
+  /// repeated failure does not loop through UAC prompts.
+  repair_attempted: bool,
+  repair_tx: Sender<Result<(), String>>,
+  repair_rx: Receiver<Result<(), String>>,
   next_core_query: Instant,
   core_version_warned: bool,
   state: State,
@@ -362,6 +369,7 @@ impl App {
 
     let autostart = autostart_entry(cfg.start_minimized);
     let (start_tx, start_rx) = mpsc::channel();
+    let (repair_tx, repair_rx) = mpsc::channel();
     let exe_path = crate::exe_path();
     let exe_stamp = exe_path.as_deref().and_then(exe_stamp);
 
@@ -427,6 +435,10 @@ impl App {
       pass_check_at: None,
       pass_checked: String::new(),
       credential_save_pending: false,
+      credential_repair: false,
+      repair_attempted: false,
+      repair_tx,
+      repair_rx,
       next_core_query: Instant::now(),
       core_version_warned: false,
       state: State::Offline,
@@ -633,6 +645,8 @@ impl App {
 
   /// Persist the edited credentials and hand them to the worker.
   fn apply_credentials(&mut self) {
+    // A fresh click may try the automatic permission repair again.
+    self.repair_attempted = false;
     let next = self.edited_config();
 
     if self.link.as_ref().is_some_and(Link::alive) {
@@ -700,7 +714,13 @@ impl App {
         self.cfg = next;
         // Say what actually happened: unticking the checkbox deletes the stored
         // credential instead of writing one.
-        let (msg, kind) = self.credentials_toast(typed);
+        let (msg, kind) = if owned_by_core {
+          // The core has not answered yet; "saved" would be a lie if its write
+          // fails (e.g. a permissions error).
+          (self.t().password_saving, ToastKind::Info)
+        } else {
+          self.credentials_toast(typed)
+        };
         self.set_toast(msg.to_string(), kind);
         self.send(Cmd::SetCredentials {
           username: self.cfg.username.clone(),
@@ -770,6 +790,15 @@ impl App {
         self.pass_edit.clear();
         self.pass_matches = None;
         self.pass_checked.clear();
+        // A previous save failure is history once the core confirms.
+        self.last_error = None;
+        let t = self.t();
+        let (msg, kind) = if self.remember {
+          (t.password_saved, ToastKind::Ok)
+        } else {
+          (t.password_cleared, ToastKind::Info)
+        };
+        self.set_toast(msg.to_string(), kind);
       }
     } else {
       self.cfg.remember_password = state.remembered;
@@ -859,6 +888,25 @@ impl App {
       let _ = tx.send((mode, result));
     });
     self.mode_rx = Some(rx);
+  }
+
+  fn pump_credential_repair(&mut self) {
+    while let Ok(result) = self.repair_rx.try_recv() {
+      self.credential_repair = false;
+      match result {
+        Ok(()) => {
+          self.push_log(Line::info("service: state directory permissions repaired"));
+          // The form kept the values on purpose; send them again now that the
+          // service account can write to its directory.
+          let next = self.edited_config();
+          self.save_credentials(next, true);
+        }
+        Err(e) => {
+          self.push_log(Line::error(format!("service: {e}")));
+          self.toast_err(e);
+        }
+      }
+    }
   }
 
   /// Deliver the outcome of the last mode change, if it has arrived.
@@ -1014,7 +1062,35 @@ impl App {
         Ev::State(s) => self.state = s,
         Ev::Info(v) => self.info = info_from(&v),
         Ev::Log(line) => self.push_log(line),
-        Ev::Error(e) => self.last_error = e,
+        Ev::Error(e) => {
+          let save_failed = e
+            .as_deref()
+            .is_some_and(|m| m.starts_with(self.t().cannot_save_credential));
+          self.last_error = e;
+          // A failed write usually means the service account lost access to
+          // the state directory (an old install ACL). Ask for one UAC prompt,
+          // repair it, then resend the credential the form still holds.
+          if save_failed && !self.repair_attempted && !self.credential_repair {
+            let machine = self.link.as_ref().is_some_and(Link::is_machine);
+            if machine {
+              self.repair_attempted = true;
+              self.credential_repair = true;
+              self.push_log(Line::info(
+                "service: repairing the state directory permissions",
+              ));
+              self.set_toast(self.t().repairing_permissions.to_string(), ToastKind::Info);
+              let tx = self.repair_tx.clone();
+              std::thread::spawn(move || {
+                let r = crate::autostart::Autostart::service(
+                  crate::autostart::ServiceAction::ResetCredential,
+                  false,
+                )
+                .map(|_| ());
+                let _ = tx.send(r);
+              });
+            }
+          }
+        }
         Ev::Notify { msg, kind } => {
           self.toast = Some(Toast {
             msg,
@@ -2419,6 +2495,7 @@ impl eframe::App for App {
 
     self.handle_menu(ctx);
     self.drain_events();
+    self.pump_credential_repair();
 
     if self
       .toast
