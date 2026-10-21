@@ -172,8 +172,8 @@ back to the front); **double-click** it to hide the window again. Telling the
 two apart takes a fixed 300 ms, so a single click acts once that delay has
 passed.
 
-**Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect`,
-`Autostart` and `Quit`.
+**Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect`
+and `Quit`.
 
 Closing the window hides it — the app keeps working. `Quit` ends the window and
 its tray icon only: the background service keeps running, whatever the autostart
@@ -250,6 +250,10 @@ thunet completions <shell>   # print a bash/zsh/fish/elvish/powershell completio
 thunet selftest              # note: the real test vectors live in `cargo test`
 ```
 
+On Windows the MSI puts the executable in `C:\Program Files\THUnet\bin` and
+appends that directory to the system `PATH`, so `thunet` works in any shell
+started after the install; the `.deb` installs it as `/usr/bin/thunet`.
+
 Completion scripts come from the same `clap` definition the parser uses, so they
 cover every subcommand (including `service <action>`) and every global flag:
 
@@ -282,7 +286,7 @@ second, unmanaged connection.
 
 ```json
 {
-  "core":   { "version": "0.1.3", "build_epoch": 1792571000, "pid": 1234,
+  "core":   { "version": "0.1.4", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
               "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
@@ -356,7 +360,7 @@ same files.
 
 | OS | Installed executable | Registration (created by the package) |
 | --- | --- | --- |
-| Windows | `C:\Program Files\THUnet\thunet.exe` | Windows Installer entry in *Settings → Apps*, Start Menu entry under `THUnet`, desktop shortcut |
+| Windows | `C:\Program Files\THUnet\bin\thunet.exe` | Windows Installer entry in *Settings → Apps*, Start Menu entry under `THUnet`, desktop shortcut, and `C:\Program Files\THUnet\bin` appended to the system `PATH` |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`, icon under `/usr/share/icons/hicolor/scalable/apps/` |
 
 The MSI is per-machine (`Scope="perMachine"`), which is what a single UAC
@@ -375,13 +379,17 @@ the service (`ControlService`, then waits for it to be gone), terminates the tra
 (`taskkill /IM thunet.exe /F` before `InstallValidate`), removes the service on
 a real uninstall, and then removes the files, the shortcuts, the Start Menu
 folder and the install directory. A major upgrade stops the service the same way
-but keeps the registration.
+but keeps the registration — and then points it at the executable that was just
+installed, so a package that moves the file does not leave the SCM launching a
+stale path; the tray logon task is rewritten the same way on the next launch.
 
 Because that `taskkill` also runs for upgrades and repairs, every interactive
-install (UILevel ≥ 4) starts the app again once the transaction is finished,
-through `explorer.exe` so the restarted tray keeps the user's own token rather
-than inheriting the installer's elevation; a
-silent install (`msiexec /qn`, winget) does not, so it never hijacks a desktop.
+install (UILevel ≥ 4) starts the app again once the transaction is finished. It
+does so through the desktop shell's own `ShellExecute` (the WiX util extension's
+`WixUnelevatedShellExec`), which runs the tray with the user's own token instead
+of inheriting the installer's elevation — asking `explorer.exe` to do it opened a
+folder window instead of the app on some machines. A silent install
+(`msiexec /qn`, winget) does not start anything, so it never hijacks a desktop.
 Double-clicking the package while it is already installed therefore ends with
 the app running rather than with a killed copy.
 
@@ -432,12 +440,11 @@ file as trusted so GNOME will launch it).
 
 To remove THUnet: *Settings → Apps → THUnet → Uninstall* on Windows, or
 `sudo apt remove thunet` on Debian/Ubuntu. Your settings in `%APPDATA%\thunet`
-are left alone; delete that directory if you
-want a clean slate. Before uninstalling, turn *Start with the system* off (that
-removes the `thunet-tray` logon task) **and** run `thunet service uninstall`
-(one elevation: it stops and deletes the service). Turning autostart off alone
-leaves the service registered; deleting the service alone leaves the logon
-task — either way something would point at a deleted executable.
+are left alone; delete that directory if you want a clean slate. Uninstalling
+needs no preparation on Windows: the package stops the tray and the core
+service, deletes both registrations (the service and the `thunet-tray` logon
+task) and removes the `PATH` entry. Turning *Start with the system* off first
+is harmless but no longer required.
 
 ## 8. Installing with winget
 

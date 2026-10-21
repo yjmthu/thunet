@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "thunet"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "auto-launch",
  "chacha20poly1305",

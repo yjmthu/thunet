@@ -140,7 +140,7 @@
 **左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。
 区分两者需要固定等 300 ms，所以单击会在该延迟后生效。
 
-**右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`开机自启`、`退出`。
+**右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`退出`。
 
 关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务
 照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或
@@ -208,6 +208,10 @@ thunet completions <shell>   # 输出 bash/zsh/fish/elvish/powershell 补全脚�
 thunet selftest              # 注意：真正的测试向量在 `cargo test` 里
 ```
 
+Windows 上 MSI 把可执行文件放在 `C:\Program Files\THUnet\bin`，并把该目录追加到
+系统 `PATH`，所以安装之后新开的终端里可以直接用 `thunet`；`.deb` 装的是
+`/usr/bin/thunet`。
+
 补全脚本由解析器使用的同一份 `clap` 定义生成，所以每个子命令（含
 `service <action>`）和每个全局参数都能补全：
 
@@ -235,7 +239,7 @@ core 这一半能在开机时起——Linux 是 systemd user unit，Windows 是�
 
 ```json
 {
-  "core":   { "version": "0.1.3", "build_epoch": 1792571000, "pid": 1234,
+  "core":   { "version": "0.1.4", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
               "host": "auth4.tsinghua.edu.cn", "auto_connect": true,
@@ -301,7 +305,7 @@ core 这一半能在开机时起——Linux 是 systemd user unit，Windows 是�
 
 | 系统 | 安装后的可执行文件 | 注册信息（由安装包创建） |
 | --- | --- | --- |
-| Windows | `C:\Program Files\THUnet\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、开始菜单里的 `THUnet`、桌面快捷方式 |
+| Windows | `C:\Program Files\THUnet\bin\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、开始菜单里的 `THUnet`、桌面快捷方式，以及追加到系统 `PATH` 的 `C:\Program Files\THUnet\bin` |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`、`/usr/share/icons/hicolor/scalable/apps/` 下的图标 |
 
 MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级
@@ -315,12 +319,14 @@ MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安
 程序运行时卸载是安全的：由于安装包是提权的，它会先停止服务（`ControlService`，
 并等它真正退出）、结束托盘进程（`InstallValidate` 之前执行 `taskkill /IM thunet.exe
 /F`），在真正的卸载时删除服务，然后才删除文件、快捷方式、开始菜单文件夹和安装
-目录。主版本升级同样会停服务，但保留注册。
+目录。主版本升级同样会停服务，但保留注册，并把注册的镜像路径改到刚装上的可执行
+文件——这样换了安装位置也不会让 SCM 去启动旧路径；托盘登录任务则在下次启动时重写。
 
 因为这个 `taskkill` 在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）
-在事务结束后会重新启动程序。启动是通过 `explorer.exe` 转一手做的：自定义动作本身
-是提权运行的，直接启动托盘会拿到管理员令牌，而经过 explorer 启动的程序属于交互
-用户。静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，
+在事务结束后会重新启动程序。启动走的是桌面外壳自己的 `ShellExecute`（WiX util 扩展
+的 `WixUnelevatedShellExec`），托盘拿到的是用户自己的令牌，而不是安装程序的提权令牌；
+早先让它去调用 `explorer.exe`，在部分机器上会弹出资源管理器窗口而不是启动程序。
+静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，
 在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被结束。
 
 开机自启**不属于**安装包 —— 程序自己注册条目，状态再直接从系统读回来（不写进
@@ -365,9 +371,9 @@ start|stop|status` 立刻可用。Windows 上服务由 `thunet service install`�
 
 卸载：Windows 上 *设置 → 应用 → THUnet → 卸载*，Debian/Ubuntu 上
 `sudo apt remove thunet`。`%APPDATA%\thunet` 里的设置会保留；想要干净状态就删掉该
-目录。卸载前请先关闭 *开机自启*（去掉 `thunet-tray` 登录任务），再执行
-`thunet service uninstall`（一次授权：停止并删除服务）。只关自启会留下服务条目，
-只删服务会留下登录任务——两者都会指向一个不存在的可执行文件。
+目录。Windows 上卸载不需要提前准备：安装包会结束托盘与 core 服务、删掉两份注册
+（服务和 `thunet-tray` 登录任务），并移除 `PATH` 条目。先关掉 *开机自启* 也无妨，
+但已经不是必需步骤。
 
 ## 8. 用 winget 安装
 

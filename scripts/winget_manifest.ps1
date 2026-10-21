@@ -127,9 +127,9 @@ Installers:
   # for anything that executes the installed binary. `--version` is a
   # non-interactive invocation that prints the version and exits 0.
   InstallationMetadata:
-    DefaultInstallLocation: '%LOCALAPPDATA%\Programs\thunet'
+    DefaultInstallLocation: '%ProgramFiles%\THUnet'
     Files:
-    - RelativeFilePath: thunet.exe
+    - RelativeFilePath: bin\thunet.exe
       FileType: launch
       InvocationParameter: --version
       DisplayName: THUnet
@@ -148,7 +148,7 @@ License: $License
 ShortDescription: Tray client for the Tsinghua University campus network.
 Description: Logs in to the Tsinghua campus network (SRun portal), keeps the
   session alive, shows the assigned IPv4/IPv6 address and traffic, and supports
-  autostart. Per-user install, no administrator rights required.
+  autostart. Per-machine install (one UAC prompt); settings stay per user.
 Moniker: thunet
 Tags:
 - tsinghua

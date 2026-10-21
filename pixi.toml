@@ -56,7 +56,9 @@ patchelf = ">=0.19.2,<0.20"
 
 [feature.package.tasks]
 # WiX v5 as a project-local .NET tool: no global install, no admin rights.
-wix-tool = "dotnet tool update --tool-path .pixi/wix wix --version 5.0.2"
+# The util extension provides `WixUnelevatedShellExec`, which the package uses
+# to start the tray as the installing user after an interactive install.
+wix-tool = "dotnet tool update --tool-path .pixi/wix wix --version 5.0.2 && .pixi/wix/wix extension add -g WixToolset.Util.wixext/5.0.2"
 # The version always comes from Cargo.toml (scripts read it, nothing is pinned).
 msi = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1", depends-on = [
   "wix-tool",

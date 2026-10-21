@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use serde_json::Value;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart::{Autostart, Mode};
@@ -253,7 +253,6 @@ pub struct App {
   tray_rgb: Option<[u8; 3]>,
   connect_item: MenuItem,
   disconnect_item: MenuItem,
-  autostart_item: CheckMenuItem,
   show_item: MenuItem,
   hide_item: MenuItem,
   quit_item: MenuItem,
@@ -312,12 +311,14 @@ impl App {
     let disconnect_item = MenuItem::with_id("disconnect", t.disconnect, true, None);
     let show_item = MenuItem::with_id("show", t.show_window, true, None);
     let hide_item = MenuItem::with_id("hide", t.hide_window, true, None);
-    let autostart_item = CheckMenuItem::with_id("autostart", t.autostart, true, false, None);
     let quit_item = MenuItem::with_id("quit", t.quit, true, None);
     let menu = Menu::new();
     let _ = menu.append_items(&[&connect_item, &disconnect_item]);
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append_items(&[&show_item, &hide_item, &autostart_item]);
+    // Autostart is deliberately absent: the three modes (off / service /
+    // service + tray) live in the settings page, and registering the service
+    // needs a UAC prompt that should not be one stray click away.
+    let _ = menu.append_items(&[&show_item, &hide_item]);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit_item);
 
@@ -353,10 +354,24 @@ impl App {
       Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
       _ => {}
     }
+    // A tray entry with no boot-starting core behind it is not a mode this
+    // app offers; it is a leftover from an older installation. Drop it before
+    // reading the mode, so the settings page and the OS agree.
+    match autostart.as_ref().map(Autostart::drop_stray_tray) {
+      Some(Ok(true)) => logs.push(Line::warn("autostart: dropped a stray tray entry")),
+      Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
+      _ => {}
+    }
+    // The entry also has to name the executable that is installed now: an
+    // upgrade may have moved it, and a task pointing at the old file would
+    // simply fail at the next logon. Rewriting is a no-op when nothing is
+    // registered.
+    if let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
+      logs.push(Line::warn(format!("autostart: {e}")));
+    }
     // Read the mode *after* that: the settings page has to show what is
     // actually registered, not what was requested.
     let autostart_mode = autostart.as_ref().map(Autostart::mode).unwrap_or(Mode::Off);
-    autostart_item.set_checked(autostart_mode != Mode::Off);
 
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
@@ -398,7 +413,6 @@ impl App {
       tray_rgb: Some(color_for(State::Offline)),
       connect_item,
       disconnect_item,
-      autostart_item,
       show_item,
       hide_item,
       quit_item,
@@ -511,7 +525,6 @@ impl App {
     let t = self.lang.texts();
     self.connect_item.set_text(t.connect);
     self.disconnect_item.set_text(t.disconnect);
-    self.autostart_item.set_text(t.autostart);
     self.show_item.set_text(t.show_window);
     self.hide_item.set_text(t.hide_window);
     self.quit_item.set_text(t.quit);
@@ -601,7 +614,6 @@ impl App {
     }
     // Show the requested state right away; the toast confirms or reverts it.
     self.autostart_mode = mode;
-    self.autostart_item.set_checked(mode != Mode::Off);
     let (tx, rx) = mpsc::channel::<(Mode, Result<(), String>)>();
     std::thread::spawn(move || {
       let result = autostart.set_mode(mode);
@@ -623,7 +635,6 @@ impl App {
     match result {
       Ok(()) => {
         self.autostart_mode = mode;
-        self.autostart_item.set_checked(mode != Mode::Off);
         let label = match mode {
           Mode::Off => t.autostart_off,
           Mode::Core => t.autostart_core,
@@ -654,7 +665,6 @@ impl App {
       .map(Autostart::mode)
       .unwrap_or(Mode::Off);
     self.autostart_mode = mode;
-    self.autostart_item.set_checked(mode != Mode::Off);
   }
 
   /// "Start minimised" and "start with the system" are independent settings,
@@ -748,16 +758,6 @@ impl App {
       match ev.id().0.as_str() {
         "connect" => self.send(Cmd::Connect),
         "disconnect" => self.send(Cmd::Disconnect),
-        "autostart" => {
-          // The menu keeps the binary shortcut; the three-way choice lives in
-          // the settings page.
-          let next = if self.autostart_mode == Mode::Off {
-            Mode::All
-          } else {
-            Mode::Off
-          };
-          self.apply_autostart_mode(next);
-        }
         "quit" => self.quit(),
         "show" => self.show_window(ctx),
         "hide" => self.hide_window(ctx),
@@ -1872,7 +1872,13 @@ impl eframe::App for App {
           // Do not sit out the reconnect throttle: the new core is usually
           // listening before the next frame.
           self.next_link_try = Instant::now();
-          self.service_request = Some((ServiceRequest::Start, Instant::now()));
+          // `ensure_link` ran above, so a core that already answered has
+          // cleared the click and toasted "started". Re-arming the watchdog
+          // here would report a failure ten seconds later for a start that
+          // succeeded.
+          if !self.link.as_ref().is_some_and(Link::alive) {
+            self.service_request = Some((ServiceRequest::Start, Instant::now()));
+          }
         }
         Err(e) => {
           self.service_request = None;

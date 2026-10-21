@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Per-machine MSI for THUnet (see README §7): installs to
-  %ProgramFiles%\THUnet and asks for administrator rights once.
+  %ProgramFiles%\THUnet and asks for administrator rights once. The executable
+  goes to `bin` under it, which is also appended to the system PATH.
 
   The background core is a Windows service, i.e. a machine-wide resource, so
   the package has to be able to stop and delete it; a per-user package runs
@@ -63,13 +64,18 @@
          leaves no app running. Silent installs such as `msiexec /qn` or winget
          keep UILevel = 2 and stay quiet.
 
-         The launch goes through explorer.exe on purpose: this custom action
-         runs elevated, and starting the tray directly would give it an
-         administrator token. Explorer already runs as the interactive user, so
-         the app it starts belongs to that user. -->
-    <CustomAction Id="LaunchApp" Directory="TARGETDIR"
-                  ExeCommand="[WindowsFolder]explorer.exe &quot;[INSTALLFOLDER]thunet.exe&quot;"
-                  Execute="immediate" Return="asyncNoWait" />
+         The launch goes through the desktop shell's own `ShellExecute`, not
+         through a new `explorer.exe` (which this elevated action would start
+         elevated, and which intermittently showed a folder window instead of
+         the app). The shell owns the interactive token, so the tray belongs to
+         the user who installed. -->
+    <!-- Set at CostFinalize in the execute sequence: `[BINDIR]` is a directory
+         property and only resolves once the directories are costed. -->
+    <SetProperty Id="WixUnelevatedShellExecTarget" Value="[BINDIR]thunet.exe"
+                 After="CostFinalize" Sequence="execute" />
+    <CustomAction Id="LaunchApp" BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixUnelevatedShellExec"
+                  Execute="immediate" Return="ignore" />
 
     <!-- Remove the service on a real uninstall only. A major upgrade also runs
          this product's uninstall, and `UPGRADINGPRODUCTCODE` is what tells the
@@ -101,11 +107,16 @@
       <!-- After the files are in place, not during an uninstall. -->
       <Custom Action="ResumeCoreService" After="InstallFinalize"
               Condition="NOT REMOVE=&quot;ALL&quot; AND (Installed OR WIX_UPGRADE_DETECTED)" />
-      <Custom Action="LaunchApp" After="InstallFinalize" Condition="UILevel &gt;= 4" />
+      <Custom Action="LaunchApp" After="InstallFinalize"
+              Condition="UILevel &gt;= 4 AND NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="THUnet" />
+      <Directory Id="INSTALLFOLDER" Name="THUnet">
+        <!-- The executable lives in `bin` so the system PATH has one
+             unambiguous directory to point at. -->
+        <Directory Id="BINDIR" Name="bin" />
+      </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="AppMenuFolder" Name="THUnet" />
@@ -116,17 +127,24 @@
       <ComponentGroupRef Id="Binaries" />
     </Feature>
 
-    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+    <ComponentGroup Id="Binaries" Directory="BINDIR">
       <Component Id="MainExe" Guid="A0B2A2A3-1B5D-4A6E-8F10-5C1E2D3F4A5B">
         <File Id="THUnetExe" Source="target/release/thunet.exe" KeyPath="yes">
           <Shortcut Id="StartMenuLnk" Directory="AppMenuFolder" Name="THUnet"
                     Description="THUnet campus network client"
-                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+                    WorkingDirectory="BINDIR" Icon="AppIcon" />
           <Shortcut Id="DesktopLnk" Directory="DesktopFolder" Name="THUnet"
                     Description="THUnet campus network client"
-                    WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+                    WorkingDirectory="BINDIR" Icon="AppIcon" />
         </File>
+        <!-- The same executable is the CLI, so the directory joins the system
+             PATH. `set` + `last` appends it only when it is missing and the
+             uninstall removes it again; this is a per-machine package, which is
+             what `System="yes"` needs. -->
+        <Environment Id="PathEntry" Name="PATH" Value="[BINDIR]"
+                     Part="last" Action="set" System="yes" />
         <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveBinFolder" Directory="BINDIR" On="uninstall" />
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
       </Component>
     </ComponentGroup>

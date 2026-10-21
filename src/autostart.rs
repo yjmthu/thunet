@@ -41,7 +41,7 @@ pub enum Mode {
 pub enum ServiceAction {
   /// Register the unit / task without starting anything.
   Install,
-  /// Remove the registration.
+  /// Remove the registration: the service, plus the tray logon task on Windows.
   Uninstall,
   /// Start automatically from now on.
   Enable,
@@ -83,14 +83,17 @@ impl Autostart {
   /// unit by hand is reflected immediately, and there is no second source of
   /// truth to drift.
   pub fn mode(&self) -> Mode {
+    // What starts at boot decides, not what is merely registered. A tray entry
+    // on its own (a hand-made task, or one left over from an installation that
+    // was removed) must not make the page claim "service + tray" while nothing
+    // starts the core.
+    if !imp::core_starts_at_boot() {
+      return Mode::Off;
+    }
     if imp::tray_registered(self) {
-      // A tray entry on its own cannot happen through this API; treat a
-      // half-installed state as "all".
       Mode::All
-    } else if imp::core_starts_at_boot() {
-      Mode::Core
     } else {
-      Mode::Off
+      Mode::Core
     }
   }
 
@@ -119,6 +122,21 @@ impl Autostart {
   /// alone — on Windows touching it would mean a UAC prompt for a checkbox.
   pub fn refresh_tray(&self) -> Result<(), String> {
     imp::refresh_tray(self)
+  }
+
+  /// Remove a tray entry that no boot-starting core backs.
+  ///
+  /// None of the three modes can produce that state: a lone tray entry is
+  /// either hand-made or left over from an older installation, and it would
+  /// only put an icon on screen that reports "service not running". The app
+  /// cleans it up instead of showing a mode it cannot offer. `Ok(true)` means
+  /// an entry was removed.
+  pub fn drop_stray_tray(&self) -> Result<bool, String> {
+    if imp::core_starts_at_boot() || !imp::tray_registered(self) {
+      return Ok(false);
+    }
+    imp::disable_tray(self)?;
+    Ok(true)
   }
 
   /// Install the service entry the CLI drives, if it is missing, so
@@ -181,13 +199,13 @@ mod imp {
 
   use windows_sys::Win32::Foundation::GetLastError;
   use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatusEx, SC_HANDLE,
-    SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_WIN32_OWN_PROCESS, StartServiceW,
+    ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
+    OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatusEx,
+    SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO,
+    SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_STOP,
+    SERVICE_DEMAND_START, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
+    SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
   };
 
   use super::{Autostart, ServiceAction};
@@ -286,8 +304,14 @@ mod imp {
     Ok(false)
   }
 
-  /// Start the core again after the installer replaced the binary.
+  /// Start the core again after the installer replaced the binary, after
+  /// making sure the registration points at the build that was just installed.
   pub fn resume_after_update() -> Result<(), String> {
+    if crate::elevate::is_elevated()
+      && let Some(me) = Autostart::new(false)
+    {
+      sync_image_path(&me)?;
+    }
     if !core_starts_at_boot() {
       return Ok(());
     }
@@ -337,7 +361,11 @@ mod imp {
       }
       ServiceAction::Uninstall => {
         delete()?;
-        Ok("core service removed".into())
+        // The tray logon task is the other registration this application
+        // creates. The installer calls this action on uninstall, and a task
+        // that outlives the package would point at a deleted executable.
+        delete_task(TRAY_TASK)?;
+        Ok("core service and tray autostart removed".into())
       }
       ServiceAction::Enable => {
         enable_direct(a)?;
@@ -393,7 +421,7 @@ mod imp {
   fn already_done(action: ServiceAction) -> String {
     match action {
       ServiceAction::Install => "core registered as a service (start type demand)",
-      ServiceAction::Uninstall => "core service removed",
+      ServiceAction::Uninstall => "core service and tray autostart removed",
       ServiceAction::Enable => "core starts with the machine",
       _ => "core no longer starts with the machine",
     }
@@ -427,11 +455,7 @@ mod imp {
       open_manager(SC_MANAGER_CREATE_SERVICE).ok_or("cannot open the service manager")?;
     let name = wide(CORE_SERVICE);
     let display = wide("THUnet background service");
-    let binary = wide(&format!(
-      "\"{}\" core --service --state-dir \"{}\"",
-      a.exe.display(),
-      crate::config::dir().display()
-    ));
+    let binary = wide(&binary_path(a));
     // SAFETY: every string outlives the call; the returned handle is closed
     // below. A null account name means LocalSystem, which is what can start
     // before anyone logs on.
@@ -621,6 +645,111 @@ mod imp {
     // SAFETY: a successful call filled the buffer with a QUERY_SERVICE_CONFIGW.
     let config = unsafe { &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW) };
     Some(config.dwStartType)
+  }
+
+  /// The image path the SCM stores for the core. It spells out the state
+  /// directory, because the token the service runs under has no profile of its
+  /// own.
+  fn binary_path(a: &Autostart) -> String {
+    format!(
+      "\"{}\" core --service --state-dir \"{}\"",
+      a.exe.display(),
+      crate::config::dir().display()
+    )
+  }
+
+  /// Point an existing registration at the executable that is installed now.
+  ///
+  /// A major upgrade — and a reinstall of the package, which
+  /// `AllowSameVersionUpgrades` turns into one — deliberately keeps the
+  /// service so that autostart survives, and that also keeps the image path
+  /// the previous package wrote. When the new package puts the executable
+  /// somewhere else, the SCM would keep launching the old one (or fail), so
+  /// the installer's `service-resume` hook rewrites the path first. No-op when
+  /// the path already matches or nothing is registered.
+  fn sync_image_path(a: &Autostart) -> Result<(), String> {
+    let Some(service) = service_open(SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG) else {
+      return Ok(());
+    };
+    let current = query_binary_path(service);
+    let wanted = binary_path(a);
+    if current.as_deref() == Some(wanted.as_str()) {
+      unsafe {
+        CloseServiceHandle(service);
+      }
+      return Ok(());
+    }
+    let binary = wide(&wanted);
+    // SAFETY: the handle is valid, the string outlives the call, and every
+    // other field is left as it was by SERVICE_NO_CHANGE.
+    let ok = unsafe {
+      ChangeServiceConfigW(
+        service,
+        SERVICE_NO_CHANGE,
+        SERVICE_NO_CHANGE,
+        SERVICE_NO_CHANGE,
+        binary.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+      )
+    };
+    let err = unsafe { GetLastError() };
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    if ok != 0 {
+      Ok(())
+    } else {
+      Err(format!(
+        "cannot point the core service at {} (error {err})",
+        a.exe.display()
+      ))
+    }
+  }
+
+  fn query_binary_path(service: SC_HANDLE) -> Option<String> {
+    let mut needed = 0u32;
+    // The first call only reports how much room the answer needs.
+    // SAFETY: a null buffer with size 0 is the documented size query.
+    unsafe {
+      QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+      return None;
+    }
+    let mut buffer = vec![0u32; (needed as usize).div_ceil(4)];
+    // SAFETY: the buffer is aligned and at least `needed` bytes long.
+    let ok = unsafe {
+      QueryServiceConfigW(
+        service,
+        buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+        needed,
+        &mut needed,
+      )
+    };
+    if ok == 0 {
+      return None;
+    }
+    // SAFETY: a successful call filled the buffer, and `lpBinaryPathName`
+    // points inside it at a NUL-terminated string.
+    let config = unsafe { &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW) };
+    let start = config.lpBinaryPathName;
+    if start.is_null() {
+      return None;
+    }
+    unsafe {
+      let mut len = 0usize;
+      while *start.add(len) != 0 {
+        len += 1;
+      }
+      Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+        start, len,
+      )))
+    }
   }
 
   fn open_manager(access: u32) -> Option<SC_HANDLE> {

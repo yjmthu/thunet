@@ -40,6 +40,7 @@ New-Item -ItemType Directory -Force -Path $dist | Out-Null
 $out = Join-Path $dist "thunet-$Version-$Arch.msi"
 
 & $wix build (Join-Path $root "packaging/thunet.wxs") `
+    -ext WixToolset.Util.wixext `
     -d "Version=$Version" -arch $Arch -o $out
 if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
 
