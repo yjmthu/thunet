@@ -105,6 +105,16 @@ fn state_color(state: State) -> egui::Color32 {
   egui::Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// `config.json`'s `theme` setting ("auto" | "light" | "dark"), as egui wants
+/// it. `auto` follows the system preference.
+fn theme_preference(setting: &str) -> egui::ThemePreference {
+  match setting {
+    "light" => egui::ThemePreference::Light,
+    "dark" => egui::ThemePreference::Dark,
+    _ => egui::ThemePreference::System,
+  }
+}
+
 /// How long the service has been up, in the coarsest useful unit.
 fn human_uptime(secs: u64) -> String {
   let days = secs / 86_400;
@@ -418,6 +428,8 @@ pub struct App {
   /// Lowest level rendered in the log pane; older lines are kept and simply
   /// hidden, so raising the threshold again brings them back.
   min_level: Level,
+  /// The theme setting last pushed to the context (`config.json` `theme`).
+  applied_theme: Option<String>,
   autostart: Option<Autostart>,
   autostart_mode: Mode,
   user_edit: String,
@@ -617,6 +629,7 @@ impl App {
       // `ensure_link` pass has to publish the language.
       lang_sent: false,
       min_level,
+      applied_theme: None,
       autostart,
       autostart_mode,
       tray,
@@ -1661,7 +1674,7 @@ impl App {
           // Denser spacing: the settings page has to fit the fixed window.
           ui.spacing_mut().item_spacing.y = 4.0;
 
-          // Language and log level lead the page: they are the two settings
+          // Language, log level and theme lead the page: they are the settings
           // people look for first.
           let mut choice = match self.cfg.lang.as_str() {
             "zh" => 1,
@@ -1670,11 +1683,20 @@ impl App {
           };
           let before_lang = choice;
           let before_level = self.min_level;
-          // Both combos share a row: the settings page has to fit the fixed
-          // window height.
+          let mut theme = match self.cfg.theme.as_str() {
+            "light" => 1,
+            "dark" => 2,
+            _ => 0,
+          };
+          let before_theme = theme;
+          // All three combos share one row, and all three are given the same
+          // width: the labels differ from language to language, but a common
+          // combo width is what keeps the row inside the fixed window width and
+          // the three controls the same size.
           ui.horizontal(|ui| {
             ui.label(t.language);
             egui::ComboBox::from_id_salt("lang")
+              .width(COMBO_WIDTH)
               .selected_text(match choice {
                 1 => t.lang_zh,
                 2 => t.lang_en,
@@ -1685,14 +1707,27 @@ impl App {
                 ui.selectable_value(&mut choice, 1, t.lang_zh);
                 ui.selectable_value(&mut choice, 2, t.lang_en);
               });
-            ui.add_space(10.0);
             ui.label(t.log_level);
             egui::ComboBox::from_id_salt("log-level")
+              .width(COMBO_WIDTH)
               .selected_text(self.min_level.tag())
               .show_ui(ui, |ui| {
                 for level in Level::CHOICES {
                   ui.selectable_value(&mut self.min_level, level, level.tag());
                 }
+              });
+            ui.label(t.theme);
+            egui::ComboBox::from_id_salt("theme")
+              .width(COMBO_WIDTH)
+              .selected_text(match theme {
+                1 => t.theme_light,
+                2 => t.theme_dark,
+                _ => t.theme_auto,
+              })
+              .show_ui(ui, |ui| {
+                ui.selectable_value(&mut theme, 0, t.theme_auto);
+                ui.selectable_value(&mut theme, 1, t.theme_light);
+                ui.selectable_value(&mut theme, 2, t.theme_dark);
               });
           });
           if choice != before_lang {
@@ -1706,6 +1741,16 @@ impl App {
           if self.min_level != before_level {
             self.cfg.log_level = self.min_level.setting().to_string();
             let _ = self.cfg.save();
+          }
+          if theme != before_theme {
+            self.cfg.theme = ["auto", "light", "dark"][theme].to_string();
+            match self.cfg.save() {
+              Ok(()) => {
+                let label = [t.theme_auto, t.theme_light, t.theme_dark][theme];
+                self.set_toast(format!("{}: {label}", t.theme), ToastKind::Info);
+              }
+              Err(e) => self.toast_err(e),
+            }
           }
 
           // A rule under the row that only changes how this window renders, so
@@ -1803,21 +1848,23 @@ impl App {
             match_hint,
           );
           ui.horizontal(|ui| {
-            ui.label(t.account);
+            let label_w = field_label_width(ui, t);
+            field_label(ui, t.account, label_w);
             ui.add_enabled(
               credentials_live,
-              egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0),
+              egui::TextEdit::singleline(&mut self.user_edit).desired_width(FIELD_WIDTH),
             );
             if stored.username {
               unsaved_marker(ui, t);
             }
           });
           ui.horizontal(|ui| {
-            ui.label(t.password);
+            let label_w = field_label_width(ui, t);
+            field_label(ui, t.password, label_w);
             let keep_hint = core_password && self.pass_edit.is_empty();
             let mut input = egui::TextEdit::singleline(&mut self.pass_edit)
               .password(true)
-              .desired_width(190.0);
+              .desired_width(FIELD_WIDTH);
             if keep_hint {
               // The core holds a password the window cannot show; an empty
               // field means "keep it" rather than "no password".
@@ -2176,6 +2223,54 @@ impl CredentialEdits {
   fn any(self) -> bool {
     self.username || self.password || self.remember
   }
+}
+
+/// Width of the three presentation combos (*Language*, *Log*, *Skin*).
+///
+/// One width for all three: they share a row, and the row has to fit the fixed
+/// window width in every language.
+const COMBO_WIDTH: f32 = 78.0;
+
+/// Width of the *Account* / *Password* input boxes.
+///
+/// Wide enough for the longest placeholder — "Saved — leave blank to keep it" —
+/// at the default font, and for the account a portal user actually types, while
+/// still leaving room on the same row for the *Unsaved* marker.
+const FIELD_WIDTH: f32 = 250.0;
+
+/// Width of the label column in front of those inputs.
+///
+/// Measured from the two labels in the current language instead of fixed:
+/// "Password" is the widest English label, while "账号" and "密码" are two
+/// characters each, and a column sized for English leaves a wide gap in
+/// Chinese. Both rows take the same number, which is what keeps the two inputs
+/// on the same x in every language.
+fn field_label_width(ui: &egui::Ui, t: &Texts) -> f32 {
+  let font = egui::TextStyle::Body.resolve(ui.style());
+  [t.account, t.password]
+    .iter()
+    .map(|text| {
+      ui.fonts_mut(|f| {
+        f.layout_no_wrap((*text).to_owned(), font.clone(), egui::Color32::WHITE)
+          .size()
+          .x
+      })
+    })
+    .fold(0.0_f32, f32::max)
+    .ceil()
+}
+
+/// That label, drawn flush left in the shared column.
+///
+/// A plain `ui.label` would make each row's column as wide as its own text, so
+/// the two inputs would start at different x; `add_sized` reserves the width
+/// but centres the text inside it.
+fn field_label(ui: &mut egui::Ui, text: &str, width: f32) {
+  let (rect, _) = ui.allocate_exact_size(
+    egui::vec2(width, ui.spacing().interact_size.y),
+    egui::Sense::hover(),
+  );
+  ui.put(rect, egui::Label::new(text));
 }
 
 /// Small "Unsaved" hint placed next to the input it belongs to.
@@ -3302,6 +3397,14 @@ impl App {
 
 impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // The stored theme is pushed here rather than in `App::new`, which runs
+    // before there is a context to apply it to. `applied_theme` remembers what
+    // was sent, so this is a no-op on the frames in between.
+    if self.applied_theme.as_deref() != Some(self.cfg.theme.as_str()) {
+      ctx.set_theme(theme_preference(&self.cfg.theme));
+      self.applied_theme = Some(self.cfg.theme.clone());
+    }
+
     // GTK delivers the appindicator menu callbacks through its own event loop,
     // but eframe owns the main loop here. Pump GTK every pass, otherwise menu
     // clicks are queued forever and never reach `handle_menu`.

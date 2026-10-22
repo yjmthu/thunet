@@ -36,6 +36,8 @@ pub struct Config {
   /// Minimum level shown in the window log: "debug" | "info" | "warn" | "error".
   /// Defaults to `info`, so only diagnostics the user asked for show up.
   pub log_level: String,
+  /// Window theme: "auto" (follow the system) | "light" | "dark".
+  pub theme: String,
 }
 
 impl Default for Config {
@@ -55,6 +57,7 @@ impl Default for Config {
       reconnect_delay_secs: 5,
       lang: "auto".into(),
       log_level: "info".into(),
+      theme: "auto".into(),
     }
   }
 }

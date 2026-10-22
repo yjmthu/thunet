@@ -46,7 +46,7 @@ One executable, no runtime dependencies, no console window, runs on Windows, Lin
    | other Linux | `thunet-<version>-linux-x64.tar.gz` | unpack and run `./thunet` (optionally `./thunet shortcut` for a desktop launcher) |
 
 2. **Run it.** Start `THUnet` from the Start Menu / application menu, or run `thunet` in a terminal. A small window opens; everything the app does is written to the log strip at the bottom of that window.
-3. **Open Settings.** Click the button in the top-right corner of the window.
+3. **Open Settings.** Click the gear in the top-right corner of the window.
 4. **Enter your credentials.** Type your TUNET account (for example `1234567890`) and your password, tick **Remember password**, then click **Apply**. The password is sealed with a random per-install key before it touches the disk, and never ends up in the settings file. The core owns that key and the sealed blob; the window never reads them back.
 5. **Connect.** Go back to the Status page and click **Connect** (or just wait a few seconds if *Auto connect* is already enabled). The dot in the header turns green and your IPv4 address appears.
 
@@ -60,11 +60,13 @@ That is all. From now on the app reconnects by itself whenever the network comes
 
 ## 2. The window at a glance
 
-The window has exactly two pages, switched with the button in the top-right corner. It opens in the middle of the monitor, and a fixed size means each launch starts from the same place.
+The window has exactly two pages, switched with the gear in the top-right corner; the arrow in the same place on the settings page leads back. It opens in the middle of the monitor, and a fixed size means each launch starts from the same place.
 
-![The THUnet status page](docs/images/en-status.png)
+| Light | Dark |
+| --- | --- |
+| <img src="docs/images/en-status-light.png" width="400" alt="The THUnet status page in the light skin"> | <img src="docs/images/en-status.png" width="400" alt="The THUnet status page"> |
 
-*Status page, with the account name, addresses and user name redacted.*
+*The status page, in the light and the dark skin.*
 
 ### Status page
 
@@ -93,18 +95,21 @@ Right-click on selected log text copies the selection straight to the clipboard.
 
 ### Settings page
 
-![The THUnet settings page](docs/images/en-settings.png)
+| Light | Dark |
+| --- | --- |
+| <img src="docs/images/en-settings-light.png" width="400" alt="The THUnet settings page in the light skin"> | <img src="docs/images/en-settings.png" width="400" alt="The THUnet settings page"> |
 
-*Settings page, with the account and password fields redacted.*
+*The settings page, in the light and the dark skin.*
 
 | Setting | Effect |
 | --- | --- |
 | Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running". On both platforms this row needs administrator rights: registering or changing the service, and starting or stopping it. The tray part alone is per user and needs no elevation once the service is already enabled |
-| Start minimised to tray | Independent of the line above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
+| Start minimised to tray | On the same row as *Auto connect*, and independent of the autostart row above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
 | Auto connect | Log in as soon as a usable network appears |
 | Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
 | Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying seals the password into `credential.bin` (never into the JSON file) and passes it to the running session immediately; if the service is down, Apply asks to start it first (administrator) and sends the credential once it answers. The window keeps no copy afterwards: the field goes blank and its placeholder says the saved value is kept, and re-typing the stored password is compared against the core (`CheckCredentials`) so it does not look unsaved. *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
 | Language | Follow system (default), 中文, English |
+| Skin | Follow system (default), Light, Dark. Applied to the window immediately, and remembered in `config.json`, so the next launch starts in the same skin |
 | Log level | `DEBUG` / `INFO` / `WARN` / `ERROR`: the lowest level shown in the log page (`INFO` by default, stored in `config.json`) |
 | Version | Version on the left, build time on the right (local clock to the second, with its UTC offset); the prefix says whether the binary is a `Release` or `Debug` build, so a local test package is never mistaken for a release one; the GitHub icon next to the version opens this repository |
 
