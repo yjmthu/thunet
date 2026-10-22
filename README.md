@@ -41,7 +41,7 @@ One executable, no runtime dependencies, no console window, runs on Windows, Lin
 
    | System | File | Install with |
    | --- | --- | --- |
-   | Windows | `thunet-<version>-x64.msi` | double-click, `msiexec /i thunet-<version>-x64.msi` (administrator rights, installs to `Program Files`), or `winget install --id THUnet.THUnet -e` once published (see [Installing with winget](#8-installing-with-winget)) |
+   | Windows | `thunet-<version>-x64.msi` | double-click, `msiexec /i thunet-<version>-x64.msi` (administrator rights, installs to `Program Files`; one or two elevation prompts, see [§7](#7-installing-uninstalling-shortcuts)), or `winget install --id THUnet.THUnet -e` once published (see [Installing with winget](#8-installing-with-winget)) |
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | other Linux | `thunet-<version>-linux-x64.tar.gz` | unpack and run `./thunet` (optionally `./thunet shortcut` for a desktop launcher) |
 
@@ -130,6 +130,8 @@ The build stamp shows the version on the left and, on the right, the local time 
 
 **Left-click the tray icon** to show the window (or to bring an existing one back to the front); **double-click** it to hide the window again. Telling the two apart takes a fixed 300 ms, so a single click acts once that delay has passed. **Windows only**: the Linux tray is an AppIndicator, which reports no clicks and has no tooltip, so use `Show window` / `Hide window` in its menu there and read the state from the window.
 
+A portable setup is marked as such in the taskbar and the tray: the window icon is blue instead of green, the tray icon moves the whole green/amber/grey scale into blue (online blue, authenticating light blue, offline dark blue), the title bar and Alt-Tab entry read `THUnet Portable`, and so does the tray tooltip. The white letter stays the brand **T** in both modes — a second glyph only made the 16 px tray icon unreadable.
+
 **Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect` and `Quit`.
 
 Closing the window hides it — the app keeps working. `Quit` ends the window and its tray icon only: the background service keeps running, whatever the autostart mode says, and is stopped explicitly from the status page's *Stop* button or with `thunet service stop`. A portable setup has no service to outlive the window — the core *is* a thread of it — but the two are tied to the same lifecycle: closing only hides both, and `Quit` ends both.
@@ -182,7 +184,7 @@ thunet core                  # background service: owns the network session
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # ask the running window to exit and wait until it is gone
 thunet status                # JSON: service state + portal session/traffic
-thunet login                 # ask the service to authenticate now
+thunet login                 # ask for the account and password, then authenticate
 thunet logout                # ask the service to de-authenticate
 thunet ac-id                 # portal ac_id the service is using
 thunet config                # config path + effective settings
@@ -206,6 +208,8 @@ The `.deb` already installs bash, zsh and fish completions under `/usr/share`, s
 The window is only a *frontend*. The network session lives in `thunet core`, which the window talks to over a machine-wide local socket (a named pipe on Windows, an abstract Unix socket on Linux). The window never starts that process on its own: it comes from autostart, `thunet service start`, or the *Start* button on the status page. Closing the window therefore keeps you online, and the core is the half that can start at boot — a systemd **system** unit on Linux, a **Windows service** on Windows, both registered by the *Start with the system* setting. Registering, starting and stopping the service needs administrator rights on both platforms.
 
 `status`, `login`, `logout` and `ac-id` are frontends too: they ask the running service over that same socket instead of contacting the portal themselves, so there is exactly one owner of the session. With no service running they stop with an error naming the command that starts it — they never fall back to a second, unmanaged connection.
+
+`thunet login` started from a terminal asks three questions: the account (the stored one is offered as the default, so Enter keeps it), the password, which is not echoed, and whether to remember the password for the next start. Leaving the password empty keeps the one the core already holds, which is how you change only the *remember* choice. Ctrl+C cancels the questions at any point — the terminal echo is restored and nothing is sent to the service. It prints one line about the result — `saved for the next start`, `this session only`, or `NOT saved` when the pair was incomplete — before the login itself. Without a terminal (stdin redirected, or started with no console at all) the questions are skipped and the command just asks the core to connect with the credentials it already holds. `-u/--username` and `-p/--password` skip the questions for scripts, at the cost of the password being visible in the shell history and in every process listing.
 
 `thunet status` prints one object with both halves:
 
@@ -284,7 +288,17 @@ Deleting `config.json` resets every setting. A real uninstall (Windows *Uninstal
 | Windows | `C:\Program Files\THUnet\bin\thunet.exe` | Windows Installer entry in *Settings → Apps*, machine-wide Start Menu entry under `%ProgramData%\Microsoft\Windows\Start Menu\Programs\THUnet`, per-user desktop shortcut, and `C:\Program Files\THUnet\bin` appended to the system `PATH` |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop` and an icon under `/usr/share/icons/hicolor/scalable/apps/`, both system-wide |
 
-The MSI is per-machine (`Scope="perMachine"`), which is what a single UAC prompt at install buys: the package owns machine-wide state, so it can stop the core service before files are replaced and delete it on uninstall — a per-user package runs unelevated and can do neither, leaving a service behind that points at a deleted executable. The trade is that install, upgrade and removal all ask for administrator rights once. The Start Menu entry is machine-wide too (spelled out under `CommonAppDataFolder`, i.e. `%ProgramData%`): WiX's `ProgramMenuFolder` resolves to the profile of whoever ran the installer, which on a per-machine package leaves a second, user-only copy next to the real one.
+The MSI is per-machine (`Scope="perMachine"`), which is what a single UAC prompt at install buys: the package owns machine-wide state, so it can stop the core service before files are replaced and delete it on uninstall — a per-user package runs unelevated and can do neither, leaving a service behind that points at a deleted executable. The trade is that install, upgrade and removal all need administrator rights. The Start Menu entry is machine-wide too (spelled out under `CommonAppDataFolder`, i.e. `%ProgramData%`): WiX's `ProgramMenuFolder` resolves to the profile of whoever ran the installer, which on a per-machine package leaves a second, user-only copy next to the real one.
+
+**How many elevation prompts to expect.** Two parts of the transaction need administrator rights and they are asked for separately. The per-machine transaction is elevated by the installer itself. Stopping the running core is a different matter: `StopCoreService` is an immediate custom action, so it runs in the msiexec *client* process, which a double-click leaves unelevated — it shells out to `thunet --machine service stop`, which asks for the rights the service DACL reserves for administrators. Starting the package from an already elevated context hands the client that token up front, so the second prompt never appears:
+
+| Started from | Fresh install | Reinstall, upgrade, uninstall | Silent (`/qn`) |
+| --- | --- | --- | --- |
+| Explorer (double-click) | 1 | 2 | — |
+| *Run as administrator*, administrator terminal, winget | 1 | 1 | 1 |
+| an ordinary shell | — | — | fails with 1925: a silent install cannot ask for elevation |
+
+The second prompt is not an error and not a second installation: rejecting it aborts the transaction and rolls everything back, accepting it lets the same installation continue. It exists because ordinary interactive users may only *query* the service — starting and stopping stay administrator-only — so the trade is one extra consent rather than letting any logged-on user stop the background core. If you would rather never see it, start the package elevated; the alternative is the `Privileged` property, which elevates the msiexec client itself and therefore runs the whole installer interface with administrator rights for the length of the install.
 
 Settings are **per user** (`%APPDATA%\thunet`), while the core's account, portal host and sealed credential live in the machine directory (`%ProgramData%\thunet`). The service is registered by the application on the first *Start with the system* or the first click on the status page's **Start** (administrator), not by the MSI; the MSI stops, repoints and restarts it during upgrades.
 

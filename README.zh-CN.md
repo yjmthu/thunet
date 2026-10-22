@@ -41,7 +41,7 @@
 
    | 系统 | 文件 | 安装方式 |
    | --- | --- | --- |
-   | Windows | `thunet-<version>-x64.msi` | 双击、`msiexec /i thunet-<version>-x64.msi`（需管理员权限，装到 `Program Files`），发布后也可以 `winget install --id THUnet.THUnet -e`（见 [用 winget 安装](#8-用-winget-安装)） |
+   | Windows | `thunet-<version>-x64.msi` | 双击、`msiexec /i thunet-<version>-x64.msi`（需管理员权限，装到 `Program Files`；会弹一次或两次提权提示，见 [§7](#7-安装卸载快捷方式)），发布后也可以 `winget install --id THUnet.THUnet -e`（见 [用 winget 安装](#8-用-winget-安装)） |
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | 其他 Linux | `thunet-<version>-linux-x64.tar.gz` | 解压后运行 `./thunet`（可选 `./thunet shortcut` 生成桌面图标） |
 
@@ -122,6 +122,8 @@
 
 **左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。区分两者需要固定等 300 ms，所以单击会在该延迟后生效。**仅 Windows**：Linux 的托盘走 AppIndicator，不上报点击、也没有 tooltip，请在菜单里用 `显示窗口` / `隐藏窗口`，状态看窗口或日志。
 
+便携配置在任务栏和托盘里都有标记：窗口图标是蓝色而不是绿色，托盘图标把绿/黄/灰整套换成蓝色（在线深蓝、认证中浅蓝、离线暗蓝），标题栏和 Alt-Tab 条目写 `THUnet Portable`，托盘 tooltip 也一样。白色字母在两种模式下都还是品牌 **T** —— 换一个字母只会让 16 px 的托盘图标糊成一团。
+
 **右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`退出`。
 
 关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或 `thunet service stop`。便携配置没有能在窗口之外活下来的服务——核心本身就是窗口的一个线程——但两者的生死绑在一起：关窗只是把两者一起藏起来，`退出` 才是真的结束它们。
@@ -174,7 +176,7 @@ thunet core                  # 后台服务：真正持有网络会话
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # 让运行中的窗口退出，并等到它真正消失
 thunet status                # JSON：服务自身状态 + 门户会话/流量
-thunet login                 # 让服务现在就认证
+thunet login                 # 询问账号和密码，然后认证
 thunet logout                # 让服务注销
 thunet ac-id                 # 服务正在使用的门户 ac_id
 thunet config                # 配置路径 + 生效中的设置
@@ -198,6 +200,8 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 窗口只是一个**前端**。网络会话住在 `thunet core` 里，两者通过本地套接字通信（Windows 上是命名管道）。窗口不会自己拉起 core：它来自开机自启、`thunet service start`，或者状态页的「启动」按钮。所以关掉窗口不会掉线，而且只有 core 这一半能在开机时起——Linux 是 systemd **系统**单元，Windows 是一个真正的 **服务**，都由设置页的「随系统启动」注册。两个平台上注册、启动和停止服务都需要管理员权限。
 
 `status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，并提示该用哪个命令启动——**绝不会**退回自己去开第二个连接。
+
+`thunet login` 在终端里运行时依次问三个问题：账号（已保存的账号作为默认值，直接回车即沿用）、密码（不回显）、以及是否记住密码供下次启动使用。密码留空表示沿用 core 已保存的那个，这是只改*是否记住*而不重新输入密码的办法。提问过程中随时可以按 Ctrl+C 取消 —— 终端回显会恢复，而且什么都没有发给服务。它会在登录之前先打印一行结果：`saved for the next start`、`this session only`，或者凭据不完整时的 `NOT saved`。没有终端时（stdin 被重定向，或根本没有控制台）提问会被跳过，只让 core 拿已保存的凭据去连接。`-u/--username` 和 `-p/--password` 可以为脚本跳过提问，代价是密码会出现在 shell 历史和所有进程列表里。
 
 `thunet status` 输出一个对象，两半都在：
 
@@ -274,7 +278,17 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 | Windows | `C:\Program Files\THUnet\bin\thunet.exe` | *设置 → 应用* 里的 Windows Installer 条目、整机开始菜单里的 `%ProgramData%\Microsoft\Windows\Start Menu\Programs\THUnet`、每用户桌面快捷方式，以及追加到系统 `PATH` 的 `C:\Program Files\THUnet\bin` |
 | Linux | `/usr/bin/thunet` | `/usr/share/applications/thunet.desktop`、`/usr/share/icons/hicolor/scalable/apps/` 下的图标，均为整机范围 |
 
-MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级状态，所以它能在替换文件前停掉 core 服务、卸载时删除它——而每用户的包以普通权限运行，两件事都做不到，只能留下一个指向已删除 exe 的服务条目。代价是安装、升级和卸载各需一次管理员授权。开始菜单条目同样是整机的（在 `CommonAppDataFolder` 即 `%ProgramData%` 下逐级写出路径）：WiX 的 `ProgramMenuFolder` 会解析成运行安装程序那个用户的配置目录，每机器安装就会在旁边多出一份只属于该用户的副本。
+MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安装包拥有机器级状态，所以它能在替换文件前停掉 core 服务、卸载时删除它——而每用户的包以普通权限运行，两件事都做不到，只能留下一个指向已删除 exe 的服务条目。代价是安装、升级和卸载都需要管理员授权。开始菜单条目同样是整机的（在 `CommonAppDataFolder` 即 `%ProgramData%` 下逐级写出路径）：WiX 的 `ProgramMenuFolder` 会解析成运行安装程序那个用户的配置目录，每机器安装就会在旁边多出一份只属于该用户的副本。
+
+**会遇到几次提权提示。** 整个事务里有两处需要管理员权限，而它们是分别申请的。每机器的安装事务由安装程序自己提权；停止正在运行的 core 是另一回事：`StopCoreService` 是 immediate 自定义动作，跑在 msiexec 的*客户端*进程里，而双击启动时那个进程是未提权的——它会去调用 `thunet --machine service stop`，由后者申请服务 DACL 只留给管理员的那部分权限。从已经提权的上下文启动安装包，则在最开始就把这个令牌交给了客户端，第二次提示根本不会出现：
+
+| 启动方式 | 全新安装 | 重新安装、升级、卸载 | 静默（`/qn`） |
+| --- | --- | --- | --- |
+| 资源管理器双击 | 1 次 | 2 次 | — |
+| 右键*以管理员身份运行*、管理员终端、winget | 1 次 | 1 次 | 1 次 |
+| 普通终端 | — | — | 失败（1925：静默安装无法申请提权） |
+
+第二次提示不是错误，也不是第二次安装：拒绝它会中止事务并整体回滚，接受它则让同一次安装继续下去。它之所以存在，是因为普通交互用户对服务只有*查询*权限——启动和停止始终只属于管理员——所以代价是多一次确认，而不是让任何登录用户都能停掉后台 core。如果不想看到它，请从提权的上下文启动安装包；另一条路是 `Privileged` 属性，它让 msiexec 客户端自己提权，代价是整个安装界面都在管理员权限下运行。
 
 窗口偏好是**每用户**的（`%APPDATA%\thunet`），而 core 的账号、门户主机和加密凭据在整机目录（`%ProgramData%\thunet`）。服务由应用在第一次选择服务档位或第一次点状态页的 **启动** 时注册（需要管理员），而不是由 MSI 直接创建；MSI 在升级时会停掉、改写路径并重启它。
 
