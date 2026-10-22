@@ -467,7 +467,16 @@ pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
       break;
     }
     match listener.accept() {
-      Ok(stream) => spawn_connection(stream, &cmd_tx, &hub),
+      Ok(stream) => {
+        // A polling listener also hands out polling streams: the flag is part
+        // of the instance, and every new instance is created from it. See
+        // `unpoll_accepted` for what that costs.
+        if polling && let Err(e) = unpoll_accepted(&stream) {
+          crate::diag::line(&format!("core: cannot make the connection blocking: {e}"));
+          continue;
+        }
+        spawn_connection(stream, &cmd_tx, &hub)
+      }
       Err(e) if polling && e.kind() == std::io::ErrorKind::WouldBlock => {
         std::thread::sleep(HOST_POLL);
       }
@@ -480,6 +489,29 @@ pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
     }
   }
   Ok(Serve::Started)
+}
+
+/// Undo the listener's nonblocking flag on one accepted connection.
+///
+/// The Windows listener creates every new pipe instance from its own options,
+/// so enabling `PIPE_NOWAIT` for polling also applies to the streams it hands
+/// out. A nonblocking read on a pipe with nothing to read does not block: it
+/// returns zero bytes, which the reader thread can only read as the frontend
+/// closing the connection. Every frontend was therefore dropped right after it
+/// attached - the window reconnected in a loop and its state flickered between
+/// online and offline, and a one-shot `thunet status` never got its answer. The
+/// flag is per instance, so clearing it here leaves the listener itself
+/// polling.
+#[cfg(windows)]
+fn unpoll_accepted(stream: &Stream) -> Result<(), String> {
+  stream.set_nonblocking(false).map_err(|e| e.to_string())
+}
+
+/// The local-socket listener already keeps its accepted streams blocking; only
+/// `accept` itself polls, so there is nothing to undo.
+#[cfg(unix)]
+fn unpoll_accepted(_stream: &Stream) -> Result<(), String> {
+  Ok(())
 }
 
 /// Make `accept` return [`WouldBlock`](std::io::ErrorKind::WouldBlock) instead
