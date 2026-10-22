@@ -149,40 +149,68 @@ fn level_color(level: Level, visuals: &egui::Visuals) -> egui::Color32 {
 fn disc_rgba(size: usize, fill: [u8; 3]) -> Vec<u8> {
   let mut rgba = vec![0u8; size * size * 4];
   let s = size as f32;
-  let c = (s - 1.0) / 2.0;
+  let half = (s - 1.0) / 2.0;
   let radius = s * 0.47;
-  let u = s / 64.0;
+  let edge = (s * 0.06).max(1.0);
   for y in 0..size {
     for x in 0..size {
-      let dx = x as f32 - c;
-      let dy = y as f32 - c;
-      let d = (dx * dx + dy * dy).sqrt();
+      let d = ((x as f32 - half).powi(2) + (y as f32 - half).powi(2)).sqrt();
       let alpha = if d <= radius {
         1.0
-      } else if d <= radius + 1.5 * u {
-        (radius + 1.5 * u - d) / (1.5 * u)
+      } else if d <= radius + edge {
+        (radius + edge - d) / edge
       } else {
         0.0
       };
       if alpha <= 0.0 {
         continue;
       }
-      // Letter "T": a horizontal bar plus a centred stem (metrics for 64 px).
-      let bar = dx.abs() <= 11.0 * u && dy >= -13.0 * u && dy <= -5.5 * u;
-      let stem = dx.abs() <= 4.0 * u && dy >= -13.0 * u && dy <= 15.0 * u;
+      let t = letter_cover(x as f32, y as f32, s);
       let i = (y * size + x) * 4;
-      let (r, g, b) = if bar || stem {
-        (255, 255, 255)
-      } else {
-        (fill[0], fill[1], fill[2])
-      };
-      rgba[i] = r;
-      rgba[i + 1] = g;
-      rgba[i + 2] = b;
+      rgba[i] = mix(fill[0], 255, t);
+      rgba[i + 1] = mix(fill[1], 255, t);
+      rgba[i + 2] = mix(fill[2], 255, t);
       rgba[i + 3] = (alpha * 255.0) as u8;
     }
   }
   rgba
+}
+
+fn mix(a: u8, b: u8, t: f32) -> u8 {
+  (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
+}
+
+/// Coverage of the white "T" at one pixel, 0.0 .. 1.0, in icon coordinates.
+///
+/// The metrics are the ones `scripts/make_icon.py` draws the packaged
+/// `assets/thunet.ico` with, feathering included, so the tray, the taskbar and
+/// the Start Menu shortcut show the same letter instead of three variations of
+/// it.
+fn letter_cover(x: f32, y: f32, size: f32) -> f32 {
+  let half = (size - 1.0) / 2.0;
+  let bar_half_w = size * 0.17;
+  let bar_top = size * 0.29;
+  let bar_thick = (size * 0.115).max(1.2);
+  let stem_half = (size * 0.062).max(0.9);
+  let stem_bottom = size * 0.74;
+  let feather = 0.75;
+
+  let inside_bar = (x - half).abs() <= bar_half_w && y >= bar_top && y <= bar_top + bar_thick;
+  let inside_stem = (x - half).abs() <= stem_half && y >= bar_top && y <= stem_bottom;
+  if inside_bar || inside_stem {
+    return 1.0;
+  }
+  // Distance to the nearest edge, so diagonal pixels blend instead of
+  // stair-stepping.
+  let dx_bar = (x - half).abs() - bar_half_w;
+  let dy_bar = (bar_top - y).max(y - (bar_top + bar_thick));
+  let dx_stem = (x - half).abs() - stem_half;
+  let dy_stem = (bar_top - y).max(y - stem_bottom);
+  let gap = dx_bar.max(dy_bar).min(dx_stem.max(dy_stem));
+  if gap <= 0.0 {
+    return 1.0;
+  }
+  (1.0 - gap / feather).max(0.0)
 }
 
 fn make_icon(rgb: [u8; 3]) -> Icon {
@@ -200,13 +228,50 @@ const ICON_SIDE: f32 = 15.0;
 /// The same, beside a page heading, which is drawn larger.
 const HEADING_ICON_SIDE: f32 = 18.0;
 
-/// Window / taskbar icon: the packaged app icon (green disc with a white "T").
+/// Blue the portable setup uses where the installed app is green.
+///
+/// The letter stays the brand "T": the two modes are the same application, and
+/// a second glyph only made the small tray icon unreadable.
+const PORTABLE_FILL: [u8; 3] = [58, 120, 200];
+
+/// Window / taskbar icon: the packaged app icon (green disc with a white "T"),
+/// blue while this process is the portable one.
 fn app_icon() -> egui::IconData {
   const S: usize = 64;
   egui::IconData {
-    rgba: disc_rgba(S, [46, 160, 67]),
+    rgba: disc_rgba(S, app_fill(State::Online)),
     width: S as u32,
     height: S as u32,
+  }
+}
+
+/// Fill of this process's icons for one state.
+///
+/// The installed app owns green / amber / grey (online, authenticating,
+/// offline). The portable setup moves that whole scale into blue, brightness
+/// carrying the state, because its window and tray sit next to the installed
+/// ones and are otherwise impossible to tell apart - the two modes keep
+/// separate accounts, credentials and endpoints.
+fn app_fill(state: State) -> [u8; 3] {
+  if !crate::ipc::portable() {
+    return color_for(state);
+  }
+  match state {
+    State::Online => PORTABLE_FILL,
+    State::Authenticating => [108, 158, 216],
+    State::Offline => [72, 88, 116],
+  }
+}
+
+/// What this process calls itself in the title bar, the tray tooltip and
+/// Alt-Tab. One string for all of them: the two modes keep separate state,
+/// credentials and endpoints, and a user running both has to be able to tell
+/// which one is asking.
+fn app_name() -> &'static str {
+  if crate::ipc::portable() {
+    "THUnet Portable"
+  } else {
+    "THUnet"
   }
 }
 
@@ -550,11 +615,7 @@ impl App {
     // points at, and a second id would mean a second icon and a second set of
     // window rules.
     let portable = crate::ipc::portable();
-    let app_title = if portable {
-      "THUnet Portable"
-    } else {
-      "THUnet"
-    };
+    let app_title = app_name();
 
     let show_item = MenuItem::with_id("show", t.show_window, true, None);
     let hide_item = MenuItem::with_id("hide", t.hide_window, true, None);
@@ -574,7 +635,7 @@ impl App {
       // The menu lives on the right button; a left click brings the window back.
       .with_menu_on_left_click(false)
       .with_tooltip(app_title)
-      .with_icon(make_icon(color_for(State::Offline)))
+      .with_icon(make_icon(app_fill(State::Offline)))
       .build()
       .ok();
     // Without a tray icon there is no way back into a hidden window, so an
@@ -1439,15 +1500,15 @@ impl App {
   /// a link that carries no portal session while the tray icon kept its grey.
   fn state_display(&self, t: &Texts) -> (&'static str, [u8; 3]) {
     match self.state {
-      State::Online => (t.online, color_for(State::Online)),
-      State::Authenticating => (t.authenticating, color_for(State::Authenticating)),
+      State::Online => (t.online, app_fill(State::Online)),
+      State::Authenticating => (t.authenticating, app_fill(State::Authenticating)),
       // The portal has no session for this address, but the link does not go
       // through it at all: "Offline" would read as "there is no internet",
       // which is the opposite of what the probe just measured.
       State::Offline if self.env == LoginEnv::NoPortal => {
-        (t.online_without_portal, color_for(State::Online))
+        (t.online_without_portal, app_fill(State::Online))
       }
-      State::Offline => (t.offline, color_for(State::Offline)),
+      State::Offline => (t.offline, app_fill(State::Offline)),
     }
   }
 
@@ -3888,8 +3949,8 @@ impl eframe::App for App {
     #[cfg(windows)]
     {
       let tip = match self.state {
-        State::Online => format!("THUnet · {label} · {}", dash(&self.info.ip4)),
-        _ => format!("THUnet · {label}"),
+        State::Online => format!("{} · {label} · {}", app_name(), dash(&self.info.ip4)),
+        _ => format!("{} · {label}", app_name()),
       };
       if let Some(tray) = &self.tray {
         let _ = tray.set_tooltip(Some(&tip));
@@ -4295,6 +4356,10 @@ fn install_tray_events(ctx: &egui::Context) {
 /// `THUNET_RENDERER=wgpu` skips straight to the fallback.
 pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
   STARTED.get_or_init(Instant::now);
+  #[cfg(windows)]
+  if crate::ipc::portable() {
+    set_portable_app_id();
+  }
   let force_wgpu = std::env::var("THUNET_RENDERER")
     .map(|v| v.eq_ignore_ascii_case("wgpu"))
     .unwrap_or(false);
@@ -4336,6 +4401,23 @@ fn init_gtk() -> Result<(), String> {
   Ok(())
 }
 
+/// Give the portable window its own taskbar identity.
+///
+/// Windows builds the taskbar button from the process's AppUserModelID: with
+/// the implicit one (the executable path) both modes resolve to the installed
+/// shortcut, so the portable window joins the installed one in a single button
+/// and the button keeps the shortcut's icon whatever the window icon is. A
+/// separate id makes it a separate button, and a button with no matching
+/// shortcut falls back to the window's own icon - the blue one.
+#[cfg(windows)]
+fn set_portable_app_id() {
+  use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+  let id: Vec<u16> = "THUnet.Portable\0".encode_utf16().collect();
+  // SAFETY: `id` is NUL-terminated and outlives the call. A failure at worst
+  // leaves the portable window grouped with the installed one, as before.
+  let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
+}
+
 fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<(), String> {
   // Mutated only by the X11 block below; other platforms build it as is.
   #[allow(unused_mut)]
@@ -4345,11 +4427,7 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
       .with_resizable(false)
       .with_visible(!minimized)
       .with_icon(std::sync::Arc::new(app_icon()))
-      .with_title(if crate::ipc::portable() {
-        "THUnet Portable"
-      } else {
-        "THUnet"
-      }),
+      .with_title(app_name()),
     // The window size is fixed by the layout, so a stale persisted size (or a
     // previous position off-screen) must not override it on the next launch.
     persist_window: false,
