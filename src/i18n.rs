@@ -74,6 +74,29 @@ pub struct Texts {
   /// Placeholder for an empty field while the core holds a saved password: an
   /// empty field means "keep it", not "delete it".
   pub password_keep: &'static str,
+  /// The account is being switched: the old session is logged out and the new
+  /// pair is tried, which drops the connection for a moment.
+  pub switching_account: &'static str,
+  /// The new pair worked and is now the stored one.
+  pub switched_account: &'static str,
+  /// The new pair did not work; the previous account signed back in and the
+  /// stored credential was left untouched.
+  pub switch_failed: &'static str,
+  /// The portal still lists this address as online, so nothing was switched.
+  pub switch_pending: &'static str,
+  /// Confirmation shown when a switch has no stored credential to fall back on.
+  pub switch_warning_title: &'static str,
+  pub switch_warning_body: &'static str,
+  pub switch_continue: &'static str,
+  pub cancel: &'static str,
+  /// Amber band: auto connect is on, but there is nothing to connect with.
+  pub auto_connect_without_credentials: &'static str,
+  /// The same gap while a leftover session is still online: it looks healthy,
+  /// but nothing can sign in again once that session ends.
+  pub auto_connect_without_credentials_online: &'static str,
+  /// Hover on a disabled *Apply*: the form is incomplete, or nothing changed.
+  pub password_required: &'static str,
+  pub nothing_to_apply: &'static str,
   /// Connect was pressed while no account/password is available at all.
   pub no_credentials: &'static str,
   /// Prefix of the compile-time stamp next to the version.
@@ -88,7 +111,23 @@ pub struct Texts {
   pub network_unavailable: &'static str,
   pub no_login_needed: &'static str,
   pub not_campus_network: &'static str,
+  /// Why a portal request failed, one line per [`crate::srun::NetCause`]. The
+  /// banner uses these instead of the OS's own text, which Windows localizes
+  /// on its own terms.
+  pub net_resolve: &'static str,
+  pub net_refused: &'static str,
+  pub net_timeout: &'static str,
+  pub net_unreachable: &'static str,
+  pub net_other: &'static str,
+  /// Shown while a login could still happen: the 802.1X network is the reason it
+  /// cannot.
   pub secure_wifi: &'static str,
+  /// Shown while the session is already up on that network, so there is nothing
+  /// left for the user to do.
+  pub secure_wifi_online: &'static str,
+  /// A portal verb was asked for on a network whose session belongs to Windows.
+  pub disconnect_unavailable: &'static str,
+  pub credentials_unavailable: &'static str,
   pub language: &'static str,
   pub log_level: &'static str,
   pub lang_auto: &'static str,
@@ -108,9 +147,16 @@ pub struct Texts {
   pub service_gone: &'static str,
   /// Red banner on the status page while no core is answering.
   pub service_down: &'static str,
+  /// Red banner while a core answers with another protocol version: it runs,
+  /// but this build cannot talk to it until someone restarts it. `{}` is the
+  /// protocol the core reported.
+  pub service_stale: &'static str,
   /// Button on that row: stop the service while it runs, start it otherwise.
   pub service_start: &'static str,
   pub service_stop: &'static str,
+  /// Same button while the core speaks another protocol: a start is a no-op
+  /// for a service that already runs, so it has to be restarted.
+  pub service_restart: &'static str,
   /// Toasts for that button. They fire when the request actually succeeded, or
   /// when it provably did not; none of them uses a colon.
   pub service_started: &'static str,
@@ -124,7 +170,9 @@ pub struct Texts {
   pub connect_ok: &'static str,
   pub connect_failed: &'static str,
   /// The portal rejected the account/password pair (see
-  /// `srun::is_credentials_error`). The raw JSON goes to the log instead.
+  /// `srun::is_credentials_error`). It is the red banner, worded when the
+  /// banner is painted so a language switch rewrites it; the raw JSON answer
+  /// goes to the log instead.
   pub invalid_credentials: &'static str,
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
@@ -142,6 +190,21 @@ pub struct Texts {
   pub desktop_shortcut: &'static str,
   pub done: &'static str,
   pub quit: &'static str,
+}
+
+impl Texts {
+  /// Words for a failed portal request, so the banner follows the app's
+  /// language instead of whatever language the operating system prints.
+  pub fn net_cause(&self, cause: crate::srun::NetCause) -> &'static str {
+    use crate::srun::NetCause;
+    match cause {
+      NetCause::Resolve => self.net_resolve,
+      NetCause::Refused => self.net_refused,
+      NetCause::Timeout => self.net_timeout,
+      NetCause::Unreachable => self.net_unreachable,
+      NetCause::Other => self.net_other,
+    }
+  }
 }
 
 static ZH: Texts = Texts {
@@ -168,6 +231,18 @@ static ZH: Texts = Texts {
   password_cleared: "密码已清除",
   password_missing: "未填写密码",
   password_keep: "已保存，留空则不修改",
+  switching_account: "正在切换账号，网络会中断片刻…",
+  switched_account: "账号已切换",
+  switch_failed: "新凭据未通过，已用原账号重新登录",
+  switch_pending: "校园网仍显示本机在线，稍后再试",
+  switch_warning_title: "没有可回退的密码",
+  switch_warning_body: "本机只有在校园网接受新密码后才会重新联网。如果新密码有误，它会掉线，而且本机没有旧密码可以重连——需要到现场或换一条线路才能恢复。确定继续吗？",
+  switch_continue: "仍要切换",
+  cancel: "取消",
+  auto_connect_without_credentials: "自动连接已开启，但没有保存账号或密码",
+  auto_connect_without_credentials_online: "当前会话可继续，但没有保存密码——掉线后不会自动重连",
+  password_required: "保存密码或更换账号都需要重新输入密码",
+  nothing_to_apply: "没有需要应用的修改",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
   on: "已开启",
@@ -178,7 +253,15 @@ static ZH: Texts = Texts {
   network_unavailable: "当前没有网络连接（网线未插或 Wi-Fi 未连接），暂不尝试登录",
   no_login_needed: "当前网络可直接访问外网，无需登录",
   not_campus_network: "当前网络不是清华校园网登录环境，跳过登录",
+  net_resolve: "无法解析服务器地址（DNS）",
+  net_refused: "服务器拒绝了连接",
+  net_timeout: "连接服务器超时",
+  net_unreachable: "当前没有可用的网络（网线未插或网卡已禁用）",
+  net_other: "网络请求失败",
   secure_wifi: "已连接 {}（系统级 802.1X 认证），无需门户登录",
+  secure_wifi_online: "已通过 {} 登录（系统级 802.1X 认证），无需操作",
+  disconnect_unavailable: "当前网络由系统级 802.1X 认证，没有本程序建立的门户会话可断开",
+  credentials_unavailable: "当前网络由系统级 802.1X 认证，门户账号在这里不会被使用",
   language: "语言",
   log_level: "日志级别",
   lang_auto: "跟随系统",
@@ -195,8 +278,10 @@ static ZH: Texts = Texts {
   service_running: "运行中",
   service_gone: "未运行",
   service_down: "后台服务当前没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
+  service_stale: "后台服务还在运行旧版本（协议 {}），重启后才能恢复连接。",
   service_start: "启动",
   service_stop: "停止",
+  service_restart: "重启",
   service_started: "后台服务已启动",
   service_stopped: "后台服务已停止",
   service_start_failed: "后台服务启动失败",
@@ -245,6 +330,18 @@ static EN: Texts = Texts {
   password_cleared: "Password cleared",
   password_missing: "No password entered",
   password_keep: "Saved — leave blank to keep it",
+  switching_account: "Switching the account, the connection drops for a moment…",
+  switched_account: "Account switched",
+  switch_failed: "The new credentials were refused; signed back in with the previous account",
+  switch_pending: "The portal still lists this machine as online; try again in a moment",
+  switch_warning_title: "No password to fall back on",
+  switch_warning_body: "This machine only gets back online if the portal accepts the new password. If it is wrong, it drops off the network and no stored password can sign it back in — recovering it would need physical access or another path. Continue?",
+  switch_continue: "Switch anyway",
+  cancel: "Cancel",
+  auto_connect_without_credentials: "Auto connect is on, but no account or password is saved",
+  auto_connect_without_credentials_online: "This session keeps running, but no password is saved — it will not reconnect on its own",
+  password_required: "Saving a password or changing the account needs the password typed in",
+  nothing_to_apply: "Nothing to apply",
   no_credentials: "No account or password saved",
   built: "Built at",
   on: "On",
@@ -255,7 +352,15 @@ static EN: Texts = Texts {
   network_unavailable: "No network connection (cable unplugged / Wi-Fi down), not logging in",
   no_login_needed: "This network already reaches the internet; no login needed",
   not_campus_network: "This does not look like the Tsinghua campus login network; skipping",
+  net_resolve: "Cannot resolve the server address (DNS)",
+  net_refused: "The server refused the connection",
+  net_timeout: "The connection to the server timed out",
+  net_unreachable: "No network route to the server (cable unplugged or adapter disabled)",
+  net_other: "The network request failed",
   secure_wifi: "Connected to {} (OS-level 802.1X); no portal login needed",
+  secure_wifi_online: "Signed in through {} (OS-level 802.1X); nothing to do",
+  disconnect_unavailable: "This network authenticates in Windows; this app has no portal session here to end",
+  credentials_unavailable: "This network authenticates in Windows; the portal account is not used here",
   language: "Language",
   log_level: "Log level",
   lang_auto: "System",
@@ -272,8 +377,10 @@ static EN: Texts = Texts {
   service_running: "running",
   service_gone: "not running",
   service_down: "The background service is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
+  service_stale: "The background service still runs an older build (protocol {}); restart it to reconnect.",
   service_start: "Start",
   service_stop: "Stop",
+  service_restart: "Restart",
   service_started: "Service started",
   service_stopped: "Service stopped",
   service_start_failed: "Service failed to start",

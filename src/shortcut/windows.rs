@@ -12,47 +12,6 @@ pub fn create_desktop_shortcut() -> Result<(), String> {
   shortcut("Desktop", "THUnet.lnk", &exe)
 }
 
-/// Remove the per-user Start Menu folder older packages created.
-///
-/// A package built before the switch to `CommonProgramMenuFolder` put the
-/// entry in the profile of whoever installed it, so upgrading left two
-/// identical entries. Only the installed copy may do this, and only while the
-/// machine-wide entry exists: then the user copy is provably a duplicate, and
-/// deleting the only way to start the app is worse than leaving a stray one.
-pub fn remove_legacy_start_menu() -> Result<bool, String> {
-  let exe = match crate::exe_path() {
-    Some(exe) => exe,
-    None => return Ok(false),
-  };
-  let installed = std::env::var_os("ProgramFiles")
-    .map(std::path::PathBuf::from)
-    .is_some_and(|dir| exe.starts_with(dir));
-  if !installed {
-    return Ok(false);
-  }
-  let (Some(appdata), Some(program_data)) = (
-    std::env::var_os("APPDATA").map(std::path::PathBuf::from),
-    std::env::var_os("ProgramData").map(std::path::PathBuf::from),
-  ) else {
-    return Ok(false);
-  };
-  let menu = |base: std::path::PathBuf| {
-    base
-      .join("Microsoft")
-      .join("Windows")
-      .join("Start Menu")
-      .join("Programs")
-      .join(crate::shortcut::APP_TITLE)
-  };
-  let legacy = menu(appdata);
-  let common = menu(program_data);
-  if !legacy.is_dir() || !common.is_dir() {
-    return Ok(false);
-  }
-  std::fs::remove_dir_all(&legacy).map_err(|e| format!("{}: {e}", legacy.display()))?;
-  Ok(true)
-}
-
 /// `[Environment]::GetFolderPath` follows OneDrive-redirected folders, which is
 /// why the `.lnk` handling is delegated to PowerShell instead of hardcoding
 /// `%USERPROFILE%\Desktop`.

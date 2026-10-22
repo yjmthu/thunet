@@ -37,10 +37,9 @@
     <!-- The Windows Installer Restart Manager prompts "the following
          applications should be closed" while the UI sequence costs the
          install, which happens before any custom action runs. This package
-         stops the core service and terminates the tray itself
-         (StopCoreService, then StopRunningApp before InstallValidate in the
-         execute sequence), so the prompt is redundant: disable the Restart
-         Manager integration and let those actions do the work. -->
+         asks the window to quit itself and the Service Control Manager to stop
+         the core, both before the files are touched, so the prompt is
+         redundant: disable the Restart Manager integration. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
 
     <!-- ARP values are copied verbatim from the Property table, so a literal
@@ -50,25 +49,9 @@
     <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]"
                  After="CostFinalize" Sequence="both" />
 
-    <!-- Stop the core service the polite way (`ControlService(STOP)`, which is
-         not a failure and therefore does not trigger the restart-on-failure
-         policy) and wait for it, so the binary can be replaced right after.
-         ServiceControl is not used on purpose: the service is registered by the
-         application, not by this package, and may not exist at all. -->
-    <CustomAction Id="StopCoreService" FileRef="THUnetExe"
-                  ExeCommand="service-admin stop"
-                  Execute="immediate" Return="ignore" />
-
-    <!-- The app hides itself on WM_CLOSE (tray behaviour), so util:CloseApplication
-         is not enough: terminate the tray before files are replaced or removed.
-         The service is already gone by then (StopCoreService runs first). -->
-    <CustomAction Id="StopRunningApp" Directory="TARGETDIR"
-                  ExeCommand="taskkill /IM thunet.exe /F"
-                  Execute="immediate" Return="ignore" />
-
     <!-- Start the app once the (interactive) transaction is over: a first
-         install, an upgrade or a repair all end with a killed copy because of
-         `StopRunningApp`, so the condition must not be limited to
+         install, an upgrade or a repair all end with a closed copy because of
+         `QuitRunningApp`, so the condition must not be limited to
          `NOT Installed` - otherwise double-clicking the package again silently
          leaves no app running. Silent installs such as `msiexec /qn` or winget
          keep UILevel = 2 and stay quiet.
@@ -100,34 +83,76 @@
          not outlive the product. Same condition as RemoveCoreService, so an
          upgrade or a repair keeps the account and the sealed password. Runs
          after the service is deleted and before RemoveFiles, so the helper
-         still exists and nothing holds the directory open. -->
+         still exists and nothing holds the directory open. `Return="ignore"`:
+         the helper itself refuses while the service is still registered, and a
+         refused or failed purge must never abort an installation. -->
     <CustomAction Id="PurgeMachineState" FileRef="THUnetExe"
                   ExeCommand="service-purge"
-                  Execute="deferred" Impersonate="no" Return="check" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- The install stopped the service above; bring the new build back — but
          only when it is set to start at boot. `demand` means the user turned
-         autostart off, and an upgrade must not resurrect that session. -->
+         autostart off, and an upgrade must not resurrect that session. Also
+         deferred and unimpersonated so `service-resume` (which repairs the
+         ImagePath and the state ACLs) runs with SYSTEM's rights. -->
     <CustomAction Id="ResumeCoreService" FileRef="THUnetExe"
                   ExeCommand="service-resume"
-                  Execute="immediate" Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Ask the running window to quit and wait for it. Closing it is not
+         enough (a tray hides itself on WM_CLOSE) and killing it skips its
+         shutdown, so this rings the app's quit doorbell and polls the
+         single-instance name until the image is really gone. `WixQuietExec` is
+         what keeps the child's console hidden: a plain immediate custom action
+         ran `taskkill` — a console program in the user's session — and flashed
+         a black window on every install. `Return="check"` because the command
+         succeeds when nothing is running, so the only failure left is "the
+         window refused to quit", and aborting is honest there: the next step
+         would try to replace a file that is still mapped. -->
+    <SetProperty Id="WixQuietExecCmdLine"
+                 Value="&quot;[BINDIR]thunet.exe&quot; quit --timeout 15000"
+                 Before="QuitRunningApp" Sequence="execute" />
+    <CustomAction Id="QuitRunningApp" BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec" Execute="immediate" Return="check" />
+
+    <!-- The service holds `thunet.exe` open for as long as it runs, and
+         `InstallValidate` is exactly the action that checks those files: with
+         the Restart Manager disabled it waits out its own "file in use"
+         timeout, which measured ~56 s on a silent upgrade. Stopping here, while
+         the sequence is still in the immediate phase, removes that wait
+         entirely. `service stop` is a no-op when nothing is registered, and it
+         waits for STOPPED itself, so the stop type is not consulted here. -->
+    <CustomAction Id="StopCoreService" FileRef="THUnetExe"
+                  ExeCommand="service stop"
+                  Execute="immediate" Return="check" />
 
     <InstallExecuteSequence>
-      <!-- Only a previous installation can still be running: on a clean install
-           there is nothing to stop, and an unconditional `taskkill` would just
-           spawn a process that fails in every validation sandbox. -->
-      <Custom Action="StopCoreService" Before="StopRunningApp"
+      <!-- The core is stopped through the Service Control Manager — the
+           ServiceControl entry on MainExe below — which is the installer's own
+           SCM client: no `sc.exe` or `net.exe`, hence no console window, and
+           `Wait="yes"` holds the sequence at StopServices until the service
+           reports STOPPED. Installing, upgrading and uninstalling all pass
+           through it, which matters because the service can be registered by
+           the application itself without any previous package.
+           The window is asked to quit first, before InstallValidate costs the
+           files: a still-mapped image cannot be replaced with the Restart
+           Manager disabled. -->
+      <Custom Action="QuitRunningApp" Before="InstallValidate"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
-      <Custom Action="StopRunningApp" Before="InstallValidate"
+      <!-- After the window is gone and still before InstallValidate (that is
+           where QuitRunningApp sits): the service is the other holder of the
+           executable. -->
+      <Custom Action="StopCoreService" After="QuitRunningApp"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <!-- Before RemoveFiles: the helper still has to exist. -->
       <Custom Action="RemoveCoreService" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="PurgeMachineState" After="RemoveCoreService"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <!-- After the files are in place, not during an uninstall. -->
-      <Custom Action="ResumeCoreService" After="InstallFinalize"
-              Condition="NOT REMOVE=&quot;ALL&quot; AND (Installed OR WIX_UPGRADE_DETECTED)" />
+      <!-- After the files are in place, not during an uninstall. The stop runs
+           on a first install too, so the matching resume has to as well. -->
+      <Custom Action="ResumeCoreService" After="InstallFiles"
+              Condition="NOT REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchApp" After="InstallFinalize"
               Condition="UILevel &gt;= 4 AND NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
@@ -166,10 +191,10 @@
       <Component Id="MainExe" Guid="A0B2A2A3-1B5D-4A6E-8F10-5C1E2D3F4A5B">
         <File Id="THUnetExe" Source="$(var.BinPath)" KeyPath="yes">
           <Shortcut Id="StartMenuLnk" Directory="AppMenuFolder" Name="THUnet"
-                    Description="THUnet campus network client"
+                    Description="THUnet Campus Network App"
                     WorkingDirectory="BINDIR" Icon="AppIcon" />
           <Shortcut Id="DesktopLnk" Directory="DesktopFolder" Name="THUnet"
-                    Description="THUnet campus network client"
+                    Description="THUnet Campus Network App"
                     WorkingDirectory="BINDIR" Icon="AppIcon" />
         </File>
         <!-- The same executable is the CLI, so the directory joins the system
@@ -181,8 +206,16 @@
         <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
         <RemoveFolder Id="RemoveBinFolder" Directory="BINDIR" On="uninstall" />
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <!-- Stop the core at StopServices (before InstallFiles) and at
+             uninstall/repair. Native SCM calls, so nothing is spawned and
+             nothing flashes; the service is deleted by the
+             `service-admin uninstall` action, not here, because that one also
+             removes the tray logon task. A machine without the service (the
+             very first install) logs a warning and continues. -->
+        <ServiceControl Id="StopCore" Name="thunet" Stop="both" Wait="yes" />
       </Component>
     </ComponentGroup>
 
   </Package>
+
 </Wix>

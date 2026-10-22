@@ -22,6 +22,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use interprocess::local_socket::prelude::*;
@@ -35,7 +36,7 @@ use interprocess::os::windows::named_pipe::{
 };
 
 use crate::config::Config;
-use crate::proto::{Cmd, Ev, Msg, VERSION, Wire};
+use crate::proto::{Cmd, Ev, Failure, Msg, VERSION, Wire};
 
 /// Whether this process serves the machine-wide endpoint. Set by [`serve`].
 static MACHINE: AtomicBool = AtomicBool::new(false);
@@ -167,7 +168,7 @@ struct Shared {
   state: Option<crate::session::State>,
   env: Option<crate::proto::LoginEnv>,
   info: Option<serde_json::Value>,
-  error: Option<String>,
+  error: Option<Failure>,
 }
 
 impl Hub {
@@ -262,13 +263,80 @@ impl Sink {
 /// Outcome of [`serve`].
 pub enum Serve {
   Started,
-  /// Another core already owns the endpoint; this process exits quietly.
+  /// Another core already owns the endpoint. Only a portable core reports this
+  /// (and then exits quietly); a machine-mode core waits out a predecessor that
+  /// is still shutting down and fails loudly if it never lets go.
   AlreadyRunning,
 }
 
 enum BindError {
   InUse,
   Other(String),
+}
+
+/// How long a service start waits for a predecessor to let go of the endpoint.
+const BIND_WAIT: Duration = Duration::from_secs(15);
+/// Poll interval while waiting, doubling up to [`BIND_STEP_MAX`]. A predecessor
+/// normally releases in well under a second, so the first steps are short; the
+/// backoff only matters when something is genuinely stuck, and keeps the
+/// retries from turning into a busy loop of probe connections against whatever
+/// still owns the endpoint.
+const BIND_STEP: Duration = Duration::from_millis(100);
+const BIND_STEP_MAX: Duration = Duration::from_millis(1_000);
+
+/// Bind the endpoint, waiting out an owner that is still shutting down.
+///
+/// The SCM has already been told the service is `RUNNING` by the time a
+/// predecessor releases the pipe, so giving up on `IN_USE` at once leaves the
+/// service looking alive while serving nobody, and only another manual restart
+/// brings it back. A portable core still exits immediately: there a busy
+/// endpoint really does mean another core is already serving, and the caller can
+/// just talk to that one.
+fn bind_listener(path: &str, machine: bool) -> Result<Option<Listener>, String> {
+  // `None` waits for nobody: one attempt, and a busy endpoint is the answer.
+  let wait = machine.then_some(BIND_WAIT);
+  bind_retrying(path, wait, || bind(path, machine))
+}
+
+/// Drive `attempt` until it succeeds, waiting at most `wait` for a busy endpoint.
+///
+/// Returns `Ok(None)` when `wait` is `None` and the very first attempt finds the
+/// endpoint in use, so the caller can report "already running" instead of an
+/// error.
+fn bind_retrying<T>(
+  path: &str,
+  wait: Option<Duration>,
+  mut attempt: impl FnMut() -> Result<T, BindError>,
+) -> Result<Option<T>, String> {
+  let Some(wait) = wait else {
+    return match attempt() {
+      Ok(value) => Ok(Some(value)),
+      Err(BindError::InUse) => Ok(None),
+      Err(BindError::Other(e)) => Err(e),
+    };
+  };
+  let deadline = Instant::now() + wait;
+  let mut step = BIND_STEP.min(wait);
+  loop {
+    match attempt() {
+      Ok(value) => return Ok(Some(value)),
+      Err(BindError::Other(e)) => return Err(e),
+      Err(BindError::InUse) => {
+        if Instant::now() + step >= deadline {
+          let waited = if wait.as_secs() > 0 {
+            format!("{} s", wait.as_secs())
+          } else {
+            format!("{} ms", wait.as_millis())
+          };
+          return Err(format!(
+            "cannot listen on {path}: another core owned it for {waited}, so this one is not serving"
+          ));
+        }
+        std::thread::sleep(step);
+        step = (step * 2).min(BIND_STEP_MAX);
+      }
+    }
+  }
 }
 
 /// Run the core: bind the endpoint, then drive the session loop forever.
@@ -283,10 +351,9 @@ pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
   }
   MACHINE.store(machine, Ordering::Relaxed);
   let path = endpoint(machine);
-  let listener = match bind(&path, machine) {
-    Ok(listener) => listener,
-    Err(BindError::InUse) => return Ok(Serve::AlreadyRunning),
-    Err(BindError::Other(e)) => return Err(e),
+  let listener = match bind_listener(&path, machine)? {
+    Some(listener) => listener,
+    None => return Ok(Serve::AlreadyRunning),
   };
   crate::diag::line(&format!("core: listening on {path} (machine={machine})"));
   #[cfg(unix)]
@@ -683,6 +750,10 @@ pub struct Link {
   cmds: Sender<Cmd>,
   events: Receiver<Ev>,
   alive: Arc<AtomicBool>,
+  /// Protocol version the core announced when it refused to talk to this
+  /// build. A frontend needs it to tell "an old core is serving" apart from
+  /// "no core at all", which are very different situations for the user.
+  speaks: Arc<Mutex<Option<u8>>>,
   machine: bool,
 }
 
@@ -749,6 +820,7 @@ impl Link {
     let stream = trusted_stream(stream, machine)?;
     let (recv_half, send_half) = stream.halves();
     let alive = Arc::new(AtomicBool::new(true));
+    let speaks = Arc::new(Mutex::new(None::<u8>));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (ev_tx, ev_rx) = channel::<Ev>();
 
@@ -769,6 +841,7 @@ impl Link {
     });
 
     let reader_alive = alive.clone();
+    let reader_speaks = speaks.clone();
     std::thread::spawn(move || {
       let mut lines = BufReader::new(recv_half).lines();
       loop {
@@ -799,10 +872,14 @@ impl Link {
             }
           }
           Ok(wire) => {
-            let _ = ev_tx.send(Ev::Log(crate::logline::Line::error(format!(
-              "core speaks protocol {} but this build speaks {VERSION}",
-              wire.v
-            ))));
+            // Remember the version instead of only logging it here: the
+            // window has to keep one stable banner and must not re-announce
+            // the same mismatch every few seconds, and the CLI wants a precise
+            // error when the link dies under it.
+            let mut slot = reader_speaks
+              .lock()
+              .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(wire.v);
             break;
           }
           Err(e) => {
@@ -819,6 +896,7 @@ impl Link {
       cmds: cmd_tx,
       events: ev_rx,
       alive,
+      speaks,
       machine,
     })
   }
@@ -834,6 +912,16 @@ impl Link {
   /// `false` once either half of the connection is gone.
   pub fn alive(&self) -> bool {
     self.alive.load(Ordering::Relaxed)
+  }
+
+  /// The protocol version the core answered with, when it is not the one this
+  /// build speaks. `None` until such an answer arrives.
+  pub fn speaks(&self) -> Option<u8> {
+    let slot = self
+      .speaks
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot
   }
 
   /// Whether this link goes to the machine service rather than a portable core.
@@ -884,21 +972,36 @@ pub fn open_result() -> Result<Link, String> {
 /// policy); otherwise a plain `thunet core` is spawned. The caller keeps its own
 /// reconnect cadence, and registering a start (`systemctl` / `schtasks`) runs
 /// synchronously, so this is a click-sized call, not a request to poll.
-pub fn start_core() -> Result<(), String> {
+///
+/// `restart` is for the upgrade case: a core that is already running keeps
+/// running the replaced image, and starting it again is a no-op, so the service
+/// has to be stopped and started to pick the new binary up.
+pub fn start_core(restart: bool) -> Result<(), String> {
   #[cfg(windows)]
   {
     // Windows has one supported core: the service. `Start` also registers it
     // on first use, so a fresh MSI install never falls back to a user-run
     // process that would own the machine endpoint.
-    return crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)
-      .map(|_| ());
+    let action = if restart {
+      crate::autostart::ServiceAction::Restart
+    } else {
+      crate::autostart::ServiceAction::Start
+    };
+    return crate::autostart::Autostart::service(action, false).map(|_| ());
   }
   #[cfg(not(windows))]
   {
     if crate::autostart::core_managed() {
-      crate::autostart::Autostart::service(crate::autostart::ServiceAction::Start, false)?;
+      let action = if restart {
+        crate::autostart::ServiceAction::Restart
+      } else {
+        crate::autostart::ServiceAction::Start
+      };
+      crate::autostart::Autostart::service(action, false)?;
       Ok(())
     } else {
+      // A portable core is not registered anywhere, so there is nothing to
+      // restart: the caller replacing it is the user closing it.
       spawn_core()
     }
   }
@@ -932,6 +1035,58 @@ mod tests {
       endpoint(false),
       "a portable core must not own the machine endpoint"
     );
+  }
+
+  #[test]
+  fn a_portable_core_does_not_wait_for_a_busy_endpoint() {
+    let started = Instant::now();
+    let got = bind_retrying("thunet-control", None, || Err::<(), _>(BindError::InUse))
+      .expect("a busy endpoint is an answer, not a failure");
+    assert!(got.is_none(), "the caller reports 'already running'");
+    assert!(
+      started.elapsed() < Duration::from_secs(1),
+      "a second portable core exits instead of waiting for the first"
+    );
+  }
+
+  #[test]
+  fn a_service_waits_out_the_core_it_replaces() {
+    let mut attempts = 0;
+    let got = bind_retrying("thunet-control", Some(Duration::from_secs(2)), || {
+      attempts += 1;
+      if attempts < 3 {
+        Err(BindError::InUse)
+      } else {
+        Ok("listener")
+      }
+    })
+    .expect("the predecessor let go within the window");
+    assert_eq!(got, Some("listener"));
+    assert_eq!(attempts, 3, "a busy endpoint is retried, not surrendered");
+  }
+
+  #[test]
+  fn a_stuck_owner_is_reported_instead_of_serving_nothing() {
+    let err = bind_retrying::<()>("thunet-control", Some(Duration::from_millis(250)), || {
+      Err(BindError::InUse)
+    })
+    .expect_err("an owner that never leaves must not look like a running service");
+    assert!(
+      err.contains("another core owned it for 250 ms"),
+      "the wait must be visible in the error: {err}"
+    );
+  }
+
+  #[test]
+  fn a_real_bind_failure_is_not_retried() {
+    let mut attempts = 0;
+    let err = bind_retrying::<()>("thunet-control", Some(Duration::from_secs(5)), || {
+      attempts += 1;
+      Err(BindError::Other("bad pipe DACL".into()))
+    })
+    .expect_err("a malformed endpoint must surface immediately");
+    assert_eq!(err, "bad pipe DACL");
+    assert_eq!(attempts, 1, "retrying cannot fix a broken endpoint");
   }
 
   #[cfg(windows)]
@@ -995,13 +1150,13 @@ mod tests {
     hub.publish(Ev::State(State::Online));
     hub.publish(Ev::Env(LoginEnv::Campus));
     hub.publish(Ev::Log(Line::info("first")));
-    hub.publish(Ev::Error(Some("boom".into())));
+    hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
     let (_rx, backlog) = hub.attach();
     // Snapshot first, then the replayed log lines.
     assert!(matches!(backlog[0], Ev::State(State::Online)));
     assert!(matches!(backlog[1], Ev::Env(LoginEnv::Campus)));
-    assert!(matches!(&backlog[2], Ev::Error(Some(e)) if e == "boom"));
+    assert!(matches!(&backlog[2], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
     assert!(matches!(backlog.last(), Some(Ev::Log(_))));
   }
 
@@ -1068,7 +1223,7 @@ mod tests {
 
     // A command has to travel the other way; both the success and the failure
     // path answer with a toast.
-    link.send(Cmd::Refresh);
+    link.send(Cmd::Refresh { quiet: false });
     let mut answered = false;
     for _ in 0..100 {
       while let Some(ev) = link.try_recv() {

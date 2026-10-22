@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::i18n::{Lang, Texts};
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
-use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, LoginEnv, ToastKind};
+use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, Failure, LoginEnv, ToastKind};
 use crate::session::State;
 
 impl LoginEnv {
@@ -176,6 +176,16 @@ fn make_icon(rgb: [u8; 3]) -> Icon {
   Icon::from_rgba(disc_rgba(S, rgb), S as u32, S as u32).expect("valid rgba")
 }
 
+/// Size of the header icons (*Settings*, *Back*) in points.
+///
+/// Set by hand rather than from the button's text height: the glyphs are
+/// textures with their own proportions, and this size lines them up with the
+/// labels next to them.
+const ICON_SIDE: f32 = 15.0;
+
+/// The same, beside a page heading, which is drawn larger.
+const HEADING_ICON_SIDE: f32 = 18.0;
+
 /// Window / taskbar icon: the packaged app icon (green disc with a white "T").
 fn app_icon() -> egui::IconData {
   const S: usize = 64;
@@ -186,6 +196,131 @@ fn app_icon() -> egui::IconData {
   }
 }
 
+/// The gear in front of *Settings*, drawn in code: asset-free like the app
+/// icon, and independent of the fonts, since egui bundles only the glyphs in
+/// `special_emojis` and the system CJK fallback has no gear either.
+fn gear_image() -> egui::ColorImage {
+  const S: usize = 64;
+  let c = (S as f32 - 1.0) / 2.0;
+  let mut rgba = vec![0u8; S * S * 4];
+  for y in 0..S {
+    for x in 0..S {
+      let dx = x as f32 - c;
+      let dy = y as f32 - c;
+      // 0 at the centre, 1 at the edge of the icon.
+      let rho = (dx * dx + dy * dy).sqrt() / c;
+      // Teeth: the rim is further out inside a tooth than in the gap after it,
+      // which gives eight rectangular teeth with radial sides.
+      let phase = (dy.atan2(dx) / std::f32::consts::TAU * 8.0).rem_euclid(1.0);
+      let outer = if phase < 0.5 { 0.95 } else { 0.72 };
+      // Two soft edges make the teeth survive being scaled down to 15 px.
+      let rim = 1.0 - ramp(rho, outer - 0.05, outer + 0.03);
+      let hub = ramp(rho, 0.26, 0.34);
+      let alpha = (rim * hub).clamp(0.0, 1.0);
+      let i = (y * S + x) * 4;
+      rgba[i] = 255;
+      rgba[i + 1] = 255;
+      rgba[i + 2] = 255;
+      rgba[i + 3] = (alpha * 255.0).round() as u8;
+    }
+  }
+  egui::ColorImage::from_rgba_unmultiplied([S, S], &rgba)
+}
+
+/// 0 at or below `lo`, 1 at or above `hi`, linear in between.
+fn ramp(v: f32, lo: f32, hi: f32) -> f32 {
+  ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// Left arrow for the *Back* button: a shaft with two head strokes.
+///
+/// White and soft-edged like the gear, so the button can tint it to its own
+/// text colour.
+fn back_arrow_image() -> egui::ColorImage {
+  const S: usize = 64;
+  // In units of the icon's own size, so the shape does not depend on `S`.
+  let strokes = [
+    ((0.24, 0.50), (0.80, 0.50)), // shaft
+    ((0.48, 0.26), (0.24, 0.50)), // upper head
+    ((0.48, 0.74), (0.24, 0.50)), // lower head
+  ];
+  let half = 0.055; // half the stroke width
+  let s = S as f32;
+  let mut rgba = vec![0u8; S * S * 4];
+  for y in 0..S {
+    for x in 0..S {
+      // Sample the pixel centre, so the arrow stays symmetric.
+      let p = ((x as f32 + 0.5) / s, (y as f32 + 0.5) / s);
+      let alpha = strokes
+        .iter()
+        .map(|&(from, to)| segment_alpha(p, from, to, half))
+        .fold(0.0, f32::max);
+      let i = (y * S + x) * 4;
+      rgba[i] = 255;
+      rgba[i + 1] = 255;
+      rgba[i + 2] = 255;
+      rgba[i + 3] = (alpha * 255.0).round() as u8;
+    }
+  }
+  egui::ColorImage::from_rgba_unmultiplied([S, S], &rgba)
+}
+
+/// Coverage of a round-capped stroke from `a` to `b` with half-width `half`.
+fn segment_alpha(p: (f32, f32), a: (f32, f32), b: (f32, f32), half: f32) -> f32 {
+  let (px, py) = p;
+  let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+  let len2 = dx * dx + dy * dy;
+  let t = if len2 > 0.0 {
+    (((px - a.0) * dx + (py - a.1) * dy) / len2).clamp(0.0, 1.0)
+  } else {
+    0.0
+  };
+  let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+  let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+  // A ~1 px soft edge at 64 px keeps the arrow smooth at 15 px.
+  1.0 - ramp(d, half - 0.012, half + 0.012)
+}
+
+/// Upload an icon once and hand the same handle out afterwards.
+///
+/// `load_texture` allocates a new GPU texture on every call, and the window is
+/// repainted twice a second even when nothing happens.
+fn icon_texture(
+  slot: &mut Option<egui::TextureHandle>,
+  ctx: &egui::Context,
+  name: &str,
+  image: fn() -> egui::ColorImage,
+) -> egui::TextureHandle {
+  slot
+    .get_or_insert_with(|| ctx.load_texture(name, image(), egui::TextureOptions::LINEAR))
+    .clone()
+}
+
+/// An icon-only header button, tinted like a text button.
+fn icon_button(texture: egui::TextureId) -> egui::Button<'static> {
+  egui::Button::image(egui::Image::new(egui::load::SizedTexture::new(
+    texture,
+    [ICON_SIDE, ICON_SIDE],
+  )))
+  .image_tint_follows_text_color(true)
+}
+
+/// An icon beside a page heading, painted in the text colour and drawn larger
+/// than the header buttons.
+fn heading_icon(
+  slot: &mut Option<egui::TextureHandle>,
+  ctx: &egui::Context,
+  name: &str,
+  image: fn() -> egui::ColorImage,
+  color: egui::Color32,
+) -> egui::Image<'static> {
+  let texture = icon_texture(slot, ctx, name, image);
+  egui::Image::new(egui::load::SizedTexture::new(
+    texture.id(),
+    [HEADING_ICON_SIDE, HEADING_ICON_SIDE],
+  ))
+  .tint(color)
+}
 // (the session loop now lives in `core.rs`)
 
 /// Which pane the window is showing: the everyday status view, or the
@@ -207,6 +342,20 @@ enum ServiceRequest {
 
 /// How long a Start/Stop may take before the click is reported as failed.
 const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an account switch may stay unanswered before *Apply* is released.
+/// The core logs out and logs in twice, so a few round trips are normal; this
+/// only exists so a lost answer cannot disable the button forever.
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait before probing the local endpoint again.
+const LINK_RETRY: Duration = Duration::from_secs(2);
+
+/// The same, while a core that cannot talk to this build is answering: only a
+/// restart changes that answer, so a faster loop would just rebuild a
+/// connection that is refused immediately. Short enough that a manual restart
+/// is picked up without waiting out a full period.
+const STALE_RETRY: Duration = Duration::from_secs(5);
 
 struct Toast {
   msg: String,
@@ -238,7 +387,10 @@ pub struct App {
   state: State,
   info: Info,
   logs: Vec<Line>,
-  last_error: Option<String>,
+  /// The failure the red banner shows. Stored as a kind rather than as words,
+  /// so the banner is re-worded by a language switch instead of keeping the
+  /// language it arrived in.
+  last_error: Option<Failure>,
   /// Height the status banner occupies in this frame (0 when none is shown).
   /// The window grows by exactly this much, so the log pane keeps its size
   /// instead of being covered or squeezed.
@@ -249,8 +401,20 @@ pub struct App {
   /// The missing-service warning is already in the log; keeps the two-second
   /// reconnect cadence from repeating it.
   service_warned: bool,
+  /// Protocol the core answered with when it refused this build. `Some` means
+  /// a core is running but cannot serve this window until it is restarted.
+  core_stale: Option<u8>,
+  /// A core answered on the current link. An open socket alone does not count:
+  /// one that speaks another protocol is refused a moment after connecting,
+  /// and the banner must not flicker for that.
+  core_answered: bool,
   cfg: Config,
   lang: Lang,
+  /// Whether this link has been told the window's language. `App::new` opens a
+  /// link before the object exists, so the first connection never passed
+  /// through the "new link" path - and the core, which words the messages it
+  /// generates itself, kept its own setting (the machine one) instead.
+  lang_sent: bool,
   /// Lowest level rendered in the log pane; older lines are kept and simply
   /// hidden, so raising the threshold again brings them back.
   min_level: Level,
@@ -270,15 +434,27 @@ pub struct App {
   /// Colour of the icon currently installed in the tray; `set_icon` rewrites a
   /// temp PNG and re-announces the indicator, so it must only run on a change.
   tray_rgb: Option<[u8; 3]>,
+  /// The gear in front of *Settings*, built on first paint: the egui context
+  /// does not exist yet when `App::new` runs.
+  gear: Option<egui::TextureHandle>,
+  /// The arrow in the settings page's *Back* button, likewise.
+  back_arrow: Option<egui::TextureHandle>,
   connect_item: MenuItem,
   disconnect_item: MenuItem,
   show_item: MenuItem,
   hide_item: MenuItem,
   quit_item: MenuItem,
   started: bool,
+  /// Keyboard focus as of the previous frame, so the window coming to the
+  /// front can trigger exactly one refresh.
+  focused: bool,
   /// `--minimized`/`start_minimized`: the first painted frame must not be
   /// left on screen (eframe shows the root window after it unconditionally).
   hide_at_start: bool,
+  /// The window has been placed once in this process. eframe is told not to
+  /// persist a window position, so the first `logic` pass picks the centre of
+  /// the monitor; afterwards the user's own drag is authoritative.
+  centered: bool,
   /// The root window is DWM-cloaked until the first real "show" request, so
   /// eframe's forced first show never reaches the compositor.
   cloaked: bool,
@@ -289,6 +465,12 @@ pub struct App {
   quit_at: Option<Instant>,
   /// Start/Stop clicked on the status page, waiting for its outcome.
   service_request: Option<(ServiceRequest, Instant)>,
+  /// An account switch that has no stored credential to fall back on: the user
+  /// has to agree to it first, because a wrong password would take the machine
+  /// off the network with nothing to sign back in with.
+  confirm_switch: Option<Config>,
+  /// A switch is in flight; *Apply* stays disabled until the core answers.
+  switch_pending: Option<Instant>,
   /// Credentials entered while the machine service was down. They stay out of
   /// `cfg` until the service accepts them, so a failed start leaves the
   /// *Unsaved* markers visible.
@@ -379,37 +561,19 @@ impl App {
       Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
       _ => {}
     }
-    // A tray entry with no boot-starting core behind it is not a mode this
-    // app offers; it is a leftover from an older installation. Drop it before
-    // reading the mode, so the settings page and the OS agree.
-    match autostart.as_ref().map(Autostart::drop_stray_tray) {
-      Some(Ok(true)) => logs.push(Line::warn("autostart: dropped a stray tray entry")),
-      Some(Err(e)) => logs.push(Line::warn(format!("autostart: {e}"))),
-      _ => {}
-    }
-    // The entry also has to name the executable that is installed now: an
+    // The tray entry has to name the executable that is installed now: an
     // upgrade may have moved it, and a task pointing at the old file would
     // simply fail at the next logon. Rewriting is a no-op when nothing is
     // registered.
     if let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
       logs.push(Line::warn(format!("autostart: {e}")));
     }
-    // Read the mode *after* that: the settings page has to show what is
-    // actually registered, not what was requested.
+    // Read the mode after that: the settings page has to show what is actually
+    // registered, not what was requested.
     let autostart_mode = autostart.as_ref().map(Autostart::mode).unwrap_or(Mode::Off);
 
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
-    // An older package put the Start Menu entry in the installing user's
-    // profile while the current one writes it machine-wide; the duplicate is
-    // ours, so remove it once the new entry exists.
-    match crate::shortcut::remove_legacy_start_menu() {
-      Ok(true) => logs.push(Line::info(
-        "shortcut: removed the per-user Start Menu copy of an older install",
-      )),
-      Ok(false) => {}
-      Err(e) => logs.push(Line::warn(format!("shortcut: {e}"))),
-    }
     if tray.is_none() {
       logs.push(Line::warn(
         "tray: unavailable, the window stays visible and closing quits",
@@ -437,6 +601,8 @@ impl App {
       banner_height: 0.0,
       window_extra: 0.0,
       service_warned: false,
+      core_stale: None,
+      core_answered: false,
       user_edit: cfg.username.clone(),
       pass_edit: cfg.password.clone(),
       remember: cfg.remember_password,
@@ -447,23 +613,32 @@ impl App {
       toast: None,
       cfg,
       lang,
+      // `App::new` opened a link before this object existed, so the first
+      // `ensure_link` pass has to publish the language.
+      lang_sent: false,
       min_level,
       autostart,
       autostart_mode,
       tray,
       tray_rgb: Some(color_for(State::Offline)),
+      gear: None,
+      back_arrow: None,
       connect_item,
       disconnect_item,
       show_item,
       hide_item,
       quit_item,
       started: false,
+      focused: false,
       hide_at_start: start_hidden,
+      centered: false,
       cloaked: start_hidden,
       shown: !start_hidden,
       quitting: false,
       quit_at: None,
       service_request: None,
+      confirm_switch: None,
+      switch_pending: None,
       pending_credentials: None,
       mode_rx: None,
       start_tx,
@@ -495,6 +670,14 @@ impl App {
   /// would make `systemctl stop` / `sc stop` look broken.
   fn ensure_link(&mut self) {
     if self.link.as_ref().is_some_and(Link::alive) {
+      if !self.lang_sent {
+        self.send(Cmd::SetLang(self.lang));
+        self.lang_sent = true;
+      }
+      // Nothing to reconnect, but a click that was re-armed because the core
+      // had not answered yet is settled here once it has. Returning early
+      // skipped that, so a successful Start still tripped the 120 s watchdog.
+      self.settle_click();
       return;
     }
     // Deliver whatever the core managed to say before it went away — the last
@@ -505,12 +688,27 @@ impl App {
     // page keeps claiming "running" for a process that is gone, with session
     // rows nothing updates any more.
     let was_machine = self.link.as_ref().is_some_and(Link::is_machine);
+    // A core that answered with another protocol is not gone: it keeps
+    // serving, so reconnecting cannot help and the page should say what is
+    // actually wrong.
+    let stale = self.link.as_ref().and_then(Link::speaks);
     if self.link.take().is_some() {
       self.push_log(Line::debug("frontend: the core link went away"));
+      self.lang_sent = false;
       self.core = None;
+      self.core_answered = false;
       self.last_error = None;
       self.state = State::Offline;
       self.info = Info::default();
+      if let Some(v) = stale
+        && self.core_stale != Some(v)
+      {
+        self.core_stale = Some(v);
+        self.push_log(Line::error(format!(
+          "the background service speaks protocol {v} but this build speaks {}; restart the service",
+          crate::proto::VERSION
+        )));
+      }
       if was_machine {
         // A machine core owned the credential; its answers are stale now, and
         // the next one will report them again after reconnecting.
@@ -529,26 +727,32 @@ impl App {
         self.toast_ok(msg);
       }
     }
+    // Nothing about a refused protocol changes by reconnecting: only a
+    // restart does, and that resets this delay. A slower loop keeps the log
+    // quiet and stops rebuilding a connection that is refused right away.
+    let wait = if self.core_stale.is_some() {
+      STALE_RETRY
+    } else {
+      LINK_RETRY
+    };
     if Instant::now() < self.next_link_try {
       return;
     }
-    self.next_link_try = Instant::now() + Duration::from_secs(2);
+    self.next_link_try = Instant::now() + wait;
     match crate::ipc::open_result() {
       Ok(link) => {
-        let kind = if link.is_machine() {
-          "service"
-        } else {
-          "portable"
-        };
-        self.push_log(Line::info(format!("connected to the {kind} core")));
         self.link = Some(link);
+        self.core_answered = false;
         self.last_error = None;
-        self.service_warned = false;
         self.send(Cmd::SetLang(self.lang));
+        self.lang_sent = true;
         // Ask who we are talking to on the next pass.
         self.next_core_query = Instant::now();
       }
       Err(reason) => {
+        // Nothing listens any more, so an earlier "old core" verdict no longer
+        // describes the machine; the ordinary "not running" band takes over.
+        self.core_stale = None;
         // Not a login failure, so this belongs in the log rather than in the
         // red banner; the service row says "not running" by itself.
         if !self.service_warned {
@@ -559,13 +763,21 @@ impl App {
         }
       }
     }
+    self.settle_click();
+  }
+
+  /// Complete a click that was waiting for a core to answer.
+  ///
+  /// Runs whether or not a reconnect just happened: the core may have answered
+  /// on the link that was already up, and a pending *Start* re-armed by the
+  /// helper's late reply would otherwise sit there until the watchdog fired.
+  fn settle_click(&mut self) {
     // Credentials entered while the service was down travel with its start:
     // once a machine core answers, hand them over and turn the pending Apply
     // into the same toast a normal one would show.
-    let machine_ready = self
-      .link
-      .as_ref()
-      .is_some_and(|link| link.alive() && link.is_machine());
+    // A core that answered is what lets a pending credential travel; an open
+    // link may already be refused for speaking another protocol.
+    let machine_ready = self.core_answered && self.link.as_ref().is_some_and(Link::is_machine);
     if machine_ready && let Some(next) = self.pending_credentials.take() {
       // The service accepted the start: this is the point where the edits
       // become the new baseline and the per-field markers clear.
@@ -589,18 +801,18 @@ impl App {
     // A pending *Start* is only done once the core actually answers. On
     // Windows the only supported start target is the service, so a portable
     // core that happens to answer first must not complete the click.
-    let start_ready = self.link.as_ref().is_some_and(|link| {
-      link.alive() && {
+    let start_ready = self.core_answered
+      && self.link.as_ref().is_some_and(|link| {
         #[cfg(windows)]
         {
           link.is_machine()
         }
         #[cfg(not(windows))]
         {
+          let _ = link;
           true
         }
-      }
-    });
+      });
     if self
       .service_request
       .is_some_and(|(r, _)| r == ServiceRequest::Start)
@@ -642,6 +854,17 @@ impl App {
     let next = self.edited_config();
 
     if self.link.as_ref().is_some_and(Link::alive) {
+      match self.credential_action(&next) {
+        CredentialAction::Store => {}
+        CredentialAction::Switch => self.switch_pending = Some(Instant::now()),
+        // Without a credential the core could fall back to, a wrong password
+        // leaves the machine offline and unreachable; that decision is the
+        // user's to make.
+        CredentialAction::Confirm => {
+          self.confirm_switch = Some(next);
+          return;
+        }
+      }
       self.save_credentials(next, true);
       return;
     }
@@ -668,8 +891,11 @@ impl App {
       self.service_request = Some((ServiceRequest::Start, Instant::now()));
       self.set_toast(self.t().service_starting.to_string(), ToastKind::Info);
       let tx = self.start_tx.clone();
+      // An old core would keep serving the replaced binary; restarting is what
+      // makes Apply work after an upgrade none of the two halves finished.
+      let restart = self.core_stale.is_some();
       std::thread::spawn(move || {
-        let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core()));
+        let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core(restart)));
       });
       return;
     }
@@ -686,6 +912,34 @@ impl App {
     next.password = self.pass_edit.clone();
     next.remember_password = self.remember;
     next
+  }
+
+  /// Would this *Apply* replace the live session, and does that need a question?
+  ///
+  /// Mirrors the core's own rule: a complete pair that differs from the current
+  /// one, while online. The core then logs the session out and tries the new
+  /// pair; whether it can fall back to the old one decides if the user is asked
+  /// first.
+  fn credential_action(&self, next: &Config) -> CredentialAction {
+    credential_action(
+      self.state == State::Online,
+      next.username != self.cfg.username,
+      !next.password.is_empty(),
+      self.pass_matches == Some(true),
+      self.switch_has_fallback(),
+    )
+  }
+
+  /// Does the core hold a pair it could sign back in with?
+  ///
+  /// That is the in-memory credential — not the *Remember password* box: the
+  /// core may hold a password this session without a sealed copy on disk, and a
+  /// sealed copy it cannot open is worth nothing.
+  fn switch_has_fallback(&self) -> bool {
+    self
+      .core_cred
+      .as_ref()
+      .is_some_and(|c| c.has_password && !c.username.is_empty())
   }
 
   /// Save the credential and hand it to a live core.
@@ -737,6 +991,54 @@ impl App {
     self.remember = self.cfg.remember_password;
     self.pending_credentials = None;
     self.toast = None;
+    // An account that was refused is only reported until the user takes the
+    // edit back; the stored pair is the one that works, so ask the portal again
+    // and let that answer clear the banner.
+    self.send(Cmd::Refresh { quiet: true });
+  }
+
+  /// Ask before an account switch that has nothing to fall back on.
+  ///
+  /// The switch itself always costs the session; what makes this case worth a
+  /// question is that a refused password would leave the machine offline with
+  /// no credential to sign back in with.
+  fn paint_switch_confirm(&mut self, ctx: &egui::Context) {
+    let Some(next) = self.confirm_switch.clone() else {
+      return;
+    };
+    let t = self.t();
+    let modal = egui::Modal::new(egui::Id::unique("thunet_switch_confirm")).show(ctx, |ui| {
+      ui.set_max_width(340.0);
+      ui.label(egui::RichText::new(t.switch_warning_title).strong());
+      ui.add_space(6.0);
+      ui.label(t.switch_warning_body);
+      ui.add_space(10.0);
+      ui.horizontal(|ui| {
+        if ui.button(t.switch_continue).clicked() {
+          Some(true)
+        } else if ui.button(t.cancel).clicked() {
+          Some(false)
+        } else {
+          None
+        }
+      })
+      .inner
+    });
+    // Escape or a click on the backdrop is a cancel.
+    let choice = if modal.should_close() {
+      Some(false)
+    } else {
+      modal.inner
+    };
+    match choice {
+      Some(true) => {
+        self.confirm_switch = None;
+        self.switch_pending = Some(Instant::now());
+        self.save_credentials(next, true);
+      }
+      Some(false) => self.confirm_switch = None,
+      None => {}
+    }
   }
 
   fn credentials_toast(&self, typed: bool) -> (&'static str, ToastKind) {
@@ -942,9 +1244,73 @@ impl App {
   /// This ends the frontend only, whatever the autostart mode says: the core
   /// owns the session and keeps running. Stopping it is a separate, explicit
   /// action — the status page's *Stop* button or `thunet service stop`.
+  /// The service row's *Start* / *Stop* / *Restart* button.
+  fn service_button(&mut self, ui: &mut egui::Ui, stale: bool, running: bool, label: &'static str) {
+    // One request at a time: the outcome arrives when the link is up (start) or
+    // down (stop), which takes a moment. A service that is already running
+    // ignores a start, so an incompatible core needs a restart.
+    if !ui
+      .add_enabled(self.service_request.is_none(), egui::Button::new(label))
+      .clicked()
+    {
+      return;
+    }
+    let verb = if stale {
+      "Restart"
+    } else if running {
+      "Stop"
+    } else {
+      "Start"
+    };
+    self.push_log(Line::debug(format!(
+      "frontend: {verb} clicked (service_request={:?})",
+      self.service_request
+    )));
+    if stale {
+      // Treated like a start: the toast fires once a usable core answers.
+      self.service_request = Some((ServiceRequest::Start, Instant::now()));
+      let tx = self.start_tx.clone();
+      std::thread::spawn(move || {
+        let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core(true)));
+      });
+    } else if running {
+      self.service_request = Some((ServiceRequest::Stop, Instant::now()));
+      let machine = self.link.as_ref().map_or(true, Link::is_machine);
+      if machine {
+        // The machine core belongs to SCM / systemd, so stopping it is an
+        // administrator operation. The link drops when the service exits.
+        let tx = self.start_tx.clone();
+        std::thread::spawn(move || {
+          let r =
+            crate::autostart::Autostart::service(crate::autostart::ServiceAction::Stop, false)
+              .map(|_| ());
+          let _ = tx.send((ServiceRequest::Stop, r));
+        });
+      } else {
+        // A portable core is ours: one control command, no UAC.
+        self.send(Cmd::Shutdown);
+      }
+    } else {
+      // Registering the start can block, so it happens off the UI thread.
+      self.service_request = Some((ServiceRequest::Start, Instant::now()));
+      let tx = self.start_tx.clone();
+      std::thread::spawn(move || {
+        let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core(false)));
+      });
+    }
+  }
+
   fn quit(&mut self) {
     self.quitting = true;
     self.quit_at = Some(Instant::now());
+  }
+
+  /// False where the portal verbs (Connect, Disconnect and the account form)
+  /// have nothing to act on. On an 802.1X network Windows owns the session and
+  /// the portal entry is only a mirror of it, so a logout there would tear down
+  /// something this app never opened - and the account is not used at all.
+  fn portal_verbs(&self) -> bool {
+    !matches!(self.env, LoginEnv::EnterpriseWifi(_))
   }
 
   /// Replace this process with a fresh launch of the executable on disk.
@@ -1002,6 +1368,20 @@ impl App {
 
   fn drain_events(&mut self) {
     while let Some(ev) = self.next_event() {
+      if !self.core_answered {
+        // A real answer, not just an open socket: a core that speaks another
+        // protocol closes the link right after connecting, and counting that
+        // as "running" is what made the banner blink.
+        self.core_answered = true;
+        self.core_stale = None;
+        self.service_warned = false;
+        let kind = if self.link.as_ref().is_some_and(Link::is_machine) {
+          "service"
+        } else {
+          "portable"
+        };
+        self.push_log(Line::info(format!("connected to the {kind} core")));
+      }
       match ev {
         Ev::State(s) => self.state = s,
         Ev::Info(v) => self.info = info_from(&v),
@@ -1042,6 +1422,8 @@ impl App {
           self.core = Some(info);
         }
         Ev::Credentials(state) => {
+          // The answer to any Apply, including the outcome of a switch.
+          self.switch_pending = None;
           // A comparison answer and/or a fresh baseline. `matches` is only
           // present on a `CheckCredentials` reply.
           if let Some(m) = state.matches {
@@ -1075,25 +1457,52 @@ impl App {
 
     egui::Frame::new()
       .fill(ui.visuals().panel_fill)
-      .inner_margin(egui::Margin::same(14))
+      // The bottom margin is smaller than the other three on purpose: the only
+      // thing down there is the build stamp, and the footer cannot go closer to
+      // the window edge than these margins allow.
+      .inner_margin(egui::Margin {
+        left: 14,
+        right: 14,
+        top: 14,
+        bottom: 8,
+      })
       .show(ui, |ui| {
-        // Warnings take their own space at the top of the page instead of lying
+        // Bands take their own space at the top of the page instead of lying
         // over the rows below: the text stays centred, the page below keeps its
         // layout, and `sync_window_height` grows the window by exactly this
         // height so the log pane is not squeezed.
         self.banner_height = 0.0;
-        if self.page == Page::Status {
-          let mut banners = Vec::new();
-          if !self.link.as_ref().is_some_and(Link::alive) {
-            banners.push(t.service_down.to_string());
+        // Both halves of "is there something to log in with": the core owns the
+        // credential, and its last answer is fresher than the 30 s `CoreInfo`.
+        let credential = self
+          .core_cred
+          .as_ref()
+          .or_else(|| self.core.as_ref().map(|c| &c.credential));
+        let auto_connect = self.core.as_ref().is_some_and(|c| c.auto_connect);
+        let credentials_ready =
+          credential.is_some_and(|c| c.has_password && !c.username.is_empty());
+        let banners = page_banners(
+          self.page,
+          self.state,
+          self.core_answered,
+          self.core_stale,
+          self.env.clone(),
+          self.last_error.as_ref(),
+          auto_connect,
+          credentials_ready,
+          t,
+        );
+        if !banners.is_empty() {
+          let mut height = 0.0;
+          for (i, (tone, text)) in banners.iter().enumerate() {
+            if i > 0 {
+              ui.add_space(BANNER_GAP);
+              height += BANNER_GAP;
+            }
+            height += banner(ui, text.as_str(), *tone);
           }
-          if let Some(err) = &self.last_error {
-            banners.push(format!("{}: {err}", t.login_failed));
-          }
-          if !banners.is_empty() {
-            self.banner_height = red_banner(ui, banners.join("\n")) + 8.0;
-            ui.add_space(8.0);
-          }
+          ui.add_space(BANNER_GAP);
+          self.banner_height = height + BANNER_GAP;
         }
 
         ui.horizontal(|ui| {
@@ -1105,15 +1514,29 @@ impl App {
             );
             ui.label(egui::RichText::new(label).size(18.0).strong());
           } else {
+            // The same gear as the button that opened this page, so the two
+            // read as the same place.
+            let color = ui.visuals().text_color();
+            let icon = heading_icon(&mut self.gear, ui.ctx(), "thunet_gear", gear_image, color);
+            ui.add(icon);
             ui.label(egui::RichText::new(t.settings).size(18.0).strong());
           }
           ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let action = if self.page == Page::Status {
-              t.settings
+            // Icon only: the label moved to the tooltip, which keeps the header
+            // to one line in both languages.
+            let (texture, label) = if self.page == Page::Status {
+              let gear = icon_texture(&mut self.gear, ui.ctx(), "thunet_gear", gear_image);
+              (gear.id(), t.settings)
             } else {
-              t.back
+              let arrow = icon_texture(
+                &mut self.back_arrow,
+                ui.ctx(),
+                "thunet_back",
+                back_arrow_image,
+              );
+              (arrow.id(), t.back)
             };
-            if ui.button(action).clicked() {
+            if ui.add(icon_button(texture)).on_hover_text(label).clicked() {
               self.page = match self.page {
                 Page::Status => Page::Settings,
                 Page::Settings => Page::Status,
@@ -1140,28 +1563,16 @@ impl App {
               ui.label(egui::RichText::new(account).monospace());
               ui.end_row();
               ui.label(t.ipv4);
-              ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(dash(&self.info.ip4)).monospace());
-                if ui
-                  .add_enabled(!self.info.ip4.is_empty(), egui::Button::new(t.copy))
-                  .clicked()
-                {
-                  ui.ctx().copy_text(self.info.ip4.clone());
-                  self.toast_ok(t.copied.to_string());
-                }
-              });
+              if address_cell(ui, &self.info.ip4, t) {
+                ui.ctx().copy_text(self.info.ip4.clone());
+                self.toast_ok(t.copied.to_string());
+              }
               ui.end_row();
               ui.label(t.ipv6);
-              ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(dash(&self.info.ip6)).monospace());
-                if ui
-                  .add_enabled(!self.info.ip6.is_empty(), egui::Button::new(t.copy))
-                  .clicked()
-                {
-                  ui.ctx().copy_text(self.info.ip6.clone());
-                  self.toast_ok(t.copied.to_string());
-                }
-              });
+              if address_cell(ui, &self.info.ip6, t) {
+                ui.ctx().copy_text(self.info.ip6.clone());
+                self.toast_ok(t.copied.to_string());
+              }
               ui.end_row();
               ui.label(t.session_traffic);
               ui.label(format!(
@@ -1179,80 +1590,34 @@ impl App {
                 .core
                 .as_ref()
                 .map(|c| (c.version.clone(), c.uptime_secs));
-              // A connected link means a core is running even before its first
-              // `CoreInfo` answer lands, so the row and the button agree from
-              // the moment the connection is up.
-              let running = service.is_some() || self.link.as_ref().is_some_and(Link::alive);
+              // A core that answered counts as running even before its first
+              // `CoreInfo` lands, and so does one that answered with another
+              // protocol: it is alive, it just cannot serve this build.
+              let stale = self.core_stale.is_some();
+              let running = service.is_some() || self.core_answered || stale;
               ui.label(t.service);
+              // Same shape as the address rows above: the button is laid out
+              // first in a right-to-left row, so it keeps the column's right
+              // edge, and the status text takes the rest from the left. The
+              // children stay inside the cell because the row is given exactly
+              // the width the cell offers.
+              let action = match (stale, running) {
+                (true, _) => t.service_restart,
+                (false, true) => t.service_stop,
+                (false, false) => t.service_start,
+              };
               ui.horizontal(|ui| {
-                match &service {
-                  Some((version, uptime)) => {
-                    ui.label(
-                      egui::RichText::new(t.service_running).color(state_color(State::Online)),
-                    );
-                    let label = format!("v{version} · {}", human_uptime(*uptime));
-                    let text = egui::RichText::new(label).monospace();
-                    ui.label(if version == env!("CARGO_PKG_VERSION") {
-                      text.weak()
-                    } else {
-                      text.color(state_color(State::Authenticating))
+                let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(
+                  size,
+                  egui::Layout::right_to_left(egui::Align::Center),
+                  |ui| {
+                    self.service_button(ui, stale, running, action);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                      service_status(ui, service.as_ref(), running, t);
                     });
-                  }
-                  None if running => {
-                    ui.label(
-                      egui::RichText::new(t.service_running).color(state_color(State::Online)),
-                    );
-                  }
-                  None => {
-                    ui.label(
-                      egui::RichText::new(t.service_gone).color(state_color(State::Offline)),
-                    );
-                  }
-                }
-                // One request at a time: the outcome arrives when the link is
-                // up (start) or down (stop), which takes a moment.
-                let idle = self.service_request.is_none();
-                let label = if running {
-                  t.service_stop
-                } else {
-                  t.service_start
-                };
-                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
-                  self.push_log(Line::debug(format!(
-                    "frontend: {} clicked (service_request={:?})",
-                    if running { "Stop" } else { "Start" },
-                    self.service_request
-                  )));
-                  if running {
-                    self.service_request = Some((ServiceRequest::Stop, Instant::now()));
-                    let machine = self.link.as_ref().map_or(true, Link::is_machine);
-                    if machine {
-                      // The machine core belongs to SCM / systemd, so stopping
-                      // it is an administrator operation. The link drops when
-                      // the service actually exits.
-                      let tx = self.start_tx.clone();
-                      std::thread::spawn(move || {
-                        let r = crate::autostart::Autostart::service(
-                          crate::autostart::ServiceAction::Stop,
-                          false,
-                        )
-                        .map(|_| ());
-                        let _ = tx.send((ServiceRequest::Stop, r));
-                      });
-                    } else {
-                      // A portable core is ours: one control command, no UAC.
-                      self.send(Cmd::Shutdown);
-                    }
-                  } else {
-                    // Registering the start can block, so it happens off the UI
-                    // thread; `logic` picks the outcome up.
-                    self.service_request = Some((ServiceRequest::Start, Instant::now()));
-                    let tx = self.start_tx.clone();
-                    std::thread::spawn(move || {
-                      let _ = tx.send((ServiceRequest::Start, crate::ipc::start_core()));
-                    });
-                  }
-                }
+                  },
+                );
               });
               ui.end_row();
             });
@@ -1274,13 +1639,22 @@ impl App {
               self.send(Cmd::Connect);
             }
             if ui
-              .add_enabled(online, egui::Button::new(t.disconnect))
+              .add_enabled(
+                online && self.portal_verbs(),
+                egui::Button::new(t.disconnect),
+              )
+              .on_disabled_hover_text(
+                self
+                  .env
+                  .blocked_reason(t)
+                  .unwrap_or_else(|| t.disconnect.into()),
+              )
               .clicked()
             {
               self.send(Cmd::Disconnect);
             }
             if ui.button(t.refresh).clicked() {
-              self.send(Cmd::Refresh);
+              self.send(Cmd::Refresh { quiet: false });
             }
           });
         } else {
@@ -1334,6 +1708,10 @@ impl App {
             let _ = self.cfg.save();
           }
 
+          // A rule under the row that only changes how this window renders, so
+          // the settings that decide what runs at logon start clearly below it.
+          ui.separator();
+
           ui.add_space(2.0);
           // Three modes, not two checkboxes: "tray without core" is not worth
           // offering, because a tray icon with no session behind it can only
@@ -1355,29 +1733,31 @@ impl App {
             self.apply_autostart_mode(mode);
           }
 
-          // Only meaningful when the tray is part of the autostart mode.
+          // Both are startup behaviour, so they share one row: the settings page
+          // has to fit the fixed window height. *Start minimised* is only
+          // meaningful when the tray is part of the autostart mode.
           let mut start_min = self.cfg.start_minimized;
           let tray_starts = self.autostart_mode != Mode::Core;
-          if ui
-            .add_enabled(
-              tray_starts,
-              egui::Checkbox::new(&mut start_min, t.start_minimized),
-            )
-            .changed()
-          {
-            self.apply_start_minimized(start_min);
-          }
-
           let mut auto_conn = self.cfg.auto_connect;
-          if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
-            self.cfg.auto_connect = auto_conn;
-            self.send(Cmd::SetAutoConnect(auto_conn));
-            match self.cfg.save() {
-              Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
-              Err(e) => self.toast_err(e),
+          ui.horizontal(|ui| {
+            if ui
+              .add_enabled(
+                tray_starts,
+                egui::Checkbox::new(&mut start_min, t.start_minimized),
+              )
+              .changed()
+            {
+              self.apply_start_minimized(start_min);
             }
-          }
-
+            if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
+              self.cfg.auto_connect = auto_conn;
+              self.send(Cmd::SetAutoConnect(auto_conn));
+              match self.cfg.save() {
+                Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
+                Err(e) => self.toast_err(e),
+              }
+            }
+          });
           ui.add_space(2.0);
           if ui.button(t.desktop_shortcut).clicked() {
             match crate::shortcut::create_desktop_shortcut() {
@@ -1390,7 +1770,22 @@ impl App {
           }
 
           ui.add_space(2.0);
+          // The rule under the shortcut button is unconditional: it is the line
+          // that separates "settings that only touch this window" from the
+          // account block, and before it appeared only when the account form was
+          // live.
           ui.separator();
+          // On an 802.1X network the portal account is never used, so the form is
+          // inert: an edit could not be put to work, and a pair that cannot be
+          // tried would be stored unverified.
+          let credentials_live = self.portal_verbs();
+          if !credentials_live && let Some(why) = self.env.blocked_reason(t) {
+            ui.label(
+              egui::RichText::new(why)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            );
+          }
           // Comment on each field separately: the marker belongs next to the
           // input that actually differs from what is stored.
           let core_password = self.core_cred.as_ref().is_some_and(|c| c.has_password);
@@ -1409,7 +1804,10 @@ impl App {
           );
           ui.horizontal(|ui| {
             ui.label(t.account);
-            ui.add(egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0));
+            ui.add_enabled(
+              credentials_live,
+              egui::TextEdit::singleline(&mut self.user_edit).desired_width(190.0),
+            );
             if stored.username {
               unsaved_marker(ui, t);
             }
@@ -1425,32 +1823,53 @@ impl App {
               // field means "keep it" rather than "no password".
               input = input.hint_text(t.password_keep);
             }
-            ui.add(input);
+            ui.add_enabled(credentials_live, input);
             if stored.password {
               unsaved_marker(ui, t);
             }
           });
           ui.horizontal(|ui| {
             if ui
-              .checkbox(&mut self.remember, t.remember_password)
+              .add_enabled(
+                credentials_live,
+                egui::Checkbox::new(&mut self.remember, t.remember_password),
+              )
               .on_hover_text(t.remember_password_hint)
               .changed()
             {
               self.toast = None;
             }
             // This row is the only one that does not save as you type, so the
-            // button shows when there is anything left to apply.
+            // button shows when there is anything left to apply. A switch in
+            // flight owns the session: a second click would start another one.
+            let may_apply = can_apply(
+              self.remember,
+              &self.user_edit,
+              &self.pass_edit,
+              stored.any(),
+            );
             let mut apply = egui::Button::new(t.apply);
             if stored.any() {
               apply = apply.fill(ui.visuals().selection.bg_fill);
             }
-            if ui.add(apply).clicked() {
+            let enabled = credentials_live && self.switch_pending.is_none() && may_apply;
+            let response = ui
+              .add_enabled(enabled, apply)
+              .on_disabled_hover_text(if stored.any() {
+                t.password_required
+              } else {
+                t.nothing_to_apply
+              });
+            if response.clicked() {
               self.apply_credentials();
             }
             // Cancelling an edit only makes sense while a password is actually
             // remembered: without one there is nothing to restore.
             if ui
-              .add_enabled(self.remember, egui::Button::new(t.revert))
+              .add_enabled(
+                credentials_live && self.remember,
+                egui::Button::new(t.revert),
+              )
               .on_hover_text(t.revert_hint)
               .clicked()
             {
@@ -1519,49 +1938,72 @@ impl App {
           }
         }
 
-        // The settings page ends with a build stamp pinned to the bottom edge:
-        // laying it out bottom-up puts it at the panel edge without having to
-        // guess its height.
+        // The settings page ends with a build stamp pinned to the bottom edge.
+        // Both distances are spelled out instead of falling out of the leftover
+        // space: `RULE_GAP` is how far the rule sits above the stamp, and
+        // `BOTTOM_MARGIN` keeps the stamp off the edge so it lines up with the
+        // page's own side margin rather than touching it.
         if self.page == Page::Settings {
-          ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(2.0);
+          /// Height the separator reserves; the line is drawn inside it.
+          const RULE_H: f32 = 2.0;
+          /// Gap between the rule and the stamp under it.
+          const RULE_GAP: f32 = 5.0;
+          // The stamp row is laid out at exactly the text height instead of the
+          // interactive height `ui.horizontal` would use: that one is ~10 px
+          // taller than the text and centres it, which pushed the stamp back up
+          // by half the difference.
+          let text_h = ui.text_style_height(&egui::TextStyle::Small);
+          let strip = RULE_H + RULE_GAP + text_h;
+          let rest = ui.available_height() - strip;
+          if rest > 0.0 {
+            ui.add_space(rest);
+          }
+          ui.vertical(|ui| {
+            // No automatic gaps inside the strip: the rule and the stamp are the
+            // only two things in it, and they are placed by the arithmetic above.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add(egui::Separator::default().spacing(RULE_H));
+            ui.add_space(RULE_GAP);
             // Version on the left, build time on the right: they answer
             // different questions, so the two ends of the strip read better
             // than one run-on line.
-            ui.horizontal(|ui| {
-              ui.label(egui::RichText::new(build_version()).small().weak());
-              // Source link: the octocat itself is clickable instead of being a
-              // `Hyperlink`, whose label is painted in the link colour (the
-              // solid glyph then looks like a blue blob) and which is also
-              // selectable text (a click leaves a blue selection over it).
-              // The glyph is one of egui's bundled icons, so no image asset is
-              // needed; hovering shows the URL and the pointing-hand cursor.
-              let mark_color = ui.visuals().weak_text_color();
-              let mark = ui
-                .add(
-                  egui::Label::new(
-                    egui::RichText::new(egui::special_emojis::GITHUB)
-                      .small()
-                      .color(mark_color),
+            ui.allocate_ui_with_layout(
+              egui::vec2(ui.available_width(), text_h),
+              egui::Layout::left_to_right(egui::Align::Center),
+              |ui| {
+                ui.label(egui::RichText::new(build_version()).small().weak());
+                // Source link: the octocat itself is clickable instead of being a
+                // `Hyperlink`, whose label is painted in the link colour (the
+                // solid glyph then looks like a blue blob) and which is also
+                // selectable text (a click leaves a blue selection over it).
+                // The glyph is one of egui's bundled icons, so no image asset is
+                // needed; hovering shows the URL and the pointing-hand cursor.
+                let mark_color = ui.visuals().weak_text_color();
+                let mark = ui
+                  .add(
+                    egui::Label::new(
+                      egui::RichText::new(egui::special_emojis::GITHUB)
+                        .small()
+                        .color(mark_color),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
                   )
-                  .selectable(false)
-                  .sense(egui::Sense::click()),
-                )
-                .on_hover_text(env!("CARGO_PKG_REPOSITORY"));
-              if mark.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-              }
-              if mark.clicked() {
-                ui.ctx().open_url(egui::OpenUrl {
-                  url: env!("CARGO_PKG_REPOSITORY").to_owned(),
-                  new_tab: true,
+                  .on_hover_text(env!("CARGO_PKG_REPOSITORY"));
+                if mark.hovered() {
+                  ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if mark.clicked() {
+                  ui.ctx().open_url(egui::OpenUrl {
+                    url: env!("CARGO_PKG_REPOSITORY").to_owned(),
+                    new_tab: true,
+                  });
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                  ui.label(egui::RichText::new(build_time_label(t)).small().weak());
                 });
-              }
-              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(build_time_label(t)).small().weak());
-              });
-            });
-            ui.separator();
+              },
+            );
           });
         }
         // Consume the leftover vertical space so the frame background reaches
@@ -1580,6 +2022,120 @@ fn dash(s: &str) -> String {
   } else {
     s.to_string()
   }
+}
+
+/// One copyable address row: the address against the left edge of the value
+/// column, the *Copy* button against its right edge.
+///
+/// The button is laid out **first**, in a right-to-left row, so the layout
+/// itself puts it on the column's right edge; the address then takes whatever
+/// is left and elides there. Placing it by arithmetic instead (`available -
+/// <button width>`) left it a few pixels short of the edge and drifted with the
+/// grid's column width, and `add_sized` centred the address because that helper
+/// lays its child out with `centered_and_justified`.
+///
+/// Returns the address label and the button, so a test can pin the alignment.
+fn address_row(ui: &mut egui::Ui, value: &str, t: &Texts) -> (egui::Response, egui::Response) {
+  ui.horizontal(|ui| {
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(
+      size,
+      egui::Layout::right_to_left(egui::Align::Center),
+      |ui| {
+        let button = ui.add_enabled(!value.is_empty(), egui::Button::new(t.copy));
+        // Laid out left-to-right in the space that is left: the enclosing
+        // right-to-left layout would otherwise align the text against the
+        // button instead of against the column's left edge.
+        let label = ui
+          .with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // `truncate` elides at the width that is left and, by default
+            // (`show_tooltip_when_elided`), shows the whole address on hover;
+            // an explicit `on_hover_text` would stack a second tooltip on top
+            // of that one for the address that is cut off (the IPv6 one).
+            ui.add(
+              egui::Label::new(egui::RichText::new(dash(value)).monospace())
+                .truncate()
+                .sense(egui::Sense::hover()),
+            )
+          })
+          .inner;
+        (label, button)
+      },
+    )
+    .inner
+  })
+  .inner
+}
+
+/// Returns true when the *Copy* button was clicked.
+fn address_cell(ui: &mut egui::Ui, value: &str, t: &Texts) -> bool {
+  address_row(ui, value, t).1.clicked()
+}
+
+/// The service row's status: "running v0.1.4 · 1m", or why nothing answers.
+fn service_status(ui: &mut egui::Ui, service: Option<&(String, u64)>, running: bool, t: &Texts) {
+  match service {
+    Some((version, uptime)) => {
+      ui.label(egui::RichText::new(t.service_running).color(state_color(State::Online)));
+      let label = format!("v{version} · {}", human_uptime(*uptime));
+      let text = egui::RichText::new(label).monospace();
+      ui.label(if version == env!("CARGO_PKG_VERSION") {
+        text.weak()
+      } else {
+        text.color(state_color(State::Authenticating))
+      });
+    }
+    None if running => {
+      ui.label(egui::RichText::new(t.service_running).color(state_color(State::Online)));
+    }
+    None => {
+      ui.label(egui::RichText::new(t.service_gone).color(state_color(State::Offline)));
+    }
+  }
+}
+
+/// What *Apply* does with the edited pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialAction {
+  /// No live session is replaced: store the pair and let the core try it.
+  Store,
+  /// Replace the session; the core signs the previous pair back in if the new
+  /// one is refused.
+  Switch,
+  /// Replace the session, but ask first: a refusal would leave nothing to sign
+  /// back in with.
+  Confirm,
+}
+
+/// Decide that from the four facts that matter.
+fn credential_action(
+  online: bool,
+  username_changed: bool,
+  password_typed: bool,
+  password_matches: bool,
+  has_fallback: bool,
+) -> CredentialAction {
+  // An empty password field means "keep the stored one", so nothing about the
+  // pair changed; a typed value the core already confirmed as the stored one is
+  // not a change either. Offline there is no session to replace.
+  if !online || !password_typed || (!username_changed && password_matches) {
+    CredentialAction::Store
+  } else if has_fallback {
+    CredentialAction::Switch
+  } else {
+    CredentialAction::Confirm
+  }
+}
+
+/// May *Apply* do anything with this form?
+///
+/// *Remember password* together with an empty field has no meaning: the core
+/// keeps what is stored (the field says "leave blank to keep it"), so the only
+/// thing an Apply could do is the one thing that is not allowed — change the
+/// account without retyping the password. Unticking the box is the explicit
+/// clear and needs neither field; with nothing changed there is nothing to do.
+fn can_apply(remember: bool, username: &str, password: &str, changed: bool) -> bool {
+  changed && (!remember || (!username.trim().is_empty() && !password.is_empty()))
 }
 
 /// Which part of the account row differs from what is stored. The other
@@ -1788,6 +2344,94 @@ fn log_entry(ui: &egui::Ui, text: String, color: egui::Color32) -> egui::Label {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The address rows must hug both edges of the value column: the address
+  /// against the left one, the *Copy* button against the right one. An earlier
+  /// version centred the address (`add_sized` lays its child out with
+  /// `centered_and_justified`), and another left the button short of the edge
+  /// by subtracting its width from `available_width()`.
+  #[test]
+  fn address_rows_hug_both_edges_of_the_value_column() {
+    use egui::{Rect, pos2, vec2};
+
+    let t = crate::i18n::Lang::En.texts();
+    let ctx = egui::Context::default();
+    let mut rows = Vec::new();
+    let mut column = Rect::NOTHING;
+    for _ in 0..3 {
+      let input = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 300.0))),
+        ..Default::default()
+      };
+      let mut out = ctx.run_ui(input, |ui| {
+        egui::Frame::new()
+          .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 14,
+            bottom: 8,
+          })
+          .show(ui, |ui| {
+            // egui may lay the ui out twice per frame (a sizing pass first);
+            // only the last pass is the one that is painted.
+            rows.clear();
+            egui::Grid::new("info")
+              .num_columns(2)
+              .spacing([12.0, 6.0])
+              .show(ui, |ui| {
+                ui.label(t.account);
+                ui.label(egui::RichText::new("alice").monospace());
+                ui.end_row();
+                ui.label(t.ipv4);
+                column = ui.max_rect();
+                let left = ui.cursor().min.x;
+                rows.push((left, address_row(ui, "192.0.2.10", t)));
+                ui.end_row();
+                ui.label(t.ipv6);
+                let left = ui.cursor().min.x;
+                rows.push((
+                  left,
+                  address_row(ui, "2001:db8:5:8001:f49d:103e:ffff:ffff", t),
+                ));
+                ui.end_row();
+              });
+          });
+      });
+      out.textures_delta.clear();
+    }
+
+    let [(start4, (label4, button4)), (start6, (label6, button6))] = &rows[..] else {
+      panic!("two rows expected, got {}", rows.len());
+    };
+    let (start4, start6) = (*start4, *start6);
+    // Both buttons end on the same edge, which is the column's.
+    assert!(
+      (button4.rect.right() - button6.rect.right()).abs() < 0.5,
+      "{:?} vs {:?}",
+      button4.rect,
+      button6.rect
+    );
+    assert!(
+      (button4.rect.right() - column.right()).abs() < 0.5,
+      "the button must reach the column's right edge: {:?} in {:?}",
+      button4.rect,
+      column
+    );
+    // Both addresses start at the left edge of the column, and the long one
+    // elides instead of running into the button.
+    for (start, label) in [(start4, label4.rect), (start6, label6.rect)] {
+      assert!(
+        (label.left() - start).abs() < 0.5,
+        "{label:?} must start at the column's left edge {start}"
+      );
+    }
+    assert!(
+      label6.rect.right() <= button6.rect.left() + 0.5,
+      "the elided address must stop before the button: {:?} vs {:?}",
+      label6.rect,
+      button6.rect
+    );
+  }
 
   /// Right-clicking a log selection relies on egui copying label selections
   /// when a `Copy` event is present while it lays the labels out. This pins
@@ -2106,6 +2750,42 @@ mod tests {
     assert!(long.height() > short.height(), "must wrap: {long:?}");
   }
 
+  /// A long error must not turn the band — and the window grown to fit it —
+  /// into a wall of text: it stops after `BANNER_ROWS` lines with an ellipsis.
+  #[test]
+  fn a_long_banner_is_capped() {
+    let ctx = egui::Context::default();
+    let height_of = |text: &str| -> f32 {
+      let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+          egui::Pos2::ZERO,
+          egui::vec2(420.0, 300.0),
+        )),
+        ..Default::default()
+      };
+      let mut height = 0.0;
+      let mut out = ctx.run_ui(input, |ui| {
+        height = banner(ui, text, BannerTone::Error);
+      });
+      out.textures_delta.clear();
+      height
+    };
+
+    // One row plus the 8 px frame margin above and below.
+    let one_line = height_of("Wrong username or password");
+    let row = one_line - 16.0;
+    assert!(row > 0.0, "a band has at least one row: {one_line}");
+    let capped = one_line + (BANNER_ROWS - 1) as f32 * row;
+
+    let run_on = "login rejected (ac_id=1): {portal answer} ".repeat(20);
+    assert!((height_of(&run_on) - capped).abs() <= 1.0, "one long line");
+
+    // Embedded newlines count as rows too, so a multi-line answer is capped
+    // the same way.
+    let stacked = "row\n".repeat(BANNER_ROWS * 3);
+    assert!((height_of(&stacked) - capped).abs() <= 1.0, "many rows");
+  }
+
   /// The footer is the only place the build date shows, so pin its shape:
   /// `THUnet <version>` on the left, `Debug|Release · Built at YYYY-MM-DD HH:MM:SS +HH:MM`
   /// on the right.
@@ -2156,7 +2836,6 @@ mod tests {
     let t = crate::i18n::Lang::En.texts();
     assert!(LoginEnv::Campus.allows_login());
     assert_eq!(LoginEnv::Campus.blocked_reason(t), None);
-
     let blocked = [
       LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
       LoginEnv::NoNetwork,
@@ -2173,6 +2852,234 @@ mod tests {
     let hint = blocked[0].blocked_reason(t).unwrap_or_default();
     assert!(hint.contains("Tsinghua-Secure"), "{hint}");
     assert!(!hint.contains("{}"), "{hint}");
+  }
+
+  /// A network where logging in cannot work is a warning band, not a red one;
+  /// failures keep the red band and lead it.
+  #[test]
+  fn a_non_campus_network_shows_a_warning_band() {
+    let t = crate::i18n::Lang::En.texts();
+    let tones = |env: LoginEnv, state: State, err: Option<Failure>| {
+      page_banners(
+        Page::Status,
+        state,
+        true,
+        None,
+        env,
+        err.as_ref(),
+        false,
+        true,
+        t,
+      )
+      .into_iter()
+      .map(|(tone, _)| tone)
+      .collect::<Vec<_>>()
+    };
+
+    assert_eq!(tones(LoginEnv::Campus, State::Offline, None), vec![]);
+    assert_eq!(
+      tones(LoginEnv::OtherPortal, State::Offline, None),
+      vec![BannerTone::Warn]
+    );
+    // Online, the verdict is only worth a band where it says "nothing to do":
+    // another operator's portal is not shown while a session is up.
+    assert_eq!(tones(LoginEnv::OtherPortal, State::Online, None), vec![]);
+    // An 802.1X network is amber until its session is up and green afterwards.
+    let secure = || LoginEnv::EnterpriseWifi("Tsinghua-Secure".into());
+    assert_eq!(
+      tones(secure(), State::Offline, None),
+      vec![BannerTone::Warn]
+    );
+    let online = page_banners(
+      Page::Status,
+      State::Online,
+      true,
+      None,
+      secure(),
+      None,
+      false,
+      true,
+      t,
+    );
+    assert_eq!(
+      online,
+      vec![(
+        BannerTone::Ok,
+        t.secure_wifi_online.replacen("{}", "Tsinghua-Secure", 1)
+      )]
+    );
+    // With no core answering the stored verdict is not trustworthy either.
+    assert_eq!(
+      page_banners(
+        Page::Status,
+        State::Offline,
+        false,
+        None,
+        LoginEnv::NoNetwork,
+        None,
+        false,
+        true,
+        t
+      ),
+      vec![(BannerTone::Error, t.service_down.to_string())]
+    );
+    // A core that answers with another protocol is running, so the band says
+    // that instead of "not running" and keeps saying it while the retry loop
+    // is throttled.
+    assert_eq!(
+      page_banners(
+        Page::Status,
+        State::Offline,
+        false,
+        Some(1),
+        LoginEnv::Campus,
+        None,
+        false,
+        true,
+        t
+      ),
+      vec![(BannerTone::Error, t.service_stale.replacen("{}", "1", 1))]
+    );
+    // A rejection is red and comes before the warning.
+    assert_eq!(
+      tones(
+        LoginEnv::NoNetwork,
+        State::Offline,
+        Some(Failure::Credentials)
+      ),
+      vec![BannerTone::Error, BannerTone::Warn]
+    );
+    // A network failure is worded from the active texts, so the band follows
+    // a language switch instead of keeping whatever language the OS printed.
+    for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+      let t = lang.texts();
+      assert_eq!(
+        page_banners(
+          Page::Status,
+          State::Offline,
+          true,
+          None,
+          LoginEnv::Campus,
+          Some(&Failure::Network(crate::srun::NetCause::Resolve)),
+          false,
+          true,
+          t
+        ),
+        vec![(BannerTone::Error, t.net_resolve.to_string())]
+      );
+    }
+    // Settings shows only the credential fix, which is what that page is for.
+    assert_eq!(
+      page_banners(
+        Page::Settings,
+        State::Offline,
+        true,
+        None,
+        LoginEnv::NoNetwork,
+        Some(&Failure::Credentials),
+        false,
+        true,
+        t
+      ),
+      vec![(BannerTone::Error, t.invalid_credentials.to_string())]
+    );
+    // Auto connect with nothing to connect with is an amber band, next to the
+    // network verdict; while online it would be noise.
+    let auto = |state: State, ready: bool| {
+      page_banners(
+        Page::Status,
+        state,
+        true,
+        None,
+        LoginEnv::Campus,
+        None,
+        true,
+        ready,
+        t,
+      )
+    };
+    assert_eq!(
+      auto(State::Offline, false),
+      vec![(
+        BannerTone::Warn,
+        t.auto_connect_without_credentials.to_string()
+      )]
+    );
+    assert!(auto(State::Offline, true).is_empty(), "credentials saved");
+    // A leftover session looks healthy, so the band has to say the machine
+    // cannot sign in again rather than stay silent.
+    assert_eq!(
+      auto(State::Online, false),
+      vec![(
+        BannerTone::Warn,
+        t.auto_connect_without_credentials_online.to_string()
+      )]
+    );
+    assert!(auto(State::Online, true).is_empty(), "credentials saved");
+  }
+
+  /// Apply has to ask before an online switch that has nothing to fall back on,
+  /// and has to stay silent when it does: a saved password means the core signs
+  /// the previous account back in if the new one is refused.
+  #[test]
+  fn only_a_switch_without_a_fallback_asks_first() {
+    // Online, a new pair typed, a saved password the core could fall back to.
+    assert_eq!(
+      credential_action(true, false, true, false, true),
+      CredentialAction::Switch,
+      "a silent switch when the old pair is still there"
+    );
+    // Same, but the core holds nothing to sign back in with.
+    assert_eq!(
+      credential_action(true, false, true, false, false),
+      CredentialAction::Confirm,
+      "no fallback: ask first"
+    );
+    // A new username with the old password kept is a switch too.
+    assert_eq!(
+      credential_action(true, true, true, false, false),
+      CredentialAction::Confirm
+    );
+    // Offline there is no session to replace, so nothing to warn about.
+    assert_eq!(
+      credential_action(false, false, true, false, false),
+      CredentialAction::Store
+    );
+    // An empty password field means "keep the stored one".
+    assert_eq!(
+      credential_action(true, true, false, false, false),
+      CredentialAction::Store
+    );
+    // Retyping the password the core already confirmed as the stored one.
+    assert_eq!(
+      credential_action(true, false, true, true, false),
+      CredentialAction::Store
+    );
+    // ... but the same password under a different account is a real change.
+    assert_eq!(
+      credential_action(true, true, true, true, false),
+      CredentialAction::Confirm
+    );
+  }
+
+  /// *Apply* stays disabled unless it has something it is allowed to do: with
+  /// *Remember password* ticked, a changed account must come with a typed
+  /// password, while unticking the box is the explicit clear.
+  #[test]
+  fn apply_needs_a_password_before_it_changes_the_account() {
+    assert!(
+      !can_apply(true, "alice", "", true),
+      "rename without password"
+    );
+    assert!(!can_apply(true, "", "pw", true), "password without account");
+    assert!(!can_apply(true, "   ", "pw", true), "a blank account");
+    assert!(can_apply(true, "alice", "pw", true));
+    // Unticking the box clears the stored credential and needs neither field.
+    assert!(can_apply(false, "", "", true));
+    assert!(can_apply(false, "alice", "", true));
+    // Nothing changed: nothing to apply either way.
+    assert!(!can_apply(true, "alice", "pw", false));
+    assert!(!can_apply(false, "", "", false));
   }
 
   #[test]
@@ -2218,24 +3125,157 @@ mod tests {
   }
 }
 
-/// Red strip for the two states that stop everything from working: an error
-/// reported by the core, and no core answering at all.
+/// Space between stacked bands, and between the last band and the page.
+const BANNER_GAP: f32 = 8.0;
+
+/// How many lines a band may take before it ends in an ellipsis.
+///
+/// Every message the window writes itself fits in this many lines at the
+/// default width; the cap exists for text it did not write, such as a portal
+/// answer pasted into a login error. Without it the band — and the window
+/// grown to fit it — could cover the whole page.
+const BANNER_ROWS: usize = 3;
+
+/// Which palette a top band uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BannerTone {
+  /// Something failed and the user has to act: no core answering, or a login
+  /// the portal refused.
+  Error,
+  /// Nothing failed; a login simply cannot work on this network, and the
+  /// verdict resolves itself once the probe sees a campus portal again.
+  Warn,
+  /// Nothing to do at all: the network authenticates below the portal and the
+  /// session is already up.
+  Ok,
+}
+
+/// The bands shown at the top of the page, in display order.
+///
+/// Failures that need the user lead; the network verdict follows, because "off
+/// campus" is information, not a fault, and it is derived from the last probe
+/// rather than from an attempt that failed.
+fn page_banners(
+  page: Page,
+  state: State,
+  core_answered: bool,
+  stale: Option<u8>,
+  env: LoginEnv,
+  last_error: Option<&Failure>,
+  auto_connect: bool,
+  credentials_ready: bool,
+  t: &Texts,
+) -> Vec<(BannerTone, String)> {
+  let mut banners = Vec::new();
+  // A service that is not serving this build only matters on the page with the
+  // button that fixes it. An old core says so instead of claiming to be gone.
+  if page == Page::Status && !core_answered {
+    let text = match stale {
+      Some(v) => t.service_stale.replacen("{}", &v.to_string(), 1),
+      None => t.service_down.to_string(),
+    };
+    banners.push((BannerTone::Error, text));
+  }
+  // A rejected password is shown on both pages: Settings is where it is
+  // fixed, so hiding it there would leave the fix without feedback. `Text`
+  // arrives worded by the core, which is why only these variants carry a
+  // wording here; `Network` is worded from `t`.
+  if let Some(err) = last_error {
+    let text = match err {
+      Failure::Credentials => t.invalid_credentials.to_string(),
+      Failure::Network(cause) => t.net_cause(*cause).to_string(),
+      Failure::Text(e) => e.clone(),
+    };
+    banners.push((BannerTone::Error, text));
+  }
+  // The verdict explains the state of *Connect*: amber while a login is
+  // impossible here (no network, another operator's portal, or an 802.1X
+  // network that has not signed in yet), green on that same network once the
+  // session is up. The core re-probes as soon as the path to the internet
+  // changes, so this is not a leftover from the network the machine left.
+  if page == Page::Status && core_answered {
+    match env {
+      LoginEnv::EnterpriseWifi(ref ssid) if state == State::Online => {
+        banners.push((BannerTone::Ok, t.secure_wifi_online.replacen("{}", ssid, 1)))
+      }
+      _ if state != State::Online => {
+        if let Some(why) = env.blocked_reason(t) {
+          banners.push((BannerTone::Warn, why));
+        }
+      }
+      _ => {}
+    }
+  }
+  // Auto connect with nothing to connect with. Offline the machine sits there
+  // until someone fills the form in; online it looks healthy but cannot sign in
+  // again — a leftover portal session, which survives a core restart because
+  // keepalive needs no credential, hides exactly that. Information, not a
+  // failure, so it uses the amber band either way.
+  if page == Page::Status && core_answered && auto_connect && !credentials_ready {
+    let text = if state == State::Online {
+      t.auto_connect_without_credentials_online
+    } else {
+      t.auto_connect_without_credentials
+    };
+    banners.push((BannerTone::Warn, text.to_string()));
+  }
+  banners
+}
+
+/// Draw one full-width band across the top of the page.
+///
+/// The text wraps at the band's width and is cut after [`BANNER_ROWS`] lines
+/// with an ellipsis; the full text is on hover (and in the log pane).
 ///
 /// Returns the height it consumed, so the window can grow by the same amount
 /// and the page below keeps the size it has without a warning.
-fn red_banner(ui: &mut egui::Ui, text: impl Into<String>) -> f32 {
+fn banner(ui: &mut egui::Ui, text: impl Into<String>, tone: BannerTone) -> f32 {
+  let text = text.into();
+  let (fill, ink) = match tone {
+    BannerTone::Error => (
+      egui::Color32::from_rgb(90, 30, 30),
+      egui::Color32::from_rgb(255, 190, 190),
+    ),
+    // The amber of a warn log line, dimmed for a band this wide.
+    BannerTone::Warn => (
+      egui::Color32::from_rgb(74, 58, 20),
+      egui::Color32::from_rgb(240, 206, 128),
+    ),
+    // A dimmed green: the news is good, so it should not shout.
+    BannerTone::Ok => (
+      egui::Color32::from_rgb(28, 56, 34),
+      egui::Color32::from_rgb(168, 226, 178),
+    ),
+  };
   let frame = egui::Frame::new()
-    .fill(egui::Color32::from_rgb(90, 30, 30))
+    .fill(fill)
     .inner_margin(egui::Margin::same(8))
     .corner_radius(6)
     .show(ui, |ui| {
       // Full width (instead of shrink-wrapping the text) and centred, so the
       // strip reads as one band across the top of the page rather than a small
-      // red box.
+      // box.
       let width = ui.available_width();
       ui.set_width(width);
       ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(text.into()).color(egui::Color32::from_rgb(255, 190, 190)));
+        // The text is laid out here instead of being handed to a `Label` as a
+        // string: a Label re-wraps whatever job it gets and would drop the row
+        // limit, so only a galley built here keeps the cap. epaint appends
+        // `…` to the elided last row by itself.
+        let mut job = egui::text::LayoutJob::simple(
+          text.clone(),
+          egui::TextStyle::Body.resolve(ui.style()),
+          ink,
+          width,
+        );
+        job.wrap.max_rows = BANNER_ROWS;
+        let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+        let elided = galley.elided;
+        let response = ui.add(egui::Label::new(egui::WidgetText::Galley(galley)));
+        // A cut band still owes the reader the whole sentence.
+        if elided {
+          response.on_hover_text(text);
+        }
       });
     });
   frame.response.rect.height()
@@ -2274,6 +3314,29 @@ impl eframe::App for App {
     // regardless of what else happens this frame.
     self.pump_mode_request();
 
+    // Place the window in the middle of its monitor. eframe persists no window
+    // geometry (`persist_window: false`, the layout fixes the size), so without
+    // this the OS just picks a spot — Windows put the first window in the
+    // top-left corner of the work area. Only once per process: the user's own
+    // drag has to win over a repeated command.
+    if !self.centered {
+      let placement = ctx.input(|i| {
+        let viewport = i.viewport();
+        (
+          viewport.monitor_size,
+          viewport
+            .outer_rect
+            .or(viewport.inner_rect)
+            .map(|rect| rect.size()),
+        )
+      });
+      if let (Some(monitor), Some(frame)) = placement {
+        self.centered = true;
+        let corner = ((monitor - frame) * 0.5).max(egui::Vec2::ZERO);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(corner.to_pos2()));
+      }
+    }
+
     if !self.started {
       self.started = true;
       // Started visible: make sure the window is not left behind the app that
@@ -2307,9 +3370,26 @@ impl eframe::App for App {
       self.show_window(ctx);
     }
 
+    // An installer (or `thunet quit`) asks for a real exit, not the tray's
+    // hide-on-close: it needs the image gone before it replaces the file.
+    if crate::single::quit_requested() {
+      self.quit();
+    }
+
     // The core may have been restarted (crash, upgrade, systemd unit or logon
     // task): reconnect instead of going deaf.
     self.ensure_link();
+
+    // The window coming to the front is the moment the page has to be current;
+    // waiting for the core's 10–15 s poll made a freshly opened window show
+    // numbers that were seconds old. The refresh is quiet: the user did not
+    // ask for it, so it neither logs nor toasts.
+    let focused = ctx.input(|i| i.focused);
+    if focused && !self.focused {
+      self.send(Cmd::Refresh { quiet: true });
+      self.next_core_query = Instant::now();
+    }
+    self.focused = focused;
 
     // Outcome of a Start/Stop that ran on the helper thread. The tag matters:
     // a successful Stop has usually already been completed by the link
@@ -2343,24 +3423,24 @@ impl eframe::App for App {
           // `ensure_link` ran above, so a core that already answered has
           // cleared the click and toasted "started". Re-arming the watchdog
           // here would report a failure later for a start that succeeded.
-          if !self.link.as_ref().is_some_and(Link::alive) {
+          if !self.core_answered {
             self.service_request = Some((ServiceRequest::Start, Instant::now()));
           }
         }
         (ServiceRequest::Start, Err(e)) => {
           let cancelled = e == crate::elevate::CANCELLED;
-          let recovered = self.link.as_ref().is_some_and(|link| {
-            link.alive() && {
+          let recovered = self.core_answered
+            && self.link.as_ref().is_some_and(|link| {
               #[cfg(windows)]
               {
                 link.is_machine()
               }
               #[cfg(not(windows))]
               {
+                let _ = link;
                 true
               }
-            }
-          });
+            });
           self.service_request = None;
           self.pending_credentials = None;
           self.push_log(Line::error(format!("service: {e}")));
@@ -2405,6 +3485,16 @@ impl eframe::App for App {
     // Verify a typed password against the core's copy once typing pauses, so
     // re-entering the saved value does not look like an unsaved edit.
     self.check_typed_password();
+
+    // A switch whose answer never arrived (core restarted mid-way, link lost)
+    // must not leave *Apply* disabled for the rest of the session.
+    if self
+      .switch_pending
+      .is_some_and(|at| at.elapsed() > SWITCH_TIMEOUT)
+    {
+      self.switch_pending = None;
+      self.push_log(Line::warn("credentials: no answer from the core"));
+    }
 
     // Ask the service about itself now and then; the row it fills is advisory,
     // so a slow cadence is plenty.
@@ -2481,7 +3571,7 @@ impl eframe::App for App {
       .set_enabled(self.state != State::Online && self.env.allows_login());
     self
       .disconnect_item
-      .set_enabled(self.state == State::Online);
+      .set_enabled(self.state == State::Online && self.portal_verbs());
 
     // When hidden, wake up often enough to pick up a second launch quickly.
     let tick = if self.shown { 500 } else { 200 };
@@ -2492,6 +3582,7 @@ impl eframe::App for App {
     self.paint(ui);
     self.sync_window_height(ui.ctx());
     paint_toast(ui.ctx(), self.toast.as_ref());
+    self.paint_switch_confirm(ui.ctx());
   }
 }
 

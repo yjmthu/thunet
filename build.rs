@@ -23,7 +23,12 @@ fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/thunet.ico");
     res.set("ProductName", "THUnet");
-    res.set("FileDescription", "THUnet campus network client");
+    // Task Manager labels a process with this string, and both halves of the
+    // application are the same image - so it must read as the product, not as
+    // one of its halves. The service is still told apart by its SCM display
+    // name (`THUnet Background Service`), which Task Manager shows nested under
+    // the process.
+    res.set("FileDescription", "THUnet Campus Network App");
     res.set("LegalCopyright", "");
     res.compile().expect("compile Windows resources");
   }

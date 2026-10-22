@@ -15,9 +15,9 @@ use crate::config::Config;
 use crate::i18n::Lang;
 use crate::ipc::Sink;
 use crate::logline::Line;
-use crate::proto::{Cmd, Ev, LoginEnv, ToastKind};
+use crate::proto::{Cmd, Ev, Failure, LoginEnv, ToastKind};
 use crate::session::{Session, State};
-use crate::srun::NetEnv;
+use crate::srun::{NetCause, NetEnv, NetError};
 
 /// How often the network is re-probed. Without a route every probe waits out
 /// its timeout, so that case backs off much further; a route that answers
@@ -26,18 +26,69 @@ use crate::srun::NetEnv;
 const ENV_PROBE_MS: u64 = 15_000;
 const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
 
+/// Windows names a freshly joined network's profile "Identifying…" for a moment
+/// after the address appears, so the probe that runs on the link change can
+/// read that placeholder instead of the SSID and leave the enterprise verdict
+/// unset for as long as the session lasts. While online only the name is
+/// re-read (a local call, no request), and only while it is still unknown - the
+/// first answer that has a name in it ends the watch.
+const SSID_WATCH_AFTER_LINK: Duration = Duration::from_secs(90);
+const SSID_WATCH_STEP: Duration = Duration::from_secs(2);
+const SSID_WATCH_MAX_STEP: Duration = Duration::from_secs(20);
+
+/// Do the portal verbs (Connect, Disconnect, a credential change) mean anything
+/// on this network? On 802.1X Wi-Fi Windows owns the session and the portal
+/// entry is only a mirror of it: a logout there would end something this app
+/// never opened, and a login has nothing to prove. The window greys those verbs
+/// out; this is the same rule for a request that arrives over the pipe.
+fn portal_verbs(env: &LoginEnv) -> bool {
+  !matches!(env, LoginEnv::EnterpriseWifi(_))
+}
+
+/// One network probe.
+struct EnvProbe {
+  env: LoginEnv,
+  ac_id: Option<String>,
+  /// Why the SSID could not be read, when it could not, so the log can say that
+  /// the 802.1X shortcut was skipped instead of silently not applying.
+  ssid_note: Option<String>,
+}
+
 /// Probe what the machine is attached to, plus the `ac_id` when a campus portal
 /// answered. The SSID check comes first: on an 802.1X network no portal request
 /// is worth making.
-fn probe_env(session: &Session) -> (LoginEnv, Option<String>) {
-  if let Some(ssid) = crate::wifi::no_portal_wifi() {
-    return (LoginEnv::EnterpriseWifi(ssid), None);
+fn probe_env(session: &Session) -> EnvProbe {
+  let wifi = crate::wifi::classify();
+  // Reported once per change: it is what makes "no 802.1X shortcut" visible,
+  // whether Windows refused to name the SSID or the name simply is not one of
+  // the enterprise networks.
+  let ssid_note = match &wifi {
+    crate::wifi::WifiKind::Enterprise(ssid) => {
+      Some(format!("wifi: {ssid} authenticates below the portal"))
+    }
+    crate::wifi::WifiKind::Portal(ssid) => Some(format!("wifi: {ssid} uses the portal")),
+    // Nothing wireless is connected: there is no verdict to explain, so this
+    // stays quiet instead of claiming "no ssid" on every wired machine.
+    crate::wifi::WifiKind::NoWifi => None,
+    crate::wifi::WifiKind::Unknown(why) => Some(format!("wifi: no ssid ({why})")),
+  };
+  if let crate::wifi::WifiKind::Enterprise(ssid) = wifi {
+    return EnvProbe {
+      env: LoginEnv::EnterpriseWifi(ssid),
+      ac_id: None,
+      ssid_note,
+    };
   }
-  match session.net_env() {
+  let (env, ac_id) = match session.net_env() {
     NetEnv::Campus { ac_id } => (LoginEnv::Campus, Some(ac_id)),
     NetEnv::Unreachable => (LoginEnv::NoNetwork, None),
     NetEnv::OtherPortal => (LoginEnv::OtherPortal, None),
     NetEnv::DirectInternet => (LoginEnv::NoPortal, None),
+  };
+  EnvProbe {
+    env,
+    ac_id,
+    ssid_note,
   }
 }
 
@@ -88,6 +139,115 @@ fn credential_state(
   }
 }
 
+/// Publish the red banner, skipping a repeat of what is already on screen.
+///
+/// Every manual Connect after a rejection re-detects the same failure, and
+/// sending it again would only make the window re-announce what it shows.
+fn set_banner(tx: &Sink, banner: &mut Option<Failure>, next: Option<Failure>) {
+  if *banner != next {
+    *banner = next.clone();
+    tx.send(Ev::Error(next)).ok();
+  }
+}
+
+/// The banner for a failed portal request.
+///
+/// A network cause travels as a kind and the window words it in its own
+/// language; anything else keeps the text the core already produced.
+fn failure_of(label: &str, e: &NetError) -> Failure {
+  match e.cause {
+    NetCause::Other => Failure::Text(format!("{label}: {e}")),
+    cause => Failure::Network(cause),
+  }
+}
+
+/// Replace the live session with one created by `next`, or leave it alone.
+///
+/// The portal hands out one session per address and proves a password only by
+/// accepting a login, so trying another pair costs the current session: log
+/// out, sign in with the new pair, and when the portal refuses it sign the
+/// previous pair back in. Nothing reaches the disk here — the caller stores the
+/// pair only on `Ok`, which is what keeps `credential.bin` on the credential
+/// that is known to work and keeps a remote machine reachable.
+fn switch_account(
+  session: &mut Session,
+  tx: &Sink,
+  t: &crate::i18n::Texts,
+  next: (&str, &str, bool),
+) -> Result<(), Failure> {
+  let (username, password, remember) = next;
+  let previous = (
+    session.cfg().username.clone(),
+    session.cfg().password.clone(),
+    session.cfg().remember_password,
+  );
+  tx.send(Ev::Notify {
+    msg: t.switching_account.into(),
+    kind: ToastKind::Info,
+  })
+  .ok();
+
+  if let Err(e) = session.logout() {
+    // Nothing was lost: the old session is still up and still the stored pair.
+    tx.send(Ev::Log(Line::error(format!(
+      "cannot switch the account, the logout failed: {e}"
+    ))))
+    .ok();
+    return Err(failure_of(t.disconnect_failed, &e));
+  }
+  tx.send(Ev::Log(Line::info("logged out to switch the account")))
+    .ok();
+
+  if session.is_online_now() {
+    // A "login" now would be a no-op the portal accepts without looking at the
+    // password, which would store a pair that was never proven. Leave the old
+    // one in place and let the user try again in a moment.
+    tx.send(Ev::Log(Line::warn(
+      "the portal still lists this address online; the account was not switched",
+    )))
+    .ok();
+    return Err(Failure::Text(t.switch_pending.to_string()));
+  }
+
+  session.set_credentials(username.to_string(), password.to_string());
+  session.cfg_mut().remember_password = remember;
+  match session.ensure_online() {
+    Ok(m) => {
+      tx.send(Ev::Log(Line::info(format!("account switched: {m}"))))
+        .ok();
+      Ok(())
+    }
+    Err(e) => {
+      let refused = session.failure == crate::session::FailureKind::Credentials;
+      tx.send(Ev::Log(Line::error(format!(
+        "the new credentials were not accepted: {e}"
+      ))))
+      .ok();
+      // The machine has to stay reachable: this is exactly the case a remote
+      // user cannot fix by hand.
+      session.set_credentials(previous.0.clone(), previous.1.clone());
+      session.cfg_mut().remember_password = previous.2;
+      match session.ensure_online() {
+        Ok(_) => tx
+          .send(Ev::Log(Line::info(
+            "signed back in with the previous account",
+          )))
+          .ok(),
+        Err(e) => tx
+          .send(Ev::Log(Line::warn(format!(
+            "the previous account could not sign back in yet: {e}"
+          ))))
+          .ok(),
+      };
+      Err(if refused {
+        Failure::Credentials
+      } else {
+        failure_of(t.login_failed, &e)
+      })
+    }
+  }
+}
+
 pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
   let keepalive = Duration::from_secs(cfg.keepalive_interval_secs.max(30));
@@ -115,6 +275,15 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let mut last_failure = String::new();
   // Set when the user pressed "Connect", so a skipped attempt can be reported.
   let mut user_connect = false;
+  // A rejected password is deterministic: the same pair can only be refused
+  // again, and retrying it hammers the portal (and may trip its lockout). So
+  // automatic attempts stop until the pair changes, the user presses Connect,
+  // a login succeeds, or the core restarts (a password fixed on the portal's
+  // own page then gets one more try).
+  let mut rejected = false;
+  // What the red banner shows, so the same failure is not re-announced and a
+  // routine success (a status refresh) never wipes a rejection still true.
+  let mut banner: Option<Failure> = None;
   // Link watch: `link_up()` costs a route lookup, so it can run every second.
   // A rising edge (network just became usable) retries immediately instead of
   // waiting out a backoff, which makes login start ~1 s after Wi-Fi connects.
@@ -124,10 +293,25 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // below reuses this verdict instead of probing again.
   let mut last_env = LoginEnv::Campus;
   let mut next_env_probe = Instant::now();
+  // The path to the internet the last probe ran on. When it changes - a cable
+  // pulled, Wi-Fi joined, a new address - the verdict describes a network the
+  // machine has already left, so it is re-probed even while the session is up.
+  let mut last_link: Option<std::net::IpAddr> = None;
+  let mut force_env = false;
+  // The last thing the log said about reading the SSID, so a read that Windows
+  // refuses is reported once instead of on every probe.
+  let mut last_ssid_note: Option<String> = None;
+  // After the path to the internet changes, the SSID is re-read for a while:
+  // see [`SSID_WATCH_AFTER_LINK`].
+  let mut ssid_watch_until = Instant::now();
+  let mut next_ssid_watch = Instant::now();
+  let mut ssid_watch_step = SSID_WATCH_STEP;
 
   for w in session.take_warnings() {
     tx.send(Ev::Log(w)).ok();
   }
+  tx.send(Ev::Log(Line::debug(format!("lang: start {lang:?}"))))
+    .ok();
 
   loop {
     let t = lang.texts();
@@ -140,7 +324,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               tx.send(Ev::Info(v)).ok();
             }
             tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Error(None)).ok();
+            rejected = false;
+            set_banner(&tx, &mut banner, None);
             tx.send(Ev::Log(Line::info("already online"))).ok();
             tx.send(Ev::Notify {
               msg: t.already_online.into(),
@@ -150,6 +335,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           } else {
             want_online = true;
             user_connect = true;
+            // An explicit Connect is the user overriding the pause.
+            rejected = false;
             next_attempt = Instant::now();
             failures = 0;
             last_failure.clear();
@@ -157,8 +344,20 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           }
         }
         Cmd::Disconnect => {
-          // Check the current state first so no useless logout request is sent.
-          if !session.is_online_now() {
+          // The session on an 802.1X network belongs to Windows; ending the
+          // portal's copy of it is a change this app has no business making,
+          // whether the request comes from the window or from `thunet logout`.
+          if !portal_verbs(&last_env) {
+            tx.send(Ev::Log(Line::warn(
+              "refused: the portal session here is not managed by this app",
+            )))
+            .ok();
+            tx.send(Ev::Notify {
+              msg: t.disconnect_unavailable.into(),
+              kind: ToastKind::Err,
+            })
+            .ok();
+          } else if !session.is_online_now() {
             if let Ok(v) = session.refresh() {
               tx.send(Ev::Info(v)).ok();
             }
@@ -181,8 +380,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
                 .ok();
               }
               Err(e) => {
-                tx.send(Ev::Error(Some(format!("{}: {e}", t.disconnect_failed))))
-                  .ok();
+                set_banner(&tx, &mut banner, Some(failure_of(t.disconnect_failed, &e)));
                 tx.send(Ev::Notify {
                   msg: t.disconnect_failed.into(),
                   kind: ToastKind::Err,
@@ -193,68 +391,209 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             want_online = false;
           }
         }
-        Cmd::Refresh => match session.refresh() {
+        Cmd::Refresh { quiet } => match session.refresh() {
           Ok(v) => {
             tx.send(Ev::Info(v)).ok();
             tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Error(None)).ok();
-            tx.send(Ev::Log(Line::info("status refreshed"))).ok();
-            tx.send(Ev::Notify {
-              msg: t.status_refreshed.into(),
-              kind: ToastKind::Ok,
-            })
-            .ok();
+            // A refresh proves the portal answers, not that the stored
+            // password is right: a rejection stays on screen (and stays
+            // latched) through it, unless the session turns out to be online.
+            if session.state == State::Online {
+              rejected = false;
+            }
+            if session.state == State::Online
+              || !matches!(banner.as_ref(), Some(Failure::Credentials))
+            {
+              set_banner(&tx, &mut banner, None);
+            }
+            // A refresh the window started by itself only exists to make the
+            // page current; it is not news.
+            if !quiet {
+              tx.send(Ev::Log(Line::info("status refreshed"))).ok();
+              tx.send(Ev::Notify {
+                msg: t.status_refreshed.into(),
+                kind: ToastKind::Ok,
+              })
+              .ok();
+            }
           }
           Err(e) => {
-            tx.send(Ev::Error(Some(format!("{}: {e}", t.refresh_failed))))
+            // The banner is the point of even a quiet refresh; only the toast
+            // is skipped.
+            set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
+            if !quiet {
+              tx.send(Ev::Notify {
+                msg: t.refresh_failed.into(),
+                kind: ToastKind::Err,
+              })
               .ok();
-            tx.send(Ev::Notify {
-              msg: t.refresh_failed.into(),
-              kind: ToastKind::Err,
-            })
-            .ok();
+            }
           }
         },
         Cmd::SetLang(l) => {
+          // Logged because two frontends can disagree: the window follows its
+          // own setting, a CLI run follows the machine one.
+          tx.send(Ev::Log(Line::debug(format!(
+            "lang: SetLang {l:?} (was {lang:?})"
+          ))))
+          .ok();
           lang = l;
+        }
+        // The pair is not used on this network and cannot be tried, so storing
+        // it would leave the machine with an unverified password. Answering
+        // with the current state keeps the window from waiting for a reply.
+        Cmd::SetCredentials { .. } if !portal_verbs(&last_env) => {
+          tx.send(Ev::Credentials(credential_state(
+            &session, remembered, None,
+          )))
+          .ok();
+          tx.send(Ev::Log(Line::warn(
+            "skipped: no portal account is used on this network",
+          )))
+          .ok();
+          tx.send(Ev::Notify {
+            msg: t.credentials_unavailable.into(),
+            kind: ToastKind::Err,
+          })
+          .ok();
         }
         Cmd::SetCredentials {
           username,
           password,
           remember,
         } => {
-          let ready = !username.is_empty() && !password.is_empty();
-          if ready {
-            session.set_credentials(username.clone(), password.clone());
-          } else if !remember {
-            // An empty form with "remember" still ticked is almost certainly
-            // the window reopening without the password; do not wipe a stored
-            // credential. Unticking the box is the explicit clear.
-            session.set_credentials(String::new(), String::new());
-          }
-          // The sealed blob alone is not enough: the core also has to record
-          // that it wants it read back. Without `remember_password` in its own
-          // `config.json` a restarted core ignores the blob and comes up with
-          // no credential at all (the window would then show an empty, unsaved
-          // password even though Apply had worked).
-          session.cfg_mut().remember_password = remember;
           let dir = crate::config::dir();
-          match session.cfg().save_to(&dir) {
-            Ok(()) => remembered = remember && !session.cfg().password.is_empty(),
-            Err(e) => {
-              tx.send(Ev::Error(Some(format!("cannot save the credential: {e}"))))
-                .ok();
-            }
+          let ready = !username.is_empty() && !password.is_empty();
+          // *Remember password* needs a complete pair: an empty field means
+          // "keep what is stored" (the window disables *Apply* in that state),
+          // so a request like this has nothing to write and nothing to change —
+          // and it must not rewrite the sealed blob or lift a rejection either.
+          // Changing the account without retyping the password is not allowed.
+          if remember && !ready {
+            tx.send(Ev::Credentials(credential_state(
+              &session, remembered, None,
+            )))
+            .ok();
+            continue;
           }
-          // Answer even when the request was a no-op: the window uses the
-          // reply to learn whether the value it typed is the stored one.
-          tx.send(Ev::Credentials(credential_state(
-            &session, remembered, None,
-          )))
-          .ok();
-          if ready && session.cfg().auto_connect && session.state != State::Online {
-            want_online = true;
-            last_status = Instant::now() - Duration::from_secs(60);
+          // Whether this Apply actually changes the pair. The same pair must
+          // not lift a rejection, or Apply would turn into a retry button for
+          // a password the portal already refused.
+          let new_pair = session.cfg().username != username || session.cfg().password != password;
+          // While online, the pair is *proven* before it is stored: the old
+          // session goes away anyway (the portal serves one account per
+          // address), so the only question is whether the machine comes back
+          // on the new credentials or on the old ones. Offline the pair is
+          // stored as given and queued for the retry loop: there is no session
+          // to protect, and the account has to be ready when the network
+          // returns.
+          if ready && new_pair && session.state == State::Online {
+            match switch_account(&mut session, &tx, t, (&username, &password, remember)) {
+              Ok(()) => {
+                rejected = false;
+                want_online = true;
+                failures = 0;
+                last_failure.clear();
+                next_attempt = Instant::now();
+                match session.cfg().save_to(&dir) {
+                  Ok(()) => {
+                    remembered = remember && !session.cfg().password.is_empty();
+                    set_banner(&tx, &mut banner, None);
+                    tx.send(Ev::Notify {
+                      msg: t.switched_account.into(),
+                      kind: ToastKind::Ok,
+                    })
+                    .ok();
+                  }
+                  // The session runs on the new pair, so this is about the
+                  // next start, not about now.
+                  Err(e) => set_banner(
+                    &tx,
+                    &mut banner,
+                    Some(Failure::Text(format!("cannot save the credential: {e}"))),
+                  ),
+                }
+              }
+              Err(failure) => {
+                // Nothing was written, so the stored credential still works and
+                // the loop may keep retrying with it.
+                rejected = false;
+                want_online = session.state != State::Online;
+                failures = 0;
+                last_failure.clear();
+                next_attempt = Instant::now();
+                // The typed pair was refused, but the previous account is back:
+                // the machine is online and its stored credential was *not*
+                // rejected, so the red banner would be a lie that never clears.
+                // The toast and the log line carry the news instead. Only a
+                // switch that left the machine offline keeps the banner.
+                let back_online = session.state == State::Online;
+                set_banner(
+                  &tx,
+                  &mut banner,
+                  if back_online { None } else { Some(failure) },
+                );
+                tx.send(Ev::Notify {
+                  msg: t.switch_failed.into(),
+                  kind: ToastKind::Err,
+                })
+                .ok();
+              }
+            }
+            tx.send(Ev::Credentials(credential_state(
+              &session, remembered, None,
+            )))
+            .ok();
+          } else {
+            if ready {
+              session.set_credentials(username.clone(), password.clone());
+            } else if !remember {
+              // An empty form with "remember" still ticked is almost certainly
+              // the window reopening without the password; do not wipe a stored
+              // credential. Unticking the box is the explicit clear.
+              session.set_credentials(String::new(), String::new());
+            }
+            if new_pair {
+              rejected = false;
+              // A cleared pair has no attempt left in it, so a rejection would
+              // stay on screen with nothing behind it.
+              if !ready {
+                set_banner(&tx, &mut banner, None);
+              }
+            }
+            // The sealed blob alone is not enough: the core also has to record
+            // that it wants it read back. Without `remember_password` in its own
+            // `config.json` a restarted core ignores the blob and comes up with
+            // no credential at all (the window would then show an empty, unsaved
+            // password even though Apply had worked).
+            session.cfg_mut().remember_password = remember;
+            match session.cfg().save_to(&dir) {
+              Ok(()) => remembered = remember && !session.cfg().password.is_empty(),
+              Err(e) => {
+                set_banner(
+                  &tx,
+                  &mut banner,
+                  Some(Failure::Text(format!("cannot save the credential: {e}"))),
+                );
+              }
+            }
+            // Answer even when the request was a no-op: the window uses the
+            // reply to learn whether the value it typed is the stored one.
+            tx.send(Ev::Credentials(credential_state(
+              &session, remembered, None,
+            )))
+            .ok();
+            // Try a complete pair at once, because the backoff in flight was
+            // chosen for the old one. `auto_connect` only says whether the app
+            // logs in by itself at start-up, so it does not gate an edit; a pair
+            // that was just refused is not tried again either.
+            if ready && session.state != State::Online && !rejected {
+              want_online = true;
+              next_attempt = Instant::now();
+              failures = 0;
+              last_failure.clear();
+              last_status = Instant::now() - Duration::from_secs(60);
+            }
           }
         }
         Cmd::CheckCredentials { username, password } => {
@@ -357,28 +696,87 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     // that just appeared instead of the verdict from before it came up. (With
     // the probe first, boot used to skip once on "no network" and then sit out
     // that skip's 30 s delay even though the link was already usable.)
-    if !missing_creds
-      && want_online
-      && session.state != State::Online
-      && Instant::now() >= next_link_check
-    {
+    //
+    // It runs unconditionally: the same route lookup is also what notices that
+    // the machine moved to a different network while a session was up, which
+    // used to go unseen because the probe did not run while online.
+    if Instant::now() >= next_link_check {
       next_link_check = Instant::now() + Duration::from_secs(1);
-      let up = crate::srun::link_up();
+      let id = crate::srun::link_id();
+      if id != last_link {
+        last_link = id;
+        // A different path to the internet: the verdict, the backoff in flight
+        // and the reason last logged all belong to the old one. The SSID window
+        // is *replaced*, never extended - a switch supersedes the watch started
+        // for the previous network, so a leftover window can never decide when
+        // the new one is read.
+        force_env = true;
+        ssid_watch_until = Instant::now() + SSID_WATCH_AFTER_LINK;
+        ssid_watch_step = SSID_WATCH_STEP;
+        next_ssid_watch = Instant::now() + ssid_watch_step;
+        next_attempt = Instant::now();
+        failures = 0;
+        last_failure.clear();
+      }
+      let up = id.is_some();
       if up && !link_ready {
         next_attempt = Instant::now();
         failures = 0;
         last_failure.clear();
         next_env_probe = Instant::now();
       }
+      if !up {
+        // No route at all: there is no name to read. Drop the window; the next
+        // link change opens a fresh one.
+        ssid_watch_until = Instant::now();
+      }
       link_ready = up;
     }
 
-    // Probe the network on a timer, online or not: the answer is what greys out
-    // *Connect* off-campus, and it must not be 15 s stale after a Wi-Fi change.
-    if session.state != State::Online && Instant::now() >= next_env_probe {
-      let (env, ac_id) = probe_env(&session);
-      if let Some(ac_id) = ac_id {
+    // While online, re-read only the name, and only while the last read could
+    // not name the network. The full probe stays off while a session is up (it
+    // costs three requests), but a name is local, and it is what decides the
+    // enterprise verdict - right after joining, Windows may still be calling
+    // the network "Identifying…".
+    if session.state == State::Online
+      && !force_env
+      && Instant::now() < ssid_watch_until
+      && Instant::now() >= next_ssid_watch
+    {
+      let kind = crate::wifi::classify();
+      if matches!(kind, crate::wifi::WifiKind::Enterprise(_))
+        == !matches!(last_env, LoginEnv::EnterpriseWifi(_))
+      {
+        // The name appeared (or the machine left that network): let the full
+        // probe decide, and say so in the log. That is the last look needed.
+        force_env = true;
+        ssid_watch_until = Instant::now();
+      } else if matches!(kind, crate::wifi::WifiKind::Unknown(_)) {
+        // Still "Identifying…": back off instead of hammering a read that is
+        // waiting for Windows to finish naming the network.
+        ssid_watch_step = (ssid_watch_step * 2).min(SSID_WATCH_MAX_STEP);
+        next_ssid_watch = Instant::now() + ssid_watch_step;
+      } else {
+        // A name that exists is the name this network keeps: stop asking.
+        ssid_watch_until = Instant::now();
+      }
+    }
+
+    // Probe the network on a timer while offline, and in the same pass the path
+    // to the internet changed - online included, because the verdict is what
+    // the window shows and it may not describe the old network.
+    if force_env || (session.state != State::Online && Instant::now() >= next_env_probe) {
+      force_env = false;
+      let probe = probe_env(&session);
+      let env = probe.env;
+      if let Some(ac_id) = probe.ac_id {
         session.set_ac_id(ac_id);
+      }
+      if let Some(note) = &probe.ssid_note
+        && last_ssid_note.as_ref() != Some(note)
+      {
+        tx.send(Ev::Log(Line::debug(note.clone()))).ok();
+        last_ssid_note = probe.ssid_note;
       }
       // The slow cadence is only for a machine with no route at all.
       // `link_ready` is maintained by the link watch, and that only runs while
@@ -408,6 +806,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     if !missing_creds
       && want_online
       && session.state != State::Online
+      && !rejected
       && link_ready
       && Instant::now() >= next_attempt
     {
@@ -479,7 +878,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           failures = 0;
           last_failure.clear();
           user_connect = false;
-          tx.send(Ev::Error(None)).ok();
+          rejected = false;
+          set_banner(&tx, &mut banner, None);
           tx.send(Ev::Log(Line::info(m))).ok();
           tx.send(Ev::Notify {
             msg: t.connect_ok.into(),
@@ -493,33 +893,45 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
           next_attempt = Instant::now() + Duration::from_secs_f64(backoff.min(120.0));
           let bad_credentials = session.failure == crate::session::FailureKind::Credentials;
-          // A credential rejection carries a long JSON blob that only helps when
-          // debugging, so it goes to the log pane while the red banner and the
-          // toast carry the one thing the user can act on.
-          tx.send(Ev::Error(if bad_credentials {
-            None
-          } else {
-            Some(e.clone())
-          }))
-          .ok();
+          // A rejected password stops the automatic attempts: the same pair
+          // can only be refused again. Only a new pair, a manual Connect or a
+          // restart lifts that.
+          rejected = bad_credentials;
+          user_connect = false;
+          // A credential rejection carries a long JSON blob that only helps
+          // when debugging, so it goes to the log pane while the red banner
+          // says what the user can act on. The banner is worded by the
+          // frontend, so a language switch re-words it, and it stays up until
+          // a login succeeds.
+          set_banner(
+            &tx,
+            &mut banner,
+            Some(if bad_credentials {
+              Failure::Credentials
+            } else {
+              // The frontend shows this verbatim, so the words have to be here:
+              // a refresh or disconnect failure already says what it was.
+              failure_of(t.login_failed, &e)
+            }),
+          );
           tx.send(Ev::Log(Line::error(format!(
             "{e} (retry in {}s)",
             backoff.min(120.0) as u64
           ))))
           .ok();
           // Only buzz once per distinct reason, otherwise retries spam toasts.
-          if e != last_failure {
-            last_failure = e;
-            tx.send(Ev::Notify {
-              msg: if bad_credentials {
-                t.invalid_credentials
-              } else {
-                t.connect_failed
-              }
-              .into(),
-              kind: ToastKind::Err,
-            })
-            .ok();
+          // A rejected password is not a toast: the banner already says it and
+          // stays there, while a toast would flash and vanish.
+          let detail = e.to_string();
+          if detail != last_failure {
+            last_failure = detail;
+            if !bad_credentials {
+              tx.send(Ev::Notify {
+                msg: t.connect_failed.into(),
+                kind: ToastKind::Err,
+              })
+              .ok();
+            }
           }
         }
       };
@@ -538,12 +950,22 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         if online && session.state != State::Online {
           session.state = State::Online;
           failures = 0;
+          // Being online leaves the warning with nothing to act on; if the
+          // session drops later, one attempt re-detects a rejection.
+          rejected = false;
+          set_banner(&tx, &mut banner, None);
           tx.send(Ev::Log(Line::info("already online"))).ok();
         } else if !online && session.state == State::Online {
           // Session ended outside our control (timeout / kicked / unplugged).
           session.state = State::Offline;
           tx.send(Ev::Log(Line::warn("session ended, now offline")))
             .ok();
+        } else if online && matches!(banner.as_ref(), Some(Failure::Credentials)) {
+          // A credential banner is only true while the machine cannot sign in.
+          // This session proves the stored pair works, so drop it even though
+          // the state did not change: that is the case after a refused switch
+          // that signed the previous account back in.
+          set_banner(&tx, &mut banner, None);
         }
         tx.send(Ev::Info(v)).ok();
       }
@@ -552,8 +974,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
 
     if session.state == State::Online && last_ka.elapsed() >= keepalive {
       // Without credentials there is nothing a failing keepalive could trigger
-      // but an empty-password login, so only report the state poll above.
-      if session.keepalive().is_err() && !missing_creds {
+      // but an empty-password login, so only report the state poll above. A
+      // latched rejection stays latched here too, otherwise a dropped session
+      // would quietly retry the refused pair behind the user's back.
+      if session.keepalive().is_err() && !missing_creds && !rejected {
         let _ = session.ensure_online();
       }
       last_ka = Instant::now();
@@ -571,5 +995,29 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     }
 
     std::thread::sleep(Duration::from_millis(400));
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The window greys the portal verbs out on 802.1X; the pipe refuses them for
+  /// the same reason, so `thunet logout` cannot end a session the OS owns.
+  #[test]
+  fn portal_verbs_are_off_on_enterprise_wifi() {
+    assert!(portal_verbs(&LoginEnv::Campus));
+    // A campus link that already reaches the internet is still a portal link:
+    // Disconnect has a real session to end there.
+    assert!(portal_verbs(&LoginEnv::NoPortal));
+    assert!(portal_verbs(&LoginEnv::OtherPortal));
+    assert!(portal_verbs(&LoginEnv::NoNetwork));
+    assert!(!portal_verbs(&LoginEnv::EnterpriseWifi(
+      "Tsinghua-Secure".into()
+    )));
+    // The duplicate-name form Windows produces is the same network.
+    assert!(!portal_verbs(&LoginEnv::EnterpriseWifi(
+      "Tsinghua-Secure 2".into()
+    )));
   }
 }

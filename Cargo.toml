@@ -58,6 +58,9 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Console",
+  # `CoCreateInstance`/`CoInitializeEx`: the Network List Manager names the
+  # current network when `netsh` refuses to (Location services off).
+  "Win32_System_Com",
   # `SHELLEXECUTEINFOW` (used by the UAC elevation path) embeds an `HKEY`
   # field, so windows-sys gates it behind the Registry module.
   "Win32_System_Registry",

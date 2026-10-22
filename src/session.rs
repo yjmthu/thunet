@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::logline::Line;
-use crate::srun::{Client, NetEnv};
+use crate::srun::{Client, NetEnv, NetError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
@@ -101,7 +101,7 @@ impl Session {
   }
 
   /// Query the portal and sync the local state with reality.
-  pub fn refresh(&mut self) -> Result<serde_json::Value, String> {
+  pub fn refresh(&mut self) -> Result<serde_json::Value, NetError> {
     let v = self.client.status(&self.cfg.ac_id)?;
     let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
     self.state = if online {
@@ -142,7 +142,7 @@ impl Session {
   }
 
   /// One full "make sure I am online" step.
-  pub fn ensure_online(&mut self) -> Result<String, String> {
+  pub fn ensure_online(&mut self) -> Result<String, NetError> {
     self.state = State::Authenticating;
     self.failure = FailureKind::Other;
     if self.client.is_online(&self.cfg.ac_id) {
@@ -178,7 +178,9 @@ impl Session {
           // amber until a later status poll happened to succeed — which on a
           // dead network never happens.
           self.state = State::Offline;
-          return Err(format!("request to {} failed: {e}", self.cfg.host));
+          // Keep the cause: the window words a dead network differently from a
+          // portal that answered with something unusable.
+          return Err(e.context(format!("request to {} failed", self.cfg.host)));
         }
       };
 
@@ -193,12 +195,12 @@ impl Session {
       if crate::srun::is_credentials_error(&code) {
         self.failure = FailureKind::Credentials;
         self.state = State::Offline;
-        return Err(self.rejected(&v));
+        return Err(NetError::msg(self.rejected(&v)));
       }
       let policy_like = code.starts_with("E28") || code == "no ecode" || code.is_empty();
       if !policy_like {
         self.state = State::Offline;
-        return Err(self.rejected(&v));
+        return Err(NetError::msg(self.rejected(&v)));
       }
       // The AC id changes with the network; re-detect once.
       if attempt == 1 {
@@ -222,13 +224,13 @@ impl Session {
         ));
       }
       self.state = State::Offline;
-      return Err(self.rejected(&v));
+      return Err(NetError::msg(self.rejected(&v)));
     }
   }
 
   /// Touch the keepalive target; failure to reach the internet implies the
   /// session is gone, so the caller should re-authenticate.
-  pub fn keepalive(&mut self) -> Result<(), String> {
+  pub fn keepalive(&mut self) -> Result<(), NetError> {
     match self.client.touch(&self.cfg.keepalive_target) {
       Ok(_) => {
         self.failures = 0;
@@ -241,7 +243,7 @@ impl Session {
     }
   }
 
-  pub fn logout(&mut self) -> Result<String, String> {
+  pub fn logout(&mut self) -> Result<String, NetError> {
     // The portal knows which account owns the session on this address, and that
     // account wins: the saved one may belong to somebody else (shared machine)
     // or be missing entirely. `get_challenge` also rejects an empty username.
@@ -262,13 +264,15 @@ impl Session {
       )));
     }
     if username.is_empty() {
-      return Err("no account to log out: none is saved and the portal reports no session".into());
+      return Err(NetError::msg(
+        "no account to log out: none is saved and the portal reports no session",
+      ));
     }
     let v = self
       .client
       .login_logout(&username, None, &ip, &self.cfg.ac_id, true)?;
     if v.get("error").and_then(|e| e.as_str()) != Some("ok") {
-      return Err(format!("logout rejected: {v}"));
+      return Err(NetError::msg(format!("logout rejected: {v}")));
     }
     self.state = State::Offline;
     Ok(format!("{v}"))

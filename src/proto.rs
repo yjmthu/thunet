@@ -21,6 +21,11 @@ use crate::logline::Line;
 use crate::session::State;
 
 /// Bumped whenever a [`Cmd`] or [`Ev`] variant changes shape or meaning.
+///
+/// While the app is pre-release the window and the service are always installed
+/// from the same build, so this stays at 1 and the shapes may change freely.
+/// Raise it the first time an old core can meet a new frontend: a released
+/// build, or an upgrade that cannot restart both halves together.
 pub const VERSION: u8 = 1;
 
 /// What the frontend asks the core to do.
@@ -28,7 +33,13 @@ pub const VERSION: u8 = 1;
 pub enum Cmd {
   Connect,
   Disconnect,
-  Refresh,
+  /// Re-read the portal and publish state/traffic.
+  Refresh {
+    /// A refresh the window started on its own (it just came to the front)
+    /// exists to make the page current, so it neither logs nor toasts.
+    #[serde(default)]
+    quiet: bool,
+  },
   /// Language for the core's own user-facing strings.
   SetLang(Lang),
   SetCredentials {
@@ -132,6 +143,36 @@ pub struct CredentialState {
   pub matches: Option<bool>,
 }
 
+/// Why the red banner is up.
+///
+/// The frontend turns these into words when it paints, so a banner that is
+/// already on screen is re-worded by a language switch; the core only reports
+/// which case happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Failure {
+  /// The portal rejected the account/password pair, which only the user can
+  /// fix. The raw JSON answer goes to the log pane instead.
+  Credentials,
+  /// The request never reached the portal. Only the kind travels: the OS text
+  /// is localized by Windows, so the window words this itself.
+  Network(crate::srun::NetCause),
+  /// Text the core already worded (a disk or service error).
+  Text(String),
+}
+
+impl std::fmt::Display for Failure {
+  /// The CLI prints one line, so it takes the words of the OS language; the
+  /// window words its banner itself instead, to follow its own setting.
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let t = crate::i18n::Lang::system().texts();
+    f.write_str(match self {
+      Failure::Credentials => t.invalid_credentials,
+      Failure::Network(cause) => t.net_cause(*cause),
+      Failure::Text(s) => s,
+    })
+  }
+}
+
 /// What the core tells the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Ev {
@@ -139,7 +180,7 @@ pub enum Ev {
   Info(Value),
   Log(Line),
   /// `Some` = a failure to surface; `None` = clear the banner.
-  Error(Option<String>),
+  Error(Option<Failure>),
   /// Transient bottom-strip feedback for an action's outcome.
   Notify {
     msg: String,
@@ -234,7 +275,9 @@ mod tests {
       Ev::Env(LoginEnv::EnterpriseWifi("Tsinghua-Secure".into())),
       Ev::Env(LoginEnv::NoPortal),
       Ev::Error(None),
-      Ev::Error(Some("boom".into())),
+      Ev::Error(Some(Failure::Credentials)),
+      Ev::Error(Some(Failure::Network(crate::srun::NetCause::Resolve))),
+      Ev::Error(Some(Failure::Text("boom".into()))),
       Ev::Log(Line::warn("careful")),
       Ev::Notify {
         msg: "ok".into(),
@@ -249,8 +292,21 @@ mod tests {
   }
 
   #[test]
+  fn a_credential_rejection_keeps_its_kind_on_the_wire() {
+    // The wording belongs to the frontend, so the wire only carries the case;
+    // a `Text` here would freeze the core's language into the banner.
+    let text = Wire::ev(Ev::Error(Some(Failure::Credentials)))
+      .line()
+      .unwrap();
+    match Wire::parse(text.trim_end()).unwrap().msg {
+      Msg::Ev(Ev::Error(Some(Failure::Credentials))) => {}
+      other => panic!("wrong variant: {other:?}"),
+    }
+  }
+
+  #[test]
   fn a_foreign_version_is_still_parsed_so_the_core_can_refuse_it() {
-    let text = r#"{"v":99,"msg":{"t":"cmd","m":"Refresh"}}"#;
+    let text = r#"{"v":99,"msg":{"t":"cmd","m":{"Refresh":{"quiet":false}}}}"#;
     let wire = Wire::parse(text).unwrap();
     assert_eq!(wire.v, 99);
   }

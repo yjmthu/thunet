@@ -19,6 +19,11 @@ python = "*"
 
 [feature.dev.dependencies]
 rust = "*"
+# Standard-library sources: rust-analyzer needs them to resolve the `core`
+# impls of primitives (`Not for bool`, `Neg for f64`, …). Without it the editor
+# reports bogus E0600 errors on perfectly valid code. Keep the version equal to
+# the `rust` package above.
+rust-src = "==1.99.0"
 
 [feature.dev.target.win-64.dependencies]
 vs2026_win-64 = "*"
@@ -40,6 +45,11 @@ bzip2 = "*"
 
 [feature.dev.target.linux-64.activation]
 scripts = ["scripts/activate_linux.sh"]
+
+[feature.dev.tasks]
+# Refresh `.vscode/settings.json` so rust-analyzer inherits this environment
+# (toolchain paths differ per platform, so the file is generated locally).
+vscode-settings = "python scripts/vscode_settings.py"
 
 # ------------------------------------------------------------------ packaging
 # `pixi run -e package msi`   -> dist/thunet-<version>-x64.msi      (Windows)

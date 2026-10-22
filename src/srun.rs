@@ -5,8 +5,10 @@
 //!   /cgi-bin/get_challenge, /cgi-bin/srun_portal, /srun_portal_pc,
 //!   /cgi-bin/rad_user_info, callback= JSONP wrapper, {MD5}/{SRBX1} prefixes.
 
+use std::io::ErrorKind;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::crypto;
@@ -27,6 +29,88 @@ pub enum NetEnv {
   Campus { ac_id: String },
   /// An interception page that does not look like the campus portal.
   OtherPortal,
+}
+
+/// What kept a request from reaching the portal, coarse enough for the window
+/// to word it in its own language.
+///
+/// The operating system's own text (`WSAHOST_NOT_FOUND` and friends) is
+/// localized by Windows, not by this app, so it can only ever be a log detail:
+/// showing it in the banner is what makes a Chinese sentence appear in an
+/// English window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetCause {
+  /// The host name did not resolve.
+  Resolve,
+  /// Nothing accepted the connection.
+  Refused,
+  /// The request ran out of time.
+  Timeout,
+  /// There is no route to the host at all.
+  Unreachable,
+  /// Anything else: a portal answer we cannot use, TLS, a protocol error.
+  Other,
+}
+
+/// A failed portal request: the cause for the user, the detail for the log.
+#[derive(Debug, Clone)]
+pub struct NetError {
+  pub cause: NetCause,
+  /// Wording for the log pane, including whatever the OS said.
+  pub detail: String,
+}
+
+impl NetError {
+  /// A failure that is not about reaching the network (a bad portal answer).
+  pub fn msg(detail: impl Into<String>) -> Self {
+    Self {
+      cause: NetCause::Other,
+      detail: detail.into(),
+    }
+  }
+
+  /// The same cause, with context prepended for the log.
+  pub fn context(self, prefix: impl std::fmt::Display) -> Self {
+    Self {
+      cause: self.cause,
+      detail: format!("{prefix}: {}", self.detail),
+    }
+  }
+
+  /// Classify a transport error. The OS text stays in `detail`: it is the only
+  /// place the platform's own wording survives, and the log is English.
+  fn transport(e: ureq::Error) -> Self {
+    let cause = match &e {
+      ureq::Error::HostNotFound => NetCause::Resolve,
+      ureq::Error::Timeout(_) => NetCause::Timeout,
+      ureq::Error::ConnectionFailed => NetCause::Unreachable,
+      ureq::Error::Io(io) => match io.kind() {
+        ErrorKind::TimedOut => NetCause::Timeout,
+        ErrorKind::ConnectionRefused => NetCause::Refused,
+        ErrorKind::AddrNotAvailable => NetCause::Unreachable,
+        // Windows reports a DNS failure as an "uncategorized" io error, so the
+        // Winsock codes have to be read directly.
+        _ => match io.raw_os_error() {
+          Some(11001 | 11002 | 11003 | 11004) => NetCause::Resolve,
+          Some(10060) => NetCause::Timeout,
+          Some(10061) => NetCause::Refused,
+          Some(10049 | 10050 | 10051 | 10065) => NetCause::Unreachable,
+          _ => NetCause::Other,
+        },
+      },
+      _ => NetCause::Other,
+    };
+    Self {
+      cause,
+      detail: e.to_string(),
+    }
+  }
+}
+
+impl std::fmt::Display for NetError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&self.detail)
+  }
 }
 
 #[derive(Debug)]
@@ -52,16 +136,16 @@ impl Client {
     if self.https { "https" } else { "http" }
   }
 
-  fn get(&self, url: &str) -> Result<String, String> {
+  fn get(&self, url: &str) -> Result<String, NetError> {
     self
       .agent
       .get(url)
       .header("User-Agent", UA)
       .call()
-      .map_err(|e| e.to_string())?
+      .map_err(NetError::transport)?
       .body_mut()
       .read_to_string()
-      .map_err(|e| e.to_string())
+      .map_err(NetError::transport)
   }
 
   /// Cheap reachability probe with a short timeout so the worker thread is not
@@ -110,29 +194,29 @@ impl Client {
   }
 
   /// Strip the JSONP wrapper and parse.
-  fn jsonp(body: &str) -> Result<Value, String> {
+  fn jsonp(body: &str) -> Result<Value, NetError> {
     let t = body.trim();
     let inner = t
       .strip_prefix(CALLBACK)
       .and_then(|r| r.strip_prefix('('))
       .and_then(|r| r.strip_suffix(')'))
       .unwrap_or(t);
-    serde_json::from_str(inner).map_err(|e| format!("bad JSON: {e}: {inner}"))
+    serde_json::from_str(inner).map_err(|e| NetError::msg(format!("bad JSON: {e}: {inner}")))
   }
 
-  pub fn challenge(&self, username: &str, ip: &str) -> Result<String, String> {
+  pub fn challenge(&self, username: &str, ip: &str) -> Result<String, NetError> {
     let url = self.url(
       "/cgi-bin/get_challenge",
       &[("username", username), ("ip", ip), ("double_stack", "1")],
     );
     let v = Self::jsonp(&self.get(&url)?)?;
     if v.get("res").and_then(Value::as_str) != Some("ok") {
-      return Err(format!("challenge rejected: {v}"));
+      return Err(NetError::msg(format!("challenge rejected: {v}")));
     }
     v.get("challenge")
       .and_then(Value::as_str)
       .map(str::to_owned)
-      .ok_or_else(|| format!("no challenge field: {v}"))
+      .ok_or_else(|| NetError::msg(format!("no challenge field: {v}")))
   }
 
   /// Detect the AC id the campus gateway assigned to this client.
@@ -145,7 +229,7 @@ impl Client {
   /// `E2808 Control policy not found`.
   /// The `bool` is `true` when the id came from a captive interception page
   /// (authoritative) and `false` when it came from a default campus page.
-  pub fn detect_ac_id(&self) -> Result<(String, bool), String> {
+  pub fn detect_ac_id(&self) -> Result<(String, bool), NetError> {
     // External targets can only answer through the gateway, so a hit here
     // means we were intercepted and the id is the real AC.
     const PROBES: [&str; 3] = [
@@ -172,7 +256,7 @@ impl Client {
         }
       }
     }
-    Err("ac_id not found (portal not intercepting?)".into())
+    Err(NetError::msg("ac_id not found (portal not intercepting?)"))
   }
 
   /// True when `/cgi-bin/rad_user_info` reports an active session.
@@ -202,18 +286,18 @@ impl Client {
   }
 
   /// GET an arbitrary URL; used by the keepalive loop to generate traffic.
-  pub fn touch(&self, url: &str) -> Result<usize, String> {
+  pub fn touch(&self, url: &str) -> Result<usize, NetError> {
     Ok(self.get(url)?.len())
   }
 
-  pub fn status(&self, ac_id: &str) -> Result<Value, String> {
+  pub fn status(&self, ac_id: &str) -> Result<Value, NetError> {
     let page = self.get(&format!(
       "{}://{}/srun_portal_pc?ac_id={}",
       self.scheme(),
       self.host,
       enc(ac_id)
     ))?;
-    let ip = scrape_ip(&page).ok_or_else(|| "public ip not found on portal page".to_string())?;
+    let ip = scrape_ip(&page).ok_or_else(|| NetError::msg("public ip not found on portal page"))?;
     let url = self.url("/cgi-bin/rad_user_info", &[("ip", &ip)]);
     let mut v = Self::jsonp(&self.get(&url)?)?;
     let online = v.get("error").and_then(Value::as_str) == Some("ok");
@@ -231,7 +315,7 @@ impl Client {
     ip: &str,
     ac_id: &str,
     logout: bool,
-  ) -> Result<Value, String> {
+  ) -> Result<Value, NetError> {
     let token = self.challenge(username, ip)?;
     let params = build_params(username, password, &token, ip, ac_id, logout);
     let refs: Vec<(&str, &str)> = params
@@ -359,17 +443,26 @@ fn looks_like_portal(body: &str) -> bool {
     || lower.contains("http-equiv='refresh'")
 }
 
-/// Cheap "is there a route to the internet at all?" check.
+/// Identity of the path this machine currently uses to reach the internet.
 ///
 /// Connecting a UDP socket only performs a route lookup - no packet is sent -
-/// so this is essentially free and fails immediately when the cable is out or
-/// no address has been assigned yet. Used to start a login attempt the moment
-/// the network comes up instead of waiting for a poll interval.
+/// so this is essentially free. The local address the kernel picks names the
+/// interface and the lease behind it, which is exactly what changes when a
+/// cable is pulled, a Wi-Fi network is joined or DHCP hands out another
+/// address. `None` means there is no route at all: the cable is out, or no
+/// address has been assigned yet.
+pub fn link_id() -> Option<std::net::IpAddr> {
+  let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+  socket.connect("223.5.5.5:53").ok()?;
+  socket.local_addr().ok().map(|a| a.ip())
+}
+
+/// Cheap "is there a route to the internet at all?" check.
+///
+/// Used to start a login attempt the moment the network comes up instead of
+/// waiting for a poll interval.
 pub fn link_up() -> bool {
-  let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-    return false;
-  };
-  socket.connect("223.5.5.5:53").is_ok()
+  link_id().is_some()
 }
 
 fn scan_ac_id(page: &str) -> Option<String> {

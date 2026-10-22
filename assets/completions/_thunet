@@ -238,6 +238,24 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(quit)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Give up (and report) after this many milliseconds]:TIMEOUT:_default' \
+'--host=[Portal host (overrides the config file)]:HOST:_default' \
+'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
+'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
+'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
+'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
+'--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
+'--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
+'--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
+'--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
+'--http[Use plain http instead of https]' \
+'--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
@@ -345,6 +363,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(quit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -383,6 +405,7 @@ _thunet_commands() {
 'service-admin:Perform one privileged service operation (the elevated half of \`service <action>\`, not for humans)' \
 'service-resume:Restart the core after an upgrade if it starts at boot (installer internal)' \
 'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
+'quit:Ask the running window to quit, then wait until it is really gone' \
 'config:Print the config path and effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
@@ -423,6 +446,7 @@ _thunet__subcmd__help_commands() {
 'service-admin:Perform one privileged service operation (the elevated half of \`service <action>\`, not for humans)' \
 'service-resume:Restart the core after an upgrade if it starts at boot (installer internal)' \
 'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
+'quit:Ask the running window to quit, then wait until it is really gone' \
 'config:Print the config path and effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
@@ -464,6 +488,11 @@ _thunet__subcmd__help__subcmd__login_commands() {
 _thunet__subcmd__help__subcmd__logout_commands() {
     local commands; commands=()
     _describe -t commands 'thunet help logout commands' commands "$@"
+}
+(( $+functions[_thunet__subcmd__help__subcmd__quit_commands] )) ||
+_thunet__subcmd__help__subcmd__quit_commands() {
+    local commands; commands=()
+    _describe -t commands 'thunet help quit commands' commands "$@"
 }
 (( $+functions[_thunet__subcmd__help__subcmd__selftest_commands] )) ||
 _thunet__subcmd__help__subcmd__selftest_commands() {
@@ -509,6 +538,11 @@ _thunet__subcmd__login_commands() {
 _thunet__subcmd__logout_commands() {
     local commands; commands=()
     _describe -t commands 'thunet logout commands' commands "$@"
+}
+(( $+functions[_thunet__subcmd__quit_commands] )) ||
+_thunet__subcmd__quit_commands() {
+    local commands; commands=()
+    _describe -t commands 'thunet quit commands' commands "$@"
 }
 (( $+functions[_thunet__subcmd__selftest_commands] )) ||
 _thunet__subcmd__selftest_commands() {

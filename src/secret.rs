@@ -62,6 +62,12 @@ pub fn delete_in(dir: &Path) {
   let _ = std::fs::remove_file(dir.join(CREDENTIAL_FILE));
 }
 
+/// Whether a sealed blob is on disk, readable or not. Used to tell "nothing
+/// saved" apart from "saved but unusable" when logging a failed load.
+pub fn stored(dir: &Path) -> bool {
+  dir.join(CREDENTIAL_FILE).exists()
+}
+
 pub fn load_in(dir: &Path) -> Option<(String, String)> {
   let blob = std::fs::read(dir.join(CREDENTIAL_FILE)).ok()?;
   if !blob.starts_with(MAGIC.as_slice()) {

@@ -143,30 +143,34 @@ impl Config {
     let path = path_in(dir);
     let mut cfg: Config = match std::fs::read_to_string(&path) {
       Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-      Err(e) => {
-        // A file this account cannot open - an empty DACL left by an older
-        // install, or EFS under another account - is unusable to us and would
-        // also fail every later save. Remove it through the directory's
-        // delete-child right so the next save creates a healthy one; the
-        // defaults below are all that can be recovered anyway.
-        if e.kind() != std::io::ErrorKind::NotFound {
-          let _ = std::fs::remove_file(&path);
-        }
-        Config::default()
-      }
+      // A file this account cannot read *right now* - an upgrade rewriting its
+      // ACL, or the installer replacing it - must not be deleted: that turned
+      // a transient permission error into permanent data loss. `save_to`
+      // already replaces a file it cannot write, so nothing here needs to.
+      Err(_) => Config::default(),
     };
-    if cfg.remember_password {
-      match secret::load_in(dir) {
-        Some((user, pass)) => {
-          if cfg.username.is_empty() {
-            cfg.username = user;
-          }
-          cfg.password = pass;
+    // The sealed blob is the authoritative record of the account: it survives a
+    // lost or unreadable `config.json`, and it is bound to this machine, so it
+    // cannot have been written by somebody else.
+    match secret::load_in(dir) {
+      Some((user, pass)) => {
+        if cfg.username.is_empty() {
+          crate::diag::line("config: recovered the account from credential.bin");
+          cfg.username = user;
         }
-        // Nothing usable is stored: a blob sealed by another machine, or a
-        // cleared entry. Drop what is there — an unreadable blob helps nobody —
-        // and fall back to typing the password.
-        None => {
+        cfg.password = pass;
+        cfg.remember_password = true;
+      }
+      // Nothing usable is stored: a blob sealed by another machine, a key this
+      // account cannot read, or a cleared entry. Drop what is there — an
+      // unreadable blob helps nobody — and fall back to typing the password.
+      None => {
+        if secret::stored(dir) {
+          crate::diag::line(
+            "config: credential.bin is present but cannot be opened (missing key or ACL)",
+          );
+        }
+        if cfg.remember_password {
           cfg.remember_password = false;
           secret::delete_in(dir);
         }
@@ -212,9 +216,10 @@ impl Config {
     let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
     let path = path_in(dir);
     if let Err(first) = std::fs::write(&path, &body) {
-      // A `config.json` written by an older install can carry an empty DACL:
-      // unreadable, and unwritable even for the service. Drop and recreate it
-      // rather than failing every save for the rest of the installation.
+      // A `config.json` whose ACL went wrong (an interrupted install, a DACL
+      // repair in between) can be unreadable and unwritable even for the
+      // service. Drop and recreate it rather than failing every save for the
+      // rest of the installation.
       let _ = std::fs::remove_file(&path);
       std::fs::write(&path, &body)
         .map_err(|e| format!("{}: {e} (first attempt: {first})", path.display()))?;

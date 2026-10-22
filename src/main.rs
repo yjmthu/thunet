@@ -236,6 +236,17 @@ enum Cmd {
   /// internal; never called for an upgrade or repair).
   #[command(hide = true)]
   ServicePurge,
+  /// Ask the running window to quit, then wait until it is really gone.
+  ///
+  /// Closing the window only hides it — that is what a tray app has to do — and
+  /// killing the process skips its shutdown. An installer therefore asks here
+  /// instead: the window exits through its own event loop and this command
+  /// polls the single-instance name until it disappears.
+  Quit {
+    /// Give up (and report) after this many milliseconds.
+    #[arg(long, default_value_t = 20_000)]
+    timeout: u64,
+  },
   /// Print the config path and effective settings.
   Config,
   /// Create a desktop shortcut for this executable.
@@ -357,7 +368,7 @@ fn run(cli: Cli) -> Result<(), String> {
           println!("{id}");
           Ok(())
         }
-        CoreEv::Error(Some(e)) => Err(e),
+        CoreEv::Error(Some(e)) => Err(e.to_string()),
         _ => Ok(()),
       }
     }
@@ -375,7 +386,7 @@ fn run(cli: Cli) -> Result<(), String> {
             None => Ok(()),
           }
         }
-        CoreEv::Error(Some(e)) => Err(e),
+        CoreEv::Error(Some(e)) => Err(e.to_string()),
         _ => Ok(()),
       }
     }
@@ -414,6 +425,14 @@ fn run(cli: Cli) -> Result<(), String> {
         // or any frontend thread exists.
         unsafe { std::env::set_var("THUNET_STATE_DIR", config::machine_dir()) };
       }
+      // The service wrapper points diagnostics at its log file, but it runs
+      // after the config is read: a failure while opening the sealed credential
+      // would otherwise go to a stderr nobody can see. Point it at the same
+      // file here, first.
+      #[cfg(windows)]
+      if machine {
+        diag::set_file(config::machine_dir().join("core.log"));
+      }
       let cfg = if machine {
         config::Config::load_machine()
       } else {
@@ -435,6 +454,7 @@ fn run(cli: Cli) -> Result<(), String> {
     Cmd::ServiceAdmin { action } => autostart::service_admin(action),
     Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
     Cmd::ServicePurge => autostart::purge_machine_state(),
+    Cmd::Quit { timeout } => single::quit_and_wait(Duration::from_millis(timeout)),
   }
 }
 
@@ -448,14 +468,18 @@ fn with_core() -> Result<ipc::Link, String> {
      or enable autostart with `thunet service enable`)"
       .to_string()
   })?;
-  // The core replays its state and log tail on connect; swallow that so the
-  // answer to our command cannot be confused with old news.
-  let mut quiet = Instant::now();
-  while quiet.elapsed() < Duration::from_millis(150) {
-    if link.try_recv().is_some() {
-      quiet = Instant::now();
-    } else {
-      std::thread::sleep(Duration::from_millis(10));
+  // The core replays its state, the log tail and any active banner on connect.
+  // Everything that arrives before the answer to this marker command is that
+  // replay: waiting for the marker instead of guessing a delay keeps a banner
+  // that is still up from being mistaken for the answer to the real command.
+  link.send(CoreCmd::CoreInfo);
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while Instant::now() < deadline {
+    match link.try_recv() {
+      Some(CoreEv::Core(_)) => break,
+      Some(_) => continue,
+      None if !link.alive() => break,
+      None => std::thread::sleep(Duration::from_millis(10)),
     }
   }
   Ok(link)
@@ -477,7 +501,15 @@ where
       }
     }
     if !link.alive() {
-      return Err("the background service closed the connection".into());
+      return Err(match link.speaks() {
+        // The core refused every line this build sent, so nothing will work
+        // until the service is restarted on a matching build.
+        Some(v) => format!(
+          "the background service speaks protocol {v} but this build speaks {}; restart the service",
+          proto::VERSION
+        ),
+        None => "the background service closed the connection".into(),
+      });
     }
     if Instant::now() >= deadline {
       return Err(format!(
@@ -509,7 +541,7 @@ fn settled(link: &ipc::Link, timeout: Duration) -> Result<(), String> {
       println!("{msg}");
       Ok(())
     }
-    CoreEv::Error(Some(e)) => Err(e),
+    CoreEv::Error(Some(e)) => Err(e.to_string()),
     _ => Ok(()),
   }
 }

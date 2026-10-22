@@ -91,17 +91,23 @@ fn body() -> Result<(), String> {
     std::process::id()
   ));
 
-  // `serve` never returns: it owns the accept loop and the session worker.
+  // `serve` never returns while it is serving: it owns the accept loop and the
+  // session worker. If it returns at all, this instance is useless, and a
+  // service that stays `RUNNING` without serving anybody can only be repaired
+  // by a second manual restart. Leaving the process alive would keep the SCM
+  // (and the window) convinced that a core is listening, so fail out loud.
   std::thread::spawn(|| {
     crate::diag::line("service: starting core serve loop");
     let cfg = crate::config::Config::load_machine();
     match crate::ipc::serve(cfg, true) {
-      Ok(crate::ipc::Serve::Started) => crate::diag::line("service: serve returned started"),
+      Ok(crate::ipc::Serve::Started) => {}
       Ok(crate::ipc::Serve::AlreadyRunning) => {
-        crate::diag::line("core: another core already owns the control pipe");
+        crate::diag::line("service: another core owns the control pipe; stopping this instance");
       }
-      Err(e) => crate::diag::line(&format!("core: {e}")),
+      Err(e) => crate::diag::line(&format!("service: {e}")),
     }
+    crate::diag::line("service: no core is being served, exiting with code 1");
+    std::process::exit(1);
   });
 
   // The SCM only asks us to stop; the session loop has no unwinding to do.

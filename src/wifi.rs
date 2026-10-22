@@ -9,9 +9,16 @@
 /// separator normalization, so `Tsinghua Secure`/`Tsinghua_Secure` also match.
 const NO_PORTAL_SSIDS: &[&str] = &["tsinghua-secure"];
 
-/// Lower-case and unify `_`/space to `-` so minor naming differences match.
+/// Lower-case and unify `_`/space to `-` so minor naming differences match,
+/// and drop the ` 2`, ` 3`, ... that Windows appends when a profile name is
+/// already taken (`Tsinghua-Secure 2` is the same network).
 fn normalize(ssid: &str) -> String {
-  ssid.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+  let base = ssid.trim();
+  let base = match base.rsplit_once(' ') {
+    Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+    _ => base,
+  };
+  base.to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
 /// True for SSIDs that never need a portal login.
@@ -42,46 +49,306 @@ fn parse_ssid(text: &str) -> Option<String> {
   None
 }
 
-/// SSID of the connected Wi-Fi network, if any.
-#[cfg(windows)]
-pub fn current_ssid() -> Option<String> {
-  use std::os::windows::process::CommandExt as _;
-  use std::sync::OnceLock;
-  /// Do not flash a console window in this GUI-subsystem process.
-  const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-  /// Windows only reveals WLAN details when location access is granted for
-  /// desktop apps; probing once is enough because that permission cannot
-  /// change while we run.
-  static USABLE: OnceLock<bool> = OnceLock::new();
+/// What the current Wi-Fi says about the portal.
+pub enum WifiKind {
+  /// This SSID authenticates below the portal (802.1X): no login to make.
+  Enterprise(String),
+  /// A named wireless network that goes through the portal.
+  Portal(String),
+  /// Nothing wireless is connected: a definitive answer.
+  NoWifi,
+  /// No name is available *yet*; the reason is for the log. Worth asking again
+  /// shortly after a network is joined, because Windows names the profile a
+  /// second or two after the address appears.
+  Unknown(String),
+}
 
-  if !*USABLE.get_or_init(|| {
-    std::process::Command::new("netsh")
-      .args(["wlan", "show", "interfaces"])
-      .creation_flags(CREATE_NO_WINDOW)
-      .output()
-      .map(|o| o.status.success() && !o.stdout.is_empty())
-      .unwrap_or(false)
-  }) {
-    return None;
+/// Classify the current wireless link. The network profile fallback is only
+/// consulted when Windows refuses to name the SSID, and only a whitelisted name
+/// becomes [`WifiKind::Enterprise`], so a wired profile can never be mistaken
+/// for a wireless one.
+pub fn classify() -> WifiKind {
+  match probe_ssid() {
+    Ok(Some(ssid)) if is_no_portal_ssid(&ssid) => WifiKind::Enterprise(ssid),
+    Ok(Some(ssid)) => WifiKind::Portal(ssid),
+    Ok(None) => WifiKind::NoWifi,
+    Err(reason) => match profile_names() {
+      Ok(names) => match names.iter().find(|name| is_no_portal_ssid(name)) {
+        Some(name) => WifiKind::Enterprise(name.clone()),
+        None if names.is_empty() => WifiKind::Unknown(format!("{reason}; no network profiles")),
+        None => WifiKind::Unknown(format!(
+          "{reason}; connected profiles: {}",
+          names.join(", ")
+        )),
+      },
+      Err(why) => WifiKind::Unknown(format!("{reason}; {why}")),
+    },
   }
+}
 
-  let out = std::process::Command::new("netsh")
-    .args(["wlan", "show", "interfaces"])
-    .creation_flags(CREATE_NO_WINDOW)
-    .output()
-    .ok()?;
-  parse_ssid(&String::from_utf8_lossy(&out.stdout))
+/// Names of the networks the machine is connected to, via the Network List
+/// Manager (the API behind `Get-NetConnectionProfile`).
+#[cfg(windows)]
+fn profile_names() -> Result<Vec<String>, String> {
+  nlm::connected_names()
 }
 
 #[cfg(not(windows))]
-pub fn current_ssid() -> Option<String> {
-  None
+fn profile_names() -> Result<Vec<String>, String> {
+  Ok(Vec::new())
 }
 
-/// `Some(ssid)` when the current Wi-Fi authenticates without a portal.
-pub fn no_portal_wifi() -> Option<String> {
-  let ssid = current_ssid()?;
-  is_no_portal_ssid(&ssid).then_some(ssid)
+/// A COM vtable is positional, so a prefix of it is enough to call the entries
+/// in it - but the count of leading slots has to be exact. All three interfaces
+/// derive from `IDispatch`, so their own methods start after three `IUnknown`
+/// slots plus four `IDispatch` ones.
+#[cfg(windows)]
+mod nlm {
+  use std::ffi::c_void;
+  use windows_sys::Win32::Foundation::SysFreeString;
+  use windows_sys::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, CoInitializeEx, CoUninitialize,
+  };
+  use windows_sys::core::{BSTR, GUID};
+
+  /// `CLSID_NetworkListManager`
+  const CLSID_MANAGER: GUID = GUID {
+    data1: 0xDCB0_0C01,
+    data2: 0x570F,
+    data3: 0x4A9B,
+    data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+  };
+  /// `IID_INetworkListManager`
+  const IID_MANAGER: GUID = GUID {
+    data1: 0xDCB0_0000,
+    data2: 0x570F,
+    data3: 0x4A9B,
+    data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+  };
+  /// `NLM_ENUM_NETWORK_CONNECTED`
+  const ENUM_CONNECTED: i32 = 1;
+  /// `COINIT_APARTMENTTHREADED`
+  const COINIT_APARTMENTTHREADED: u32 = 2;
+  /// `RPC_E_CHANGED_MODE`: this thread already has COM, in another mode.
+  const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+
+  /// A vtable slot that is never called, so only its width matters.
+  type Slot = *const c_void;
+  type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+
+  #[repr(C)]
+  struct ManagerVtbl {
+    unknown: [Slot; 3],
+    dispatch: [Slot; 4],
+    get_networks: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> i32,
+  }
+
+  #[repr(C)]
+  struct EnumVtbl {
+    unknown: [Slot; 3],
+    dispatch: [Slot; 4],
+    /// `get__NewEnum`
+    new_enum: Slot,
+    next: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut u32) -> i32,
+  }
+
+  #[repr(C)]
+  struct NetworkVtbl {
+    unknown: [Slot; 3],
+    dispatch: [Slot; 4],
+    get_name: unsafe extern "system" fn(*mut c_void, *mut BSTR) -> i32,
+  }
+
+  /// One interface pointer, released on drop.
+  struct Com(*mut c_void);
+
+  impl Com {
+    /// Release is slot 2 of every COM vtable.
+    fn release(ptr: *mut c_void) {
+      unsafe {
+        // The object's first word points at the vtable; step through *that*,
+        // not through the object.
+        let table: *const Release = *(ptr as *const *const Release);
+        let release: Release = *table.add(2);
+        release(ptr);
+      }
+    }
+
+    unsafe fn vtbl<T>(&self) -> &T {
+      unsafe { &**(self.0 as *const *const T) }
+    }
+  }
+
+  impl Drop for Com {
+    fn drop(&mut self) {
+      if !self.0.is_null() {
+        Com::release(self.0);
+      }
+    }
+  }
+
+  /// The string a BSTR points at, freed afterwards.
+  unsafe fn take(b: BSTR) -> Option<String> {
+    if b.is_null() {
+      return None;
+    }
+    unsafe {
+      let mut len = 0usize;
+      while *b.add(len) != 0 {
+        len += 1;
+      }
+      let text = String::from_utf16_lossy(std::slice::from_raw_parts(b, len));
+      SysFreeString(b);
+      Some(text)
+    }
+  }
+
+  /// Names of the connected networks. For a wireless one this is the SSID.
+  pub fn connected_names() -> Result<Vec<String>, String> {
+    unsafe {
+      let hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
+      // S_OK/S_FALSE: this call initialised it, so it must be undone here.
+      // RPC_E_CHANGED_MODE: something already did, keep going and leave it.
+      let owned = hr >= 0;
+      if !owned && hr != RPC_E_CHANGED_MODE {
+        return Err(format!("COM is unavailable (0x{:08x})", hr as u32));
+      }
+      let names = enumerate();
+      if owned {
+        CoUninitialize();
+      }
+      names
+    }
+  }
+
+  unsafe fn enumerate() -> Result<Vec<String>, String> {
+    unsafe {
+      let mut manager: *mut c_void = std::ptr::null_mut();
+      let hr = CoCreateInstance(
+        &CLSID_MANAGER,
+        std::ptr::null_mut(),
+        CLSCTX_INPROC_SERVER,
+        &IID_MANAGER,
+        &mut manager,
+      );
+      if hr < 0 || manager.is_null() {
+        return Err(format!(
+          "the network list is unavailable (0x{:08x})",
+          hr as u32
+        ));
+      }
+      let manager = Com(manager);
+      let mut list: *mut c_void = std::ptr::null_mut();
+      let hr = (manager.vtbl::<ManagerVtbl>().get_networks)(manager.0, ENUM_CONNECTED, &mut list);
+      if hr < 0 || list.is_null() {
+        return Err(format!(
+          "the network list could not be read (0x{:08x})",
+          hr as u32
+        ));
+      }
+      let list = Com(list);
+      let mut names = Vec::new();
+      loop {
+        let mut network: *mut c_void = std::ptr::null_mut();
+        let mut fetched = 0u32;
+        let hr = (list.vtbl::<EnumVtbl>().next)(list.0, 1, &mut network, &mut fetched);
+        if hr < 0 || fetched == 0 || network.is_null() {
+          break;
+        }
+        let network = Com(network);
+        let mut name: BSTR = std::ptr::null();
+        let hr = (network.vtbl::<NetworkVtbl>().get_name)(network.0, &mut name);
+        if hr >= 0
+          && let Some(name) = take(name)
+        {
+          names.push(name);
+        }
+      }
+      Ok(names)
+    }
+  }
+}
+
+#[cfg(windows)]
+mod imp {
+  use super::*;
+  use std::os::windows::process::CommandExt as _;
+  use std::sync::Mutex;
+  use std::time::{Duration, Instant};
+
+  /// Do not flash a console window in this GUI-subsystem process.
+  const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+  /// A failure repeats until something outside changes (the radio is switched
+  /// on, Location permission is granted, the WLAN service restarts), so it is
+  /// worth caching - but it must expire, or one bad moment at start-up would
+  /// hide the SSID for the rest of the run. (`OnceLock` did exactly that.)
+  const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+  static LAST_FAILURE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+  fn cached_failure() -> Option<String> {
+    let guard = LAST_FAILURE.lock().ok()?;
+    let (when, reason) = guard.as_ref()?;
+    (when.elapsed() < RETRY_AFTER).then(|| reason.clone())
+  }
+
+  fn remember(reason: String) -> String {
+    if let Ok(mut guard) = LAST_FAILURE.lock() {
+      *guard = Some((Instant::now(), reason.clone()));
+    }
+    reason
+  }
+
+  fn forget() {
+    if let Ok(mut guard) = LAST_FAILURE.lock() {
+      *guard = None;
+    }
+  }
+
+  pub fn probe_ssid() -> Result<Option<String>, String> {
+    if let Some(reason) = cached_failure() {
+      return Err(reason);
+    }
+    let out = match std::process::Command::new("netsh")
+      .args(["wlan", "show", "interfaces"])
+      .creation_flags(CREATE_NO_WINDOW)
+      .output()
+    {
+      Ok(out) => out,
+      Err(e) => return Err(remember(format!("cannot run netsh: {e}"))),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    if let Some(ssid) = parse_ssid(&text) {
+      forget();
+      return Ok(Some(ssid));
+    }
+    if out.status.success() {
+      // The WLAN stack answered: there simply is no wireless network right now
+      // (a cable, a switched-off radio, a machine without Wi-Fi).
+      return Ok(None);
+    }
+    // Windows hides the SSID from processes that lack the location permission
+    // and says so in a localized message; quote it rather than parse it.
+    let first = text
+      .lines()
+      .map(str::trim)
+      .find(|l| !l.is_empty())
+      .unwrap_or("")
+      .to_string();
+    Err(remember(if first.is_empty() {
+      format!("netsh exited with {}", out.status)
+    } else {
+      format!("netsh cannot read the WLAN state ({first})")
+    }))
+  }
+}
+
+#[cfg(windows)]
+pub use imp::probe_ssid;
+
+#[cfg(not(windows))]
+pub fn probe_ssid() -> Result<Option<String>, String> {
+  Ok(None)
 }
 
 #[cfg(test)]
@@ -101,6 +368,8 @@ mod tests {
     assert_eq!(parse_ssid(en).as_deref(), Some("Tsinghua"));
 
     assert_eq!(parse_ssid("    State : disconnected\n"), None);
+    // A lossily decoded OEM-coded error message must not yield a bogus SSID.
+    assert_eq!(parse_ssid("缃戠粶澹版槑闇€瑕佷綅缃潈闄? SSID : \n"), None);
   }
 
   #[test]
@@ -110,8 +379,24 @@ mod tests {
     assert!(is_no_portal_ssid("Tsinghua Secure"));
     assert!(is_no_portal_ssid("  tsinghua_secure "));
     assert!(is_no_portal_ssid("TSINGHUA-SECURE"));
+    // Windows appends " 2" when the profile name is already taken, so the same
+    // network can be called this on a machine that re-joined it.
+    assert!(is_no_portal_ssid("Tsinghua-Secure 2"));
+    assert!(is_no_portal_ssid("Tsinghua-Secure 12"));
     assert!(!is_no_portal_ssid("Tsinghua"));
+    // A version suffix is part of the name, not a duplicate marker.
     assert!(!is_no_portal_ssid("Tsinghua-Secure-5G"));
+    assert!(!is_no_portal_ssid("Tsinghua-IPv4 2"));
     assert!(!is_no_portal_ssid(""));
+  }
+
+  #[test]
+  fn only_a_matching_ssid_becomes_a_shortcut() {
+    // The filter is what turns a read SSID into the 802.1X verdict, so an
+    // unrelated network must stay `None` instead of disabling the portal.
+    let other = Some("Tsinghua".to_string()).filter(|s| is_no_portal_ssid(s));
+    assert_eq!(other, None);
+    let secure = Some("Tsinghua-Secure".to_string()).filter(|s| is_no_portal_ssid(s));
+    assert_eq!(secure.as_deref(), Some("Tsinghua-Secure"));
   }
 }
