@@ -71,6 +71,11 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
+  # `GetBestInterfaceEx` + `GetAdaptersAddresses`: which adapter carries the
+  # default route, and whether it is a cable or Wi-Fi (the status page says so).
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
 ] }
 # `thunet core --service`: only the Service Control Manager can start a process
 # before anyone logs on, which is what makes the session come up with the

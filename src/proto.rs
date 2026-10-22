@@ -93,6 +93,25 @@ pub enum LoginEnv {
   NoPortal,
 }
 
+/// Which physical link carries the machine's default route.
+///
+/// A machine can have a cable and Wi-Fi up at the same time, and the portal
+/// session belongs to one of them: knowing which link the OS actually sends on
+/// is what makes an "online" verdict readable, and it is the first thing to
+/// check when a session appears to come and go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkKind {
+  /// No route at all: no cable, no Wi-Fi, or no address yet.
+  #[default]
+  None,
+  /// Wired Ethernet.
+  Ethernet,
+  /// Wi-Fi.
+  Wlan,
+  /// Anything else: a tunnel, a virtual switch, a modem.
+  Other,
+}
+
 /// The core's own state, as reported by [`Cmd::CoreInfo`].
 ///
 /// The same value is embedded in the `core` half of an [`Ev::Status`] dump, so
@@ -113,6 +132,10 @@ pub struct CoreInfo {
   pub env: LoginEnv,
   pub ac_id: String,
   pub host: String,
+  /// The link the core's requests would leave on. Absent when the core is old
+  /// enough not to know the field, which reads as "unknown".
+  #[serde(default)]
+  pub link: LinkKind,
   /// What the core would log in with. The password itself never leaves it.
   #[serde(default)]
   pub credential: CredentialState,
@@ -153,6 +176,9 @@ pub enum Failure {
   /// The portal rejected the account/password pair, which only the user can
   /// fix. The raw JSON answer goes to the log pane instead.
   Credentials,
+  /// The portal could not reach an access controller for the `ac_id` the core
+  /// holds, which on THU means the id belongs to another link.
+  AcUnreachable,
   /// The request never reached the portal. Only the kind travels: the OS text
   /// is localized by Windows, so the window words this itself.
   Network(crate::srun::NetCause),
@@ -167,6 +193,7 @@ impl std::fmt::Display for Failure {
     let t = crate::i18n::Lang::system().texts();
     f.write_str(match self {
       Failure::Credentials => t.invalid_credentials,
+      Failure::AcUnreachable => t.ac_unreachable,
       Failure::Network(cause) => t.net_cause(*cause),
       Failure::Text(s) => s,
     })
@@ -322,6 +349,7 @@ mod tests {
       env: LoginEnv::Campus,
       ac_id: "169".into(),
       host: "auth4.tsinghua.edu.cn".into(),
+      link: LinkKind::Wlan,
       credential: CredentialState {
         username: "alice".into(),
         has_password: true,
@@ -344,6 +372,21 @@ mod tests {
       }
       other => panic!("wrong variant: {other:?}"),
     }
+  }
+
+  #[test]
+  fn a_core_that_does_not_report_the_link_still_parses() {
+    // An updated window has to keep working against a service built before
+    // this field existed; the row then reads as "no link" rather than the
+    // whole answer failing to parse.
+    let old = r#"{"version":"0.1.3","pid":1,"uptime_secs":2,"state":"Offline",
+      "env":"Campus","ac_id":"1","host":"auth4.tsinghua.edu.cn",
+      "credential":{"username":"alice","has_password":false,"remembered":false},
+      "auto_connect":false,"wanted_online":false,"failures":0,"frontends":0,
+      "endpoint":"x"}"#;
+    let info: CoreInfo = serde_json::from_str(old).unwrap();
+    assert_eq!(info.link, LinkKind::None);
+    assert_eq!(info.version, "0.1.3");
   }
 
   #[test]

@@ -74,6 +74,7 @@ The window has exactly two pages, switched with the gear in the top-right corner
 | --- | --- |
 | Coloured dot + label | `Online`, `Authenticating` or `Offline` |
 | `Account` | The account the portal reports for the current session |
+| `Link` | Which interface carries the default route: `Ethernet` / `WLAN` / `No link`. With a cable and Wi-Fi both up it names the one the OS actually routes on — the first thing to look at when a session appears to come and go |
 | `IPv4` / `IPv6` | Addresses assigned by the campus network, each with a **Copy** button |
 | `Session traffic` | Bytes downloaded / uploaded during this session |
 | `Service` | Whether a core is answering, with its version and uptime; it turns to `not running` as soon as the core is stopped. The button beside it stops or starts that process — like `thunet service stop`, it never closes the window |

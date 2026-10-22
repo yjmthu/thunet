@@ -25,15 +25,22 @@ Three tiny probe requests (3 s timeout) classify the current network:
 
 | Probe result | Meaning | Reaction |
 | --- | --- | --- |
-| nothing answers | no link / no route | wait 30 s, retry |
+| nothing answers | no link, or a gateway that drops pre-login traffic | wait / log in, see below |
 | answer contains `index_<ac_id>.html` | the campus gateway is intercepting HTTP | remember `ac_id`, log in |
 | a small HTML/JS stub without `ac_id` | some other captive portal | wait 60 s, retry |
-| the real page (or any HTTP status) | internet works | only log in if the portal says the session is gone |
+| the real page (or any HTTP status) | nothing is intercepting: the session is up, or this link routes without the portal | no login: there is nothing to address it to |
 
 Two shortcuts are applied first:
 
 - **Link check.** `link_up()` performs a UDP `connect()` to `223.5.5.5:53`: the kernel does a route lookup and sends nothing. Without a route the loop sleeps instead of firing HTTP requests, so a laptop on a train stays quiet.
 - **Enterprise Wi-Fi.** SSIDs such as `Tsinghua-Secure` authenticate with 802.1X and never show a captive portal, so the portal login is skipped (`src/wifi.rs`). Reading the SSID requires `netsh` on Windows, which needs Location permission; the check is best-effort, and the "internet works" probe above is the fallback.
+
+Two local facts only ever *upgrade* the "nothing answers" case, where the login is the only way forward:
+
+- **Campus SSID.** Every other `Tsinghua…` SSID (`Tsinghua`, `Tsinghua-IPv4`) keeps the portal, so the name makes a login meaningful there. The name is read from `netsh`, or from the connected network profiles when `netsh` is refused.
+- **The portal knows this address.** `/cgi-bin/rad_user_info` reports the caller's own address (`client_ip`). On the campus network it equals the address this machine holds on its default route, because nothing is NATed in between; from any other network the two differ. That separates "the campus gateway just is not intercepting" from "this is not our network at all", so a hotel Wi-Fi never gets a login attempt.
+
+A link that already reaches the internet is **not** upgraded, even when the name says campus: there is nothing to log in to, and `ac_id` is per access network — an id borrowed from the link this machine came from makes the portal answer `E2808` or `INFO failed, BAS respond timeout`. Those two answers are classified as "this `ac_id` cannot be used here", which stops the retry loop instead of hammering the portal (see §10).
 
 ## 2. Find the `ac_id`
 
@@ -127,4 +134,4 @@ The RADIUS accounting row appears roughly **20 seconds** after an accepted login
 | `E2808 Control policy not found` | wrong `ac_id` (usually a hardcoded `1`) |
 | `E2901` / `password error` | wrong password, or a stale `{MD5}` digest |
 | `E2553` | account/IP mismatch (already logged in elsewhere) |
-| `login_error` `E2620` | traffic quota or account state; ask the network centre |
+| `E2620 You are already online` | the account still has a session - on another device, or on the link this machine just left (an 802.1X SSID creates one too); no retry opens a second session, so the client stops and says so |

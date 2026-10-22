@@ -48,6 +48,10 @@ pub enum NetCause {
   Timeout,
   /// There is no route to the host at all.
   Unreachable,
+  /// The other side closed the connection mid-answer: a middlebox cutting TLS,
+  /// a gateway resetting, a server that hung up. The request did reach
+  /// something, so this is not "no network".
+  Lost,
   /// Anything else: a portal answer we cannot use, TLS, a protocol error.
   Other,
 }
@@ -88,12 +92,23 @@ impl NetError {
         ErrorKind::TimedOut => NetCause::Timeout,
         ErrorKind::ConnectionRefused => NetCause::Refused,
         ErrorKind::AddrNotAvailable => NetCause::Unreachable,
+        // A connection the other side cut. rustls reports a TLS stream that
+        // ended without `close_notify` as `InvalidData` (its own wording, with
+        // a docs link) or `UnexpectedEof`, and a reset gateway lands on the
+        // same kinds - none of that is worth a banner, so it is one cause.
+        ErrorKind::UnexpectedEof
+        | ErrorKind::InvalidData
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe => NetCause::Lost,
         // Windows reports a DNS failure as an "uncategorized" io error, so the
         // Winsock codes have to be read directly.
         _ => match io.raw_os_error() {
           Some(11001 | 11002 | 11003 | 11004) => NetCause::Resolve,
           Some(10060) => NetCause::Timeout,
           Some(10061) => NetCause::Refused,
+          // WSAECONNABORTED / WSAECONNRESET.
+          Some(10053 | 10054) => NetCause::Lost,
           Some(10049 | 10050 | 10051 | 10065) => NetCause::Unreachable,
           _ => NetCause::Other,
         },
@@ -118,17 +133,30 @@ pub struct Client {
   host: String,
   https: bool,
   agent: ureq::Agent,
+  /// The login round-trip is relayed by the portal to the access controller,
+  /// and right after a session was ended somewhere else (the web portal,
+  /// another client) that round-trip can take many seconds. Sharing the short
+  /// status timeout made those attempts fail as "connection timed out" while
+  /// the portal was in fact still working on them.
+  login_agent: ureq::Agent,
 }
+
+/// How long a login (challenge + `srun_portal`) may take, at least.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Client {
   pub fn new(host: impl Into<String>, https: bool, timeout: Duration) -> Self {
-    let config = ureq::Agent::config_builder()
-      .timeout_global(Some(timeout))
-      .build();
+    let agent = |t: Duration| -> ureq::Agent {
+      ureq::Agent::config_builder()
+        .timeout_global(Some(t))
+        .build()
+        .into()
+    };
     Self {
       host: host.into(),
       https,
-      agent: config.into(),
+      agent: agent(timeout),
+      login_agent: agent(timeout.max(LOGIN_TIMEOUT)),
     }
   }
 
@@ -137,8 +165,17 @@ impl Client {
   }
 
   fn get(&self, url: &str) -> Result<String, NetError> {
-    self
-      .agent
+    self.get_with(&self.agent, url)
+  }
+
+  /// The same request with the login budget, for the two calls the portal
+  /// forwards to the access controller.
+  fn login_get(&self, url: &str) -> Result<String, NetError> {
+    self.get_with(&self.login_agent, url)
+  }
+
+  fn get_with(&self, agent: &ureq::Agent, url: &str) -> Result<String, NetError> {
+    agent
       .get(url)
       .header("User-Agent", UA)
       .call()
@@ -209,7 +246,13 @@ impl Client {
       "/cgi-bin/get_challenge",
       &[("username", username), ("ip", ip), ("double_stack", "1")],
     );
-    let v = Self::jsonp(&self.get(&url)?)?;
+    // Naming the step keeps a timeout in the log diagnosable: the portal
+    // answers some of its endpoints while another one is stuck, and "the
+    // request failed" alone cannot tell them apart.
+    let body = self
+      .login_get(&url)
+      .map_err(|e| e.context("get_challenge"))?;
+    let v = Self::jsonp(&body)?;
     if v.get("res").and_then(Value::as_str) != Some("ok") {
       return Err(NetError::msg(format!("challenge rejected: {v}")));
     }
@@ -323,7 +366,30 @@ impl Client {
       .map(|(k, v)| (k.as_str(), v.as_str()))
       .collect();
     let url = self.url("/cgi-bin/srun_portal", &refs);
-    Self::jsonp(&self.get(&url)?)
+    let step = if logout {
+      "srun_portal logout"
+    } else {
+      "srun_portal login"
+    };
+    let body = self.login_get(&url).map_err(|e| e.context(step))?;
+    Self::jsonp(&body)
+  }
+
+  /// The address the portal sees this request coming from, or `None` when the
+  /// portal did not answer with one.
+  ///
+  /// It is the one fact that says "this machine is on the campus network",
+  /// even where the gateway does not intercept HTTP: the portal reports the
+  /// caller's own address, which only matches ours while no NAT stands
+  /// between the two.
+  pub fn portal_address(&self) -> Option<String> {
+    let url = self.url("/cgi-bin/rad_user_info", &[]);
+    let body = self.get(&url).ok()?;
+    let v = Self::jsonp(&body).ok()?;
+    v.get("client_ip")
+      .and_then(Value::as_str)
+      .filter(|ip| !ip.trim().is_empty())
+      .map(|ip| ip.trim().to_string())
   }
 
   /// Account name and address of the live session on `ip` (empty = this host).
@@ -361,6 +427,21 @@ impl Client {
 /// E2531/E2532/E2553 are the generic SRun3K variants.
 pub fn is_credentials_error(code: &str) -> bool {
   matches!(code, "E2531" | "E2532" | "E2553" | "E2901")
+}
+
+/// Portal answers meaning "this login cannot be handed to the access
+/// controller that `ac_id` names".
+///
+/// `E2808 Control policy not found` is a policy for an AC this client is not on,
+/// and `INFO failed, BAS respond timeout` is that AC not answering at all. On
+/// THU both happen when the id belongs to another link: the campus hands out a
+/// different one per access network, and switching between them (cable, Wi-Fi,
+/// 802.1X) leaves a stale value behind. Retrying with the same id cannot work.
+pub fn is_ac_unreachable(code: &str, message: &str) -> bool {
+  if code == "E2808" {
+    return true;
+  }
+  message.to_ascii_lowercase().contains("bas respond timeout")
 }
 
 /// Percent-encode for a query string (RFC 3986 unreserved kept).
@@ -463,6 +544,171 @@ pub fn link_id() -> Option<std::net::IpAddr> {
 /// waiting for a poll interval.
 pub fn link_up() -> bool {
   link_id().is_some()
+}
+
+/// Which kind of link carries that route: a cable, Wi-Fi, or neither.
+///
+/// The window shows it next to the account, because a laptop can have both a
+/// cable and a Wi-Fi association up and the portal session belongs to exactly
+/// one of them - a session that appears to come and go is usually two links
+/// taking turns.
+pub fn link_kind() -> crate::proto::LinkKind {
+  link_imp::link_kind()
+}
+
+/// The default-route interface name in `/proc/net/route`.
+///
+/// The table is hex and little-endian; a default route has a zero destination
+/// and the `UP` (`0x1`) flag, and the kernel uses the lowest metric among
+/// them. Kept free of `cfg` so the parsing itself is testable on any host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn default_route(table: &str) -> Option<String> {
+  let mut best: Option<(u32, String)> = None;
+  for line in table.lines().skip(1) {
+    let mut cols = line.split_whitespace();
+    let Some(iface) = cols.next() else { continue };
+    let (Some(destination), Some(_gateway), Some(flags)) = (cols.next(), cols.next(), cols.next())
+    else {
+      continue;
+    };
+    let metric = cols.nth(2).and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    let Ok(flags) = u32::from_str_radix(flags, 16) else {
+      continue;
+    };
+    // Destination 0.0.0.0 with RTF_UP: the route that catches everything.
+    if destination != "00000000" || flags & 0x1 == 0 {
+      continue;
+    }
+    if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+      best = Some((metric, iface.to_string()));
+    }
+  }
+  best.map(|(_, iface)| iface)
+}
+
+#[cfg(windows)]
+mod link_imp {
+  use crate::proto::LinkKind;
+  use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+    GetBestInterfaceEx, IP_ADAPTER_ADDRESSES_LH,
+  };
+  use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_UNSPEC, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN,
+  };
+
+  /// `IF_TYPE_ETHERNET_CSMACD` and `IF_TYPE_IEEE80211` from `ipifcons.h`.
+  const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
+  const IF_TYPE_IEEE80211: u32 = 71;
+  /// `ERROR_BUFFER_OVERFLOW`: the list did not fit, `size` now says how much it
+  /// needs.
+  const ERROR_BUFFER_OVERFLOW: u32 = 111;
+  /// A sanity cap, so a broken `size` answer cannot spin here.
+  const MAX_LIST_BYTES: u32 = 4 * 1024 * 1024;
+
+  pub fn link_kind() -> LinkKind {
+    match best_index().and_then(if_type) {
+      Some(IF_TYPE_ETHERNET_CSMACD) => LinkKind::Ethernet,
+      Some(IF_TYPE_IEEE80211) => LinkKind::Wlan,
+      // A route that exists but belongs to some other adapter (a tunnel, a
+      // virtual switch) still is not "no link".
+      Some(_) => LinkKind::Other,
+      None if crate::srun::link_up() => LinkKind::Other,
+      None => LinkKind::None,
+    }
+  }
+
+  /// The index of the interface the routing table would send to `223.5.5.5`,
+  /// which is the same destination `link_id()` asks the kernel about.
+  fn best_index() -> Option<u32> {
+    let target = SOCKADDR_IN {
+      sin_family: AF_INET,
+      sin_port: 53u16.to_be(),
+      // Network order in memory, so the four octets land in the intended order.
+      sin_addr: IN_ADDR {
+        S_un: IN_ADDR_0 {
+          S_addr: u32::from_ne_bytes([223, 5, 5, 5]),
+        },
+      },
+      sin_zero: [0; 8],
+    };
+    let mut index = 0u32;
+    let rc =
+      unsafe { GetBestInterfaceEx(&target as *const SOCKADDR_IN as *const SOCKADDR, &mut index) };
+    (rc == 0 && index != 0).then_some(index)
+  }
+
+  /// `IfType` of the adapter with that index, or `None` when the list cannot be
+  /// read (which is a different case from "not found" only for the log).
+  fn if_type(index: u32) -> Option<u32> {
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024u32;
+    loop {
+      let mut buf = vec![0u8; size as usize];
+      let rc = unsafe {
+        GetAdaptersAddresses(
+          AF_UNSPEC as u32,
+          flags,
+          std::ptr::null(),
+          buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+          &mut size,
+        )
+      };
+      if rc == ERROR_BUFFER_OVERFLOW && size <= MAX_LIST_BYTES {
+        continue;
+      }
+      if rc != 0 {
+        return None;
+      }
+      let mut entry = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+      while !entry.is_null() {
+        let adapter = unsafe { &*entry };
+        let this = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+        if this == index {
+          return Some(adapter.IfType);
+        }
+        entry = adapter.Next;
+      }
+      return None;
+    }
+  }
+}
+
+#[cfg(target_os = "linux")]
+mod link_imp {
+  use crate::proto::LinkKind;
+
+  pub fn link_kind() -> LinkKind {
+    let Ok(table) = std::fs::read_to_string("/proc/net/route") else {
+      return LinkKind::None;
+    };
+    let Some(iface) = super::default_route(&table) else {
+      return LinkKind::None;
+    };
+    let sys = std::path::Path::new("/sys/class/net").join(&iface);
+    if sys.join("wireless").exists() || sys.join("phy80211").exists() {
+      return LinkKind::Wlan;
+    }
+    match std::fs::read_to_string(sys.join("type")) {
+      // ARPHRD_ETHER is what a wired NIC reports; a tunnel reports 65534.
+      Ok(kind) if kind.trim() == "1" => LinkKind::Ethernet,
+      Ok(_) => LinkKind::Other,
+      Err(_) => LinkKind::Other,
+    }
+  }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod link_imp {
+  use crate::proto::LinkKind;
+
+  pub fn link_kind() -> LinkKind {
+    if crate::srun::link_up() {
+      LinkKind::Other
+    } else {
+      LinkKind::None
+    }
+  }
 }
 
 fn scan_ac_id(page: &str) -> Option<String> {
@@ -573,5 +819,66 @@ mod tests {
     assert_eq!(get("password"), format!("{{MD5}}{}", crypto::md5_hex("p")));
     assert!(get("info").starts_with("{SRBX1}"));
     assert_eq!(get("chksum").len(), 40);
+  }
+
+  #[test]
+  fn an_ac_that_cannot_be_reached_is_its_own_refusal() {
+    // Verified answers: a wrong policy id, and the AC behind a stale id not
+    // answering at all. Neither is a password problem, and neither gets better
+    // by sending the same id again.
+    assert!(is_ac_unreachable("E2808", "Control policy not found"));
+    assert!(is_ac_unreachable("", "INFO failed, BAS respond timeout."));
+    assert!(is_ac_unreachable("login_error", "bas respond timeout"));
+    assert!(!is_ac_unreachable("E2901", "ldap_bind error"));
+    assert!(!is_ac_unreachable("E2620", "E2620: You are already online"));
+    assert!(!is_ac_unreachable("", ""));
+  }
+
+  #[test]
+  fn a_tls_stream_cut_by_the_peer_is_a_lost_connection() {
+    // What rustls says when a middlebox ends an HTTPS answer without
+    // `close_notify`. It used to reach the banner verbatim, docs link and all.
+    let io = std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "peer closed connection without sending TLS close_notify: \
+       https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+    );
+    let err = NetError::transport(ureq::Error::Io(io));
+    assert_eq!(err.cause, NetCause::Lost);
+    // The technical sentence is still there for the log pane.
+    assert!(err.detail.contains("close_notify"), "{}", err.detail);
+
+    // A reset socket is the same news, whatever the layer that noticed it.
+    for kind in [
+      std::io::ErrorKind::UnexpectedEof,
+      std::io::ErrorKind::ConnectionReset,
+      std::io::ErrorKind::ConnectionAborted,
+      std::io::ErrorKind::BrokenPipe,
+    ] {
+      let err = NetError::transport(ureq::Error::Io(std::io::Error::new(kind, "gone")));
+      assert_eq!(err.cause, NetCause::Lost, "{kind:?}");
+    }
+  }
+
+  #[test]
+  fn the_default_route_names_the_uplink() {
+    // Real shape of `/proc/net/route`: hex and little-endian, one header line.
+    let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                 eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                 wlan0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                 eth0\t0002A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+    // The lowest metric wins, exactly as the kernel chooses.
+    assert_eq!(default_route(table).as_deref(), Some("eth0"));
+
+    let wifi_only = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                     wlan0\t00000000\t0105A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n";
+    assert_eq!(default_route(wifi_only).as_deref(), Some("wlan0"));
+
+    // No default route (only a link-scope one), or no table at all.
+    let no_default = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                      eth0\t0002A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+    assert_eq!(default_route(no_default), None);
+    assert_eq!(default_route("Iface\tDestination\tGateway\n"), None);
+    assert_eq!(default_route(""), None);
   }
 }

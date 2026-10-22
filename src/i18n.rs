@@ -118,6 +118,8 @@ pub struct Texts {
   pub net_refused: &'static str,
   pub net_timeout: &'static str,
   pub net_unreachable: &'static str,
+  /// The other side closed the connection mid-answer.
+  pub net_lost: &'static str,
   pub net_other: &'static str,
   /// Shown while a login could still happen: the 802.1X network is the reason it
   /// cannot.
@@ -142,6 +144,12 @@ pub struct Texts {
   pub authenticating: &'static str,
   pub offline: &'static str,
   pub account: &'static str,
+  /// Label of the row that names the link the session rides on (cable, Wi-Fi).
+  pub link: &'static str,
+  pub link_ethernet: &'static str,
+  pub link_wlan: &'static str,
+  pub link_none: &'static str,
+  pub link_other: &'static str,
   pub ipv4: &'static str,
   pub ipv6: &'static str,
   pub session_traffic: &'static str,
@@ -178,6 +186,10 @@ pub struct Texts {
   /// banner is painted so a language switch rewrites it; the raw JSON answer
   /// goes to the log instead.
   pub invalid_credentials: &'static str,
+  /// The portal could not reach an access controller for the `ac_id` in use.
+  pub ac_unreachable: &'static str,
+  /// State label: the link reaches the internet without a portal session.
+  pub online_without_portal: &'static str,
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
   pub autostart_failed: &'static str,
@@ -206,7 +218,21 @@ impl Texts {
       NetCause::Refused => self.net_refused,
       NetCause::Timeout => self.net_timeout,
       NetCause::Unreachable => self.net_unreachable,
+      NetCause::Lost => self.net_lost,
       NetCause::Other => self.net_other,
+    }
+  }
+}
+
+impl crate::proto::LinkKind {
+  /// Words for the link row: which interface carries the session.
+  pub fn text(&self, t: &Texts) -> &'static str {
+    use crate::proto::LinkKind;
+    match self {
+      LinkKind::None => t.link_none,
+      LinkKind::Ethernet => t.link_ethernet,
+      LinkKind::Wlan => t.link_wlan,
+      LinkKind::Other => t.link_other,
     }
   }
 }
@@ -255,12 +281,13 @@ static ZH: Texts = Texts {
   copy_line: "复制本行",
   copy_all: "复制全部",
   network_unavailable: "当前没有网络连接（网线未插或 Wi-Fi 未连接），暂不尝试登录",
-  no_login_needed: "当前网络可直接访问外网，无需登录",
+  no_login_needed: "当前网络不经过校园门户（未检测到拦截），本机不会尝试登录",
   not_campus_network: "当前网络不是清华校园网登录环境，跳过登录",
   net_resolve: "无法解析服务器地址（DNS）",
   net_refused: "服务器拒绝了连接",
   net_timeout: "连接服务器超时",
   net_unreachable: "当前没有可用的网络（网线未插或网卡已禁用）",
+  net_lost: "连接被对端中断（服务器或网关提前关闭了连接）",
   net_other: "网络请求失败",
   secure_wifi: "已连接 {}（系统级 802.1X 认证），无需门户登录",
   secure_wifi_online: "已通过 {} 登录（系统级 802.1X 认证），无需操作",
@@ -276,9 +303,15 @@ static ZH: Texts = Texts {
   lang_zh: "中文",
   lang_en: "English",
   online: "在线",
+  online_without_portal: "已联网（未登录）",
   authenticating: "认证中",
   offline: "离线",
   account: "账号",
+  link: "网络",
+  link_ethernet: "以太网",
+  link_wlan: "WLAN",
+  link_none: "未连接",
+  link_other: "其他",
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "本次流量",
@@ -299,6 +332,7 @@ static ZH: Texts = Texts {
   connect_ok: "连接成功",
   connect_failed: "连接失败",
   invalid_credentials: "用户名或密码错误",
+  ac_unreachable: "门户无法把登录送到当前链路的接入点（ac_id 不属于这条线路），本机不再重试；换回会拦截门户的网络后会自动重连",
   refresh_failed: "刷新失败",
   disconnect_failed: "断开失败",
   autostart_failed: "自启设置失败",
@@ -358,12 +392,13 @@ static EN: Texts = Texts {
   copy_line: "Copy line",
   copy_all: "Copy all",
   network_unavailable: "No network connection (cable unplugged / Wi-Fi down), not logging in",
-  no_login_needed: "This network already reaches the internet; no login needed",
+  no_login_needed: "This link does not go through the campus portal (nothing intercepts HTTP); no login is attempted",
   not_campus_network: "This does not look like the Tsinghua campus login network; skipping",
   net_resolve: "Cannot resolve the server address (DNS)",
   net_refused: "The server refused the connection",
   net_timeout: "The connection to the server timed out",
   net_unreachable: "No network route to the server (cable unplugged or adapter disabled)",
+  net_lost: "The connection was closed by the other side (server or gateway hung up)",
   net_other: "The network request failed",
   secure_wifi: "Connected to {} (OS-level 802.1X); no portal login needed",
   secure_wifi_online: "Signed in through {} (OS-level 802.1X); nothing to do",
@@ -379,9 +414,15 @@ static EN: Texts = Texts {
   lang_zh: "中文",
   lang_en: "English",
   online: "Online",
+  online_without_portal: "Online (unauthenticated)",
   authenticating: "Authenticating",
   offline: "Offline",
   account: "Account",
+  link: "Link",
+  link_ethernet: "Ethernet",
+  link_wlan: "WLAN",
+  link_none: "No link",
+  link_other: "Other",
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "Session traffic",
@@ -402,6 +443,7 @@ static EN: Texts = Texts {
   connect_ok: "Connected",
   connect_failed: "Connection failed",
   invalid_credentials: "Wrong username or password",
+  ac_unreachable: "The portal could not reach the access controller for this link's ac_id; not retrying here",
   refresh_failed: "Refresh failed",
   disconnect_failed: "Disconnect failed",
   autostart_failed: "Failed to change autostart",

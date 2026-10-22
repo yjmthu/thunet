@@ -66,6 +66,7 @@ fn probe_env(session: &Session) -> EnvProbe {
     crate::wifi::WifiKind::Enterprise(ssid) => {
       Some(format!("wifi: {ssid} authenticates below the portal"))
     }
+    crate::wifi::WifiKind::Campus(ssid) => Some(format!("wifi: {ssid} is a campus network")),
     crate::wifi::WifiKind::Portal(ssid) => Some(format!("wifi: {ssid} uses the portal")),
     // Nothing wireless is connected: there is no verdict to explain, so this
     // stays quiet instead of claiming "no ssid" on every wired machine.
@@ -79,11 +80,32 @@ fn probe_env(session: &Session) -> EnvProbe {
       ssid_note,
     };
   }
+  let named_campus = matches!(&wifi, crate::wifi::WifiKind::Campus(_));
+  // The silent-drop case needs a second look: the campus gateway drops
+  // pre-login traffic on the wired network instead of redirecting it, so the
+  // probes see "nothing answers" while a portal login is exactly what is
+  // missing. Two local facts decide it: the SSID name, and the campus portal
+  // already talking to this machine's own address (true only while no NAT sits
+  // in between).
+  //
+  // A link that *does* reach the internet is deliberately not upgraded: there a
+  // login is not needed, and the `ac_id` of the campus network is per link, so
+  // the one this machine has may belong to the network it came from - the
+  // portal then answers `BAS respond timeout` or `E2808` and nothing has been
+  // gained.
+  let campus_link = |session: &Session| named_campus || session.portal_owns_address();
   let (env, ac_id) = match session.net_env() {
     NetEnv::Campus { ac_id } => (LoginEnv::Campus, Some(ac_id)),
-    NetEnv::Unreachable => (LoginEnv::NoNetwork, None),
     NetEnv::OtherPortal => (LoginEnv::OtherPortal, None),
     NetEnv::DirectInternet => (LoginEnv::NoPortal, None),
+    NetEnv::Unreachable => (
+      if campus_link(session) && crate::srun::link_up() {
+        LoginEnv::Campus
+      } else {
+        LoginEnv::NoNetwork
+      },
+      None,
+    ),
   };
   EnvProbe {
     env,
@@ -112,6 +134,9 @@ fn core_info(
     env: login_env.clone(),
     ac_id: session.cfg().ac_id.clone(),
     host: session.cfg().host.clone(),
+    // Read here rather than in the frontend so `thunet status` describes the
+    // same link the core's own requests leave on.
+    link: crate::srun::link_kind(),
     credential,
     auto_connect: session.cfg().auto_connect,
     wanted_online,
@@ -265,6 +290,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     )))
     .ok();
   }
+  // Consecutive refresh failures. One is a hiccup the next one recovers from
+  // (a dropped connection, a slow portal); it belongs in the log. A failure
+  // that repeats is what the banner is for.
+  let mut refresh_failures = 0u32;
   let mut last_ka = Instant::now();
   let mut last_status = Instant::now() - Duration::from_secs(60);
   let mut last_state = State::Offline;
@@ -393,6 +422,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         }
         Cmd::Refresh { quiet } => match session.refresh() {
           Ok(v) => {
+            refresh_failures = 0;
             tx.send(Ev::Info(v)).ok();
             tx.send(Ev::State(session.state)).ok();
             // A refresh proves the portal answers, not that the stored
@@ -402,7 +432,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               rejected = false;
             }
             if session.state == State::Online
-              || !matches!(banner.as_ref(), Some(Failure::Credentials))
+              || !matches!(
+                banner.as_ref(),
+                Some(Failure::Credentials | Failure::AcUnreachable)
+              )
             {
               set_banner(&tx, &mut banner, None);
             }
@@ -418,9 +451,16 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             }
           }
           Err(e) => {
-            // The banner is the point of even a quiet refresh; only the toast
-            // is skipped.
-            set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
+            refresh_failures = refresh_failures.saturating_add(1);
+            // The technical sentence (a TLS or DNS message) is far too long for
+            // a band, so the log keeps it. One failed refresh is not news for
+            // the page either - the next one clears it - so only a failure that
+            // repeats raises the banner; the toast answers the button press.
+            tx.send(Ev::Log(Line::warn(format!("refresh failed: {e}"))))
+              .ok();
+            if refresh_failures >= 2 {
+              set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
+            }
             if !quiet {
               tx.send(Ev::Notify {
                 msg: t.refresh_failed.into(),
@@ -893,27 +933,42 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
           next_attempt = Instant::now() + Duration::from_secs_f64(backoff.min(120.0));
           let bad_credentials = session.failure == crate::session::FailureKind::Credentials;
+          let ac_unreachable = session.failure == crate::session::FailureKind::AcUnreachable;
           // A rejected password stops the automatic attempts: the same pair
           // can only be refused again. Only a new pair, a manual Connect or a
-          // restart lifts that.
-          rejected = bad_credentials;
+          // restart lifts that. An `ac_id` the portal cannot route this link to
+          // is equally final here, so it pauses the loop as well.
+          rejected = bad_credentials || ac_unreachable;
           user_connect = false;
           // A credential rejection carries a long JSON blob that only helps
           // when debugging, so it goes to the log pane while the red banner
           // says what the user can act on. The banner is worded by the
           // frontend, so a language switch re-words it, and it stays up until
           // a login succeeds.
-          set_banner(
-            &tx,
-            &mut banner,
-            Some(if bad_credentials {
-              Failure::Credentials
-            } else {
-              // The frontend shows this verbatim, so the words have to be here:
-              // a refresh or disconnect failure already says what it was.
-              failure_of(t.login_failed, &e)
-            }),
-          );
+          //
+          // A transport failure is different: a timeout or a cut connection is
+          // usually over by the next attempt, and every such retry painting the
+          // page red reads as "everything is broken". The log keeps it, and
+          // only a failure that survives one more attempt raises the band.
+          let final_refusal = bad_credentials || ac_unreachable;
+          if final_refusal || failures >= 2 {
+            set_banner(
+              &tx,
+              &mut banner,
+              Some(if bad_credentials {
+                Failure::Credentials
+              } else if ac_unreachable {
+                // The id belongs to another link; the banner says so instead of
+                // pasting the portal's answer.
+                Failure::AcUnreachable
+              } else {
+                // The frontend shows this verbatim, so the words have to be
+                // here: a refresh or disconnect failure already says what it
+                // was.
+                failure_of(t.login_failed, &e)
+              }),
+            );
+          }
           tx.send(Ev::Log(Line::error(format!(
             "{e} (retry in {}s)",
             backoff.min(120.0) as u64
@@ -925,7 +980,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           let detail = e.to_string();
           if detail != last_failure {
             last_failure = detail;
-            if !bad_credentials {
+            if !bad_credentials && !ac_unreachable {
               tx.send(Ev::Notify {
                 msg: t.connect_failed.into(),
                 kind: ToastKind::Err,
@@ -960,11 +1015,17 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           session.state = State::Offline;
           tx.send(Ev::Log(Line::warn("session ended, now offline")))
             .ok();
-        } else if online && matches!(banner.as_ref(), Some(Failure::Credentials)) {
+        } else if online
+          && matches!(
+            banner.as_ref(),
+            Some(Failure::Credentials | Failure::AcUnreachable)
+          )
+        {
           // A credential banner is only true while the machine cannot sign in.
           // This session proves the stored pair works, so drop it even though
           // the state did not change: that is the case after a refused switch
-          // that signed the previous account back in.
+          // that signed the previous account back in. The same goes for the
+          // "already online" notice - this session *is* the account's session.
           set_banner(&tx, &mut banner, None);
         }
         tx.send(Ev::Info(v)).ok();

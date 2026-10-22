@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::i18n::{Lang, Texts};
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
-use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, Failure, LoginEnv, ToastKind};
+use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, Failure, LinkKind, LoginEnv, ToastKind};
 use crate::session::State;
 
 impl LoginEnv {
@@ -394,6 +394,12 @@ pub struct App {
   pass_checked: String,
   next_core_query: Instant,
   core_version_warned: bool,
+  /// Which interface carries the default route. Read locally and re-read
+  /// often: a cable plugged in has to show up long before the 30 s service
+  /// poll, and a laptop can have a cable and Wi-Fi up at once - which link the
+  /// session rides on is the first thing to check when it comes and goes.
+  uplink: LinkKind,
+  next_uplink: Instant,
   state: State,
   info: Info,
   logs: Vec<Line>,
@@ -606,6 +612,8 @@ impl App {
       pass_checked: String::new(),
       next_core_query: Instant::now(),
       core_version_warned: false,
+      uplink: crate::srun::link_kind(),
+      next_uplink: Instant::now(),
       state: State::Offline,
       info: Info::default(),
       logs,
@@ -1326,6 +1334,24 @@ impl App {
     !matches!(self.env, LoginEnv::EnterpriseWifi(_))
   }
 
+  /// Words and colour for the state line, and for the tray icon with them.
+  ///
+  /// One helper because the two drifted apart: the window showed "online" for
+  /// a link that carries no portal session while the tray icon kept its grey.
+  fn state_display(&self, t: &Texts) -> (&'static str, [u8; 3]) {
+    match self.state {
+      State::Online => (t.online, color_for(State::Online)),
+      State::Authenticating => (t.authenticating, color_for(State::Authenticating)),
+      // The portal has no session for this address, but the link does not go
+      // through it at all: "Offline" would read as "there is no internet",
+      // which is the opposite of what the probe just measured.
+      State::Offline if self.env == LoginEnv::NoPortal => {
+        (t.online_without_portal, color_for(State::Online))
+      }
+      State::Offline => (t.offline, color_for(State::Offline)),
+    }
+  }
+
   /// Replace this process with a fresh launch of the executable on disk.
   ///
   /// Used when the service reports a newer build: this process still runs the
@@ -1462,11 +1488,7 @@ impl App {
       self.toast_ok(self.t().copied.to_string());
     }
     let t = self.t();
-    let (label, rgb) = match self.state {
-      State::Online => (t.online, color_for(State::Online)),
-      State::Authenticating => (t.authenticating, color_for(State::Authenticating)),
-      State::Offline => (t.offline, color_for(State::Offline)),
-    };
+    let (label, rgb) = self.state_display(t);
 
     egui::Frame::new()
       .fill(ui.visuals().panel_fill)
@@ -1561,12 +1583,15 @@ impl App {
         ui.add_space(8.0);
 
         if self.page == Page::Status {
-          let account = if !self.info.name.is_empty() {
-            self.info.name.clone()
-          } else if !self.cfg.username.is_empty() {
-            self.cfg.username.clone()
+          // Only the portal names an account, and it does so only when this
+          // address has a session: the `not_online_error` answer carries
+          // `client_ip` and nothing else. Falling back to the configured name
+          // would claim a session the portal never confirmed - that name has
+          // its place on the settings page, where it is edited.
+          let account = if self.info.name.is_empty() {
+            "—".to_string()
           } else {
-            "-".to_string()
+            self.info.name.clone()
           };
           egui::Grid::new("info")
             .num_columns(2)
@@ -1574,6 +1599,9 @@ impl App {
             .show(ui, |ui| {
               ui.label(t.account);
               ui.label(egui::RichText::new(account).monospace());
+              ui.end_row();
+              ui.label(t.link);
+              ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
               ui.end_row();
               ui.label(t.ipv4);
               if address_cell(ui, &self.info.ip4, t) {
@@ -3278,10 +3306,17 @@ fn page_banners(
   if let Some(err) = last_error {
     let text = match err {
       Failure::Credentials => t.invalid_credentials.to_string(),
+      Failure::AcUnreachable => t.ac_unreachable.to_string(),
       Failure::Network(cause) => t.net_cause(*cause).to_string(),
       Failure::Text(e) => e.clone(),
     };
-    banners.push((BannerTone::Error, text));
+    // An `ac_id` that belongs to another link is not a fault of this machine,
+    // and only something outside this window can change it.
+    let tone = match err {
+      Failure::AcUnreachable => BannerTone::Warn,
+      _ => BannerTone::Error,
+    };
+    banners.push((tone, text));
   }
   // The verdict explains the state of *Connect*: amber while a login is
   // impossible here (no network, another operator's portal, or an 802.1X
@@ -3320,7 +3355,9 @@ fn page_banners(
 /// Draw one full-width band across the top of the page.
 ///
 /// The text wraps at the band's width and is cut after [`BANNER_ROWS`] lines
-/// with an ellipsis; the full text is on hover (and in the log pane).
+/// with an ellipsis. egui shows the untruncated text on hover by itself (a
+/// `Label` whose galley came out elided does that), so no tooltip is set here -
+/// a manual one would stack a second bubble on top of it.
 ///
 /// Returns the height it consumed, so the window can grow by the same amount
 /// and the page below keeps the size it has without a warning.
@@ -3358,19 +3395,14 @@ fn banner(ui: &mut egui::Ui, text: impl Into<String>, tone: BannerTone) -> f32 {
         // limit, so only a galley built here keeps the cap. epaint appends
         // `…` to the elided last row by itself.
         let mut job = egui::text::LayoutJob::simple(
-          text.clone(),
+          text,
           egui::TextStyle::Body.resolve(ui.style()),
           ink,
           width,
         );
         job.wrap.max_rows = BANNER_ROWS;
         let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-        let elided = galley.elided;
-        let response = ui.add(egui::Label::new(egui::WidgetText::Galley(galley)));
-        // A cut band still owes the reader the whole sentence.
-        if elided {
-          response.on_hover_text(text);
-        }
+        ui.add(egui::Label::new(egui::WidgetText::Galley(galley)));
       });
     });
   frame.response.rect.height()
@@ -3599,6 +3631,14 @@ impl eframe::App for App {
       self.push_log(Line::warn("credentials: no answer from the core"));
     }
 
+    // Which link carries the session is a local fact, so it is read here
+    // instead of being asked of the core: the row has to follow a cable being
+    // plugged in within a couple of seconds, and the service poll is 30 s.
+    if Instant::now() >= self.next_uplink {
+      self.next_uplink = Instant::now() + Duration::from_secs(2);
+      self.uplink = crate::srun::link_kind();
+    }
+
     // Ask the service about itself now and then; the row it fills is advisory,
     // so a slow cadence is plenty.
     if self.link.as_ref().is_some_and(Link::alive) && Instant::now() >= self.next_core_query {
@@ -3652,19 +3692,19 @@ impl eframe::App for App {
       }
     }
 
-    // Keep ticking while hidden so tray clicks are still processed.
-    let rgb = color_for(self.state);
+    // Keep ticking while hidden so tray clicks are still processed. The icon
+    // and the tooltip come from the same words as the window's state line.
+    let t = self.t();
+    let (label, rgb) = self.state_display(t);
     if self.tray_rgb != Some(rgb) {
       self.tray_rgb = Some(rgb);
       if let Some(tray) = &self.tray {
         let _ = tray.set_icon(Some(make_icon(rgb)));
       }
     }
-    let t = self.t();
     let tip = match self.state {
-      State::Online => format!("THUnet · {} · {}", t.online, dash(&self.info.ip4)),
-      State::Authenticating => format!("THUnet · {}", t.authenticating),
-      State::Offline => format!("THUnet · {}", t.offline),
+      State::Online => format!("THUnet · {label} · {}", dash(&self.info.ip4)),
+      _ => format!("THUnet · {label}"),
     };
     if let Some(tray) = &self.tray {
       let _ = tray.set_tooltip(Some(&tip));
@@ -3690,10 +3730,15 @@ impl eframe::App for App {
 }
 
 const DEFAULT_WIDTH: f32 = 420.0;
+/// One row of the status grid, measured: the label height plus the 6 px the
+/// grid leaves between rows.
+const INFO_ROW_HEIGHT: f32 = 27.0;
 /// Fixed client height: tall enough for the denser settings page (including
 /// its log-level row and the build stamp), tight enough that the status page
-/// has no dead space.
-const WINDOW_HEIGHT: f32 = 300.0;
+/// has no dead space. The status grid gained the `Link` row after this was
+/// tuned, so its height is added on top - otherwise the log pane would shrink
+/// by one line every time a row is added.
+const WINDOW_HEIGHT: f32 = 300.0 + INFO_ROW_HEIGHT;
 
 /// Local time of the compile that produced this binary, to the second, with the
 /// numeric UTC offset so "local" needs no further qualification. `build.rs`

@@ -4,10 +4,19 @@
 //! WPA2/WPA3-Enterprise: the OS logs in with the saved 802.1X credentials and
 //! there is **no captive portal** to talk to. Attempting an SRun portal login
 //! there is pointless, so the worker skips it.
+//!
+//! The other campus SSIDs (`Tsinghua`, `Tsinghua-IPv4`) keep the portal, but
+//! the gateway does not always intercept HTTP on them, so the name is the
+//! better authority for "this is the campus network": the probe alone would
+//! call such a link "internet works, nothing to log in to".
 
 /// SSIDs whose authentication happens below the portal. Compared after
 /// separator normalization, so `Tsinghua Secure`/`Tsinghua_Secure` also match.
 const NO_PORTAL_SSIDS: &[&str] = &["tsinghua-secure"];
+
+/// Prefixes of the SSIDs that belong to the campus network and still use the
+/// portal. The campus adds suffixes (`-IPv4`, `-WiFi6`), hence the prefix test.
+const CAMPUS_SSID_PREFIXES: &[&str] = &["tsinghua"];
 
 /// Lower-case and unify `_`/space to `-` so minor naming differences match,
 /// and drop the ` 2`, ` 3`, ... that Windows appends when a profile name is
@@ -25,6 +34,15 @@ fn normalize(ssid: &str) -> String {
 pub fn is_no_portal_ssid(ssid: &str) -> bool {
   let normalized = normalize(ssid);
   NO_PORTAL_SSIDS.iter().any(|s| normalized == *s)
+}
+
+/// True for SSIDs of the campus network that are served by the portal.
+pub fn is_campus_ssid(ssid: &str) -> bool {
+  let normalized = normalize(ssid);
+  !is_no_portal_ssid(ssid)
+    && CAMPUS_SSID_PREFIXES
+      .iter()
+      .any(|p| normalized.starts_with(p))
 }
 
 /// Pull the SSID out of `netsh wlan show interfaces` output.
@@ -53,6 +71,9 @@ fn parse_ssid(text: &str) -> Option<String> {
 pub enum WifiKind {
   /// This SSID authenticates below the portal (802.1X): no login to make.
   Enterprise(String),
+  /// A campus SSID served by the portal: a login is the right thing to do,
+  /// even when the gateway does not intercept HTTP on it.
+  Campus(String),
   /// A named wireless network that goes through the portal.
   Portal(String),
   /// Nothing wireless is connected: a definitive answer.
@@ -65,22 +86,29 @@ pub enum WifiKind {
 
 /// Classify the current wireless link. The network profile fallback is only
 /// consulted when Windows refuses to name the SSID, and only a whitelisted name
-/// becomes [`WifiKind::Enterprise`], so a wired profile can never be mistaken
-/// for a wireless one.
+/// decides the verdict, so a wired profile can never be mistaken for a
+/// wireless one.
 pub fn classify() -> WifiKind {
   match probe_ssid() {
     Ok(Some(ssid)) if is_no_portal_ssid(&ssid) => WifiKind::Enterprise(ssid),
+    Ok(Some(ssid)) if is_campus_ssid(&ssid) => WifiKind::Campus(ssid),
     Ok(Some(ssid)) => WifiKind::Portal(ssid),
     Ok(None) => WifiKind::NoWifi,
     Err(reason) => match profile_names() {
-      Ok(names) => match names.iter().find(|name| is_no_portal_ssid(name)) {
-        Some(name) => WifiKind::Enterprise(name.clone()),
-        None if names.is_empty() => WifiKind::Unknown(format!("{reason}; no network profiles")),
-        None => WifiKind::Unknown(format!(
-          "{reason}; connected profiles: {}",
-          names.join(", ")
-        )),
-      },
+      Ok(names) => {
+        if let Some(name) = names.iter().find(|name| is_no_portal_ssid(name)) {
+          WifiKind::Enterprise(name.clone())
+        } else if let Some(name) = names.iter().find(|name| is_campus_ssid(name)) {
+          WifiKind::Campus(name.clone())
+        } else if names.is_empty() {
+          WifiKind::Unknown(format!("{reason}; no network profiles"))
+        } else {
+          WifiKind::Unknown(format!(
+            "{reason}; connected profiles: {}",
+            names.join(", ")
+          ))
+        }
+      }
       Err(why) => WifiKind::Unknown(format!("{reason}; {why}")),
     },
   }
@@ -394,9 +422,31 @@ mod tests {
   fn only_a_matching_ssid_becomes_a_shortcut() {
     // The filter is what turns a read SSID into the 802.1X verdict, so an
     // unrelated network must stay `None` instead of disabling the portal.
-    let other = Some("Tsinghua".to_string()).filter(|s| is_no_portal_ssid(s));
+    let other = Some("Guest".to_string()).filter(|s| is_no_portal_ssid(s));
     assert_eq!(other, None);
     let secure = Some("Tsinghua-Secure".to_string()).filter(|s| is_no_portal_ssid(s));
     assert_eq!(secure.as_deref(), Some("Tsinghua-Secure"));
+  }
+
+  #[test]
+  fn campus_ssids_keep_the_portal() {
+    // The campus network renames its SSIDs; every one of them still uses the
+    // portal, so the probe is allowed to treat a login as meaningful there.
+    for ssid in [
+      "Tsinghua",
+      "Tsinghua-IPv4",
+      "Tsinghua-IPv4 2",
+      "tsinghua_ipv6",
+      "  TSINGHUA  ",
+    ] {
+      assert!(is_campus_ssid(ssid), "{ssid}");
+    }
+    // 802.1X wins over the name: that network has no portal to log in to.
+    assert!(!is_campus_ssid("Tsinghua-Secure"));
+    assert!(!is_campus_ssid("Tsinghua-Secure 2"));
+    // Somebody else's network is not a campus one, whatever it looks like.
+    for ssid in ["Guest", "eduroam", "THU-Guest", ""] {
+      assert!(!is_campus_ssid(ssid), "{ssid}");
+    }
   }
 }

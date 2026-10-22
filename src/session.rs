@@ -27,6 +27,9 @@ pub enum FailureKind {
   Other,
   /// Wrong account or password: retrying cannot help, and the raw JSON is noise.
   Credentials,
+  /// The portal could not route the login to the access controller named by
+  /// `ac_id`, which is what an id borrowed from another link looks like.
+  AcUnreachable,
 }
 
 pub struct Session {
@@ -46,6 +49,13 @@ fn ecode(v: &serde_json::Value) -> String {
   v.get("ecode")
     .and_then(|e| e.as_str())
     .unwrap_or("no ecode")
+    .to_string()
+}
+
+fn error_msg(v: &serde_json::Value) -> String {
+  v.get("error_msg")
+    .and_then(|e| e.as_str())
+    .unwrap_or_default()
     .to_string()
 }
 
@@ -125,6 +135,23 @@ impl Session {
     self.client.net_env()
   }
 
+  /// Is the campus portal already talking to *this* machine?
+  ///
+  /// The portal reports the caller's own address, and on the campus network
+  /// that address is exactly the one the OS picked for the default route -
+  /// there is no NAT in between. From anywhere else the two differ (or the
+  /// portal does not answer at all), which is what keeps a hotel Wi-Fi from
+  /// being mistaken for a portal that is simply not intercepting.
+  pub fn portal_owns_address(&self) -> bool {
+    let Some(local) = crate::srun::link_id() else {
+      return false;
+    };
+    self
+      .client
+      .portal_address()
+      .is_some_and(|seen| seen == local.to_string())
+  }
+
   /// Adopt an ac_id found by the caller's probe (only when auto-detecting).
   pub fn set_ac_id(&mut self, ac_id: String) {
     if self.auto_ac && self.cfg.ac_id != ac_id {
@@ -197,6 +224,9 @@ impl Session {
         self.state = State::Offline;
         return Err(NetError::msg(self.rejected(&v)));
       }
+      // Errors that are about the AC id (or that carry no code at all) may
+      // still have created the session, so they are the ones worth re-trying
+      // with a fresh id and then polling for. Everything else is final.
       let policy_like = code.starts_with("E28") || code == "no ecode" || code.is_empty();
       if !policy_like {
         self.state = State::Offline;
@@ -224,6 +254,17 @@ impl Session {
         ));
       }
       self.state = State::Offline;
+      // Both of these say the same thing: the portal could not hand the login
+      // to an access controller for the id this client has, which on THU is
+      // what a stale id from another link looks like. The raw JSON in the
+      // banner would only hide that, so it gets its own kind.
+      if crate::srun::is_ac_unreachable(&code, &error_msg(&v)) {
+        self.failure = FailureKind::AcUnreachable;
+        return Err(NetError::msg(format!(
+          "the portal could not reach the access controller for ac_id={}: {v}",
+          self.cfg.ac_id
+        )));
+      }
       return Err(NetError::msg(self.rejected(&v)));
     }
   }
