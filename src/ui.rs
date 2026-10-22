@@ -14,7 +14,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde_json::Value;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+// Click events exist only in the Windows backend; the Linux one
+// (`libappindicator`) never reports a click, so nothing there consumes these.
+#[cfg(windows)]
+use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
@@ -438,6 +442,11 @@ pub struct App {
   applied_theme: Option<String>,
   autostart: Option<Autostart>,
   autostart_mode: Mode,
+  /// This process runs a portable core (`THUNET_STATE_DIR`), so the machine
+  /// service is not its business: the settings page hides the autostart modes
+  /// (all three register something with systemd / the SCM) and nothing here
+  /// may write a registration for a machine that chose portable.
+  portable: bool,
   user_edit: String,
   pass_edit: String,
   remember: bool,
@@ -534,6 +543,19 @@ impl App {
 
     let connect_item = MenuItem::with_id("connect", t.connect, true, None);
     let disconnect_item = MenuItem::with_id("disconnect", t.disconnect, true, None);
+    // Portable is visible in the title and the tray tooltip: the two modes
+    // keep separate state, credentials and endpoints, so the user has to be
+    // able to tell which one this window is. The application id is left alone
+    // - it is what the desktop groups windows by and what the autostart entry
+    // points at, and a second id would mean a second icon and a second set of
+    // window rules.
+    let portable = crate::ipc::portable();
+    let app_title = if portable {
+      "THUnet Portable"
+    } else {
+      "THUnet"
+    };
+
     let show_item = MenuItem::with_id("show", t.show_window, true, None);
     let hide_item = MenuItem::with_id("hide", t.hide_window, true, None);
     let quit_item = MenuItem::with_id("quit", t.quit, true, None);
@@ -551,7 +573,7 @@ impl App {
       .with_menu(Box::new(menu.clone()))
       // The menu lives on the right button; a left click brings the window back.
       .with_menu_on_left_click(false)
-      .with_tooltip("THUnet")
+      .with_tooltip(app_title)
       .with_icon(make_icon(color_for(State::Offline)))
       .build()
       .ok();
@@ -572,6 +594,16 @@ impl App {
       "config: {}",
       crate::config::path().display()
     ))];
+    // Portable: the core is a thread of this window, so it exists exactly as
+    // long as the window does. There is nothing to start, and starting it here
+    // is not the "a window must not resurrect a service" rule being broken -
+    // that rule is about the machine service, which portable mode never uses.
+    if portable {
+      match crate::ipc::host_core() {
+        Ok(()) => logs.push(Line::info("portable: the core runs in this window")),
+        Err(e) => logs.push(Line::warn(format!("portable: {e}"))),
+      }
+    }
     // The package (or `thunet service install`) provides the system unit; this
     // is a no-op on both platforms and kept for portable builds.
     match autostart.as_ref().map(Autostart::prepare_service) {
@@ -582,8 +614,9 @@ impl App {
     // The tray entry has to name the executable that is installed now: an
     // upgrade may have moved it, and a task pointing at the old file would
     // simply fail at the next logon. Rewriting is a no-op when nothing is
-    // registered.
-    if let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
+    // registered. A portable run leaves the entry alone: it belongs to a
+    // machine-mode configuration this process is not part of.
+    if !portable && let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
       logs.push(Line::warn(format!("autostart: {e}")));
     }
     // Read the mode after that: the settings page has to show what is actually
@@ -640,6 +673,7 @@ impl App {
       applied_theme: None,
       autostart,
       autostart_mode,
+      portable,
       tray,
       tray_rgb: Some(color_for(State::Offline)),
       gear: None,
@@ -684,12 +718,72 @@ impl App {
     self.link.as_ref()?.try_recv()
   }
 
+  /// Drop the core link and every fact it reported.
+  ///
+  /// A core in its own process reports this by closing the pipe; a hosted core
+  /// cannot (both halves of the socket live in this process), so
+  /// [`Self::ensure_link`] triggers the same cleanup from the hosting side.
+  fn forget_core(&mut self, was_machine: bool, stale: Option<u8>) {
+    self.push_log(Line::debug("frontend: the core link went away"));
+    self.lang_sent = false;
+    self.core = None;
+    self.core_answered = false;
+    self.last_error = None;
+    self.state = State::Offline;
+    self.info = Info::default();
+    if let Some(v) = stale
+      && self.core_stale != Some(v)
+    {
+      self.core_stale = Some(v);
+      self.push_log(Line::error(format!(
+        "the background service speaks protocol {v} but this build speaks {}; restart the service",
+        crate::proto::VERSION
+      )));
+    }
+    if was_machine {
+      // A machine core owned the credential; its answers are stale now, and
+      // the next one will report them again after reconnecting.
+      self.core_cred = None;
+      self.pass_matches = None;
+      self.pass_checked.clear();
+    }
+    // A pending *Stop* is only done once the core is really gone.
+    if let Some((ServiceRequest::Stop, _)) = self.service_request {
+      self.service_request = None;
+      // "Not running" is the expected outcome of this click, not a warning:
+      // keep the reconnect probe quiet until a core answers again. The flag
+      // resets on a successful connect, so a real outage still reports.
+      self.service_warned = true;
+      let msg = self.t().service_stopped.to_string();
+      self.toast_ok(msg);
+    }
+  }
+
   /// Reconnect to the background core, without starting one.
   ///
   /// Starting a core is an explicit action — autostart at boot, the status
   /// page's *Start* button, or the CLI. A window that respawned one on its own
   /// would make `systemctl stop` / `sc stop` look broken.
   fn ensure_link(&mut self) {
+    // A core this window hosts ends *inside* this process, and the connections
+    // it accepted cannot report EOF from there: both halves of the socket stay
+    // open until the other side lets go, and the core's read half only lets go
+    // after the frontend does. "Stop was requested and nothing is hosted any
+    // more" is the same fact seen from the hosting side, so use it instead of
+    // waiting for a hang-up that cannot happen.
+    if self.portable
+      && self.link.is_some()
+      && self
+        .service_request
+        .is_some_and(|(r, _)| r == ServiceRequest::Stop)
+      && !crate::ipc::hosted()
+    {
+      let was_machine = self.link.as_ref().is_some_and(Link::is_machine);
+      let stale = self.link.as_ref().and_then(Link::speaks);
+      self.link = None;
+      self.forget_core(was_machine, stale);
+      return;
+    }
     if self.link.as_ref().is_some_and(Link::alive) {
       if !self.lang_sent {
         self.send(Cmd::SetLang(self.lang));
@@ -714,39 +808,7 @@ impl App {
     // actually wrong.
     let stale = self.link.as_ref().and_then(Link::speaks);
     if self.link.take().is_some() {
-      self.push_log(Line::debug("frontend: the core link went away"));
-      self.lang_sent = false;
-      self.core = None;
-      self.core_answered = false;
-      self.last_error = None;
-      self.state = State::Offline;
-      self.info = Info::default();
-      if let Some(v) = stale
-        && self.core_stale != Some(v)
-      {
-        self.core_stale = Some(v);
-        self.push_log(Line::error(format!(
-          "the background service speaks protocol {v} but this build speaks {}; restart the service",
-          crate::proto::VERSION
-        )));
-      }
-      if was_machine {
-        // A machine core owned the credential; its answers are stale now, and
-        // the next one will report them again after reconnecting.
-        self.core_cred = None;
-        self.pass_matches = None;
-        self.pass_checked.clear();
-      }
-      // A pending *Stop* is only done once the core has actually hung up.
-      if let Some((ServiceRequest::Stop, _)) = self.service_request {
-        self.service_request = None;
-        // "Not running" is the expected outcome of this click, not a warning:
-        // keep the reconnect probe quiet until a core answers again. The flag
-        // resets on a successful connect, so a real outage still reports.
-        self.service_warned = true;
-        let msg = self.t().service_stopped.to_string();
-        self.toast_ok(msg);
-      }
+      self.forget_core(was_machine, stale);
     }
     // Nothing about a refused protocol changes by reconnecting: only a
     // restart does, and that resets this delay. A slower loop keeps the log
@@ -776,7 +838,11 @@ impl App {
         self.core_stale = None;
         // Not a login failure, so this belongs in the log rather than in the
         // red banner; the service row says "not running" by itself.
-        if !self.service_warned {
+        // Portable: the core was just started in this window, so the first
+        // few failed connects only mean the thread has not bound its socket
+        // yet. Saying nothing is right - a core that really died stops being
+        // `hosted()` and reports as usual.
+        if !self.service_warned && !(self.portable && crate::ipc::hosted()) {
           self.service_warned = true;
           self.push_log(Line::warn(format!(
             "the background service is not running: {reason}"
@@ -811,6 +877,8 @@ impl App {
         username: self.cfg.username.clone(),
         password: self.cfg.password.clone(),
         remember: self.cfg.remember_password,
+        // These were typed in this window, so there is nothing held to seal.
+        keep_password: false,
       });
       // The machine core holds it from now on. Keeping a copy here would make
       // the window claim a stored password it cannot verify against the core.
@@ -819,16 +887,18 @@ impl App {
       self.pass_matches = None;
       self.pass_checked.clear();
     }
-    // A pending *Start* is only done once the core actually answers. On
-    // Windows the only supported start target is the service, so a portable
-    // core that happens to answer first must not complete the click.
+    // A pending *Start* is only done once the core actually answers, and only
+    // for the core this click asked for: the machine endpoint is bound by the
+    // service identity alone, so a portable core that merely happens to be up
+    // must not complete the click. A portable process hosts its own core, so
+    // there that *is* the answer. (macOS has no machine service at all.)
     let start_ready = self.core_answered
       && self.link.as_ref().is_some_and(|link| {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-          link.is_machine()
+          link.is_machine() || crate::ipc::portable()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
           let _ = link;
           true
@@ -890,13 +960,12 @@ impl App {
       return;
     }
 
-    // No core answers. On a machine-service install (and on Windows, where
-    // Start registers that service), start it and deliver the credential once
-    // it appears. Falling back to the per-user store here is wrong: the machine
-    // core would never read that file. An explicit `--state-dir` means the
-    // caller asked for portable mode, so leave that alone.
-    let portable = std::env::var_os("THUNET_STATE_DIR").is_some();
-    if crate::autostart::core_managed() || (cfg!(windows) && !portable) {
+    // No core answers. When the start below brings up the machine service (see
+    // `ipc::core_is_service`), the credential has to travel with it and is
+    // delivered once that core answers: the machine core would never read the
+    // per-user store. An explicit `--state-dir` asks for portable mode, where
+    // the user store is exactly right.
+    if crate::ipc::core_is_service() {
       if let Err(e) = next.save_prefs() {
         self.toast_err(e);
         return;
@@ -987,6 +1056,12 @@ impl App {
           username: self.cfg.username.clone(),
           password: self.cfg.password.clone(),
           remember: self.cfg.remember_password,
+          // The field is empty and the core is the holder: ask it to seal the
+          // password it already has instead of failing for lack of plaintext.
+          keep_password: owned_by_core
+            && self.cfg.remember_password
+            && self.cfg.password.is_empty()
+            && self.core_cred.as_ref().is_some_and(|c| c.has_password),
         });
         if owned_by_core {
           // The core is the only holder now; the field goes back to empty and
@@ -1157,6 +1232,11 @@ impl App {
   /// The work happens on a helper thread: on Windows the core half may show a
   /// UAC prompt, so the answer can take as long as the user needs to click.
   fn apply_autostart_mode(&mut self, mode: Mode) {
+    // The row is not drawn in portable mode; this keeps a stray call from
+    // registering the machine service anyway.
+    if self.portable {
+      return;
+    }
     let Some(autostart) = self.autostart.clone() else {
       self.toast_err(self.t().autostart_failed.to_string());
       return;
@@ -1203,6 +1283,14 @@ impl App {
         // Nothing changed: go back to what the OS actually says.
         self.reload_autostart_mode();
         self.toast_err(t.admin_cancelled.to_string());
+      }
+      Err(e) if e == crate::elevate::NO_AUTHORIZATION => {
+        // Same "nothing changed" outcome, but `pkexec` cannot tell a dismissed
+        // dialog from a session that could not show one, so the wording is
+        // neutral and names the terminal fallback.
+        self.reload_autostart_mode();
+        self.push_log(Line::warn(format!("autostart: {e}")));
+        self.toast_err(t.admin_unavailable.to_string());
       }
       Err(e) => {
         self.reload_autostart_mode();
@@ -1251,12 +1339,23 @@ impl App {
       self.cloaked = false;
     }
     self.shown = true;
+    // Undo the Wayland fallback in `hide_window`, which left it minimised.
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
   }
 
   fn hide_window(&mut self, ctx: &egui::Context) {
     self.shown = false;
+    // winit cannot hide a Wayland toplevel ("Not possible on Wayland"), and
+    // `run_with` only forces X11 when `DISPLAY` exists. Without this fallback a
+    // pure-Wayland session would ignore *Hide window* and the close button and
+    // leave the window on screen; minimising is the closest thing the protocol
+    // offers.
+    if wayland_without_x11() {
+      ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+      return;
+    }
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
   }
 
@@ -1327,7 +1426,7 @@ impl App {
   }
 
   /// False where the portal verbs (Connect, Disconnect and the account form)
-  /// have nothing to act on. On an 802.1X network Windows owns the session and
+  /// have nothing to act on. On an 802.1X network the OS owns the session and
   /// the portal entry is only a mirror of it, so a logout there would tear down
   /// something this app never opened - and the account is not used at all.
   fn portal_verbs(&self) -> bool {
@@ -1472,6 +1571,9 @@ impl App {
         }
         // Answers to the CLI's one-off questions; the window has no use for them.
         Ev::Status(_) | Ev::AcId(_) => {}
+        // An installer is about to replace the executable: end here instead of
+        // hiding, so the image is gone before the file is (see `quit`).
+        Ev::Quit => self.quit(),
       }
     }
   }
@@ -1516,10 +1618,15 @@ impl App {
         let auto_connect = self.core.as_ref().is_some_and(|c| c.auto_connect);
         let credentials_ready =
           credential.is_some_and(|c| c.has_password && !c.username.is_empty());
+        // Portable mode hosts the core, so "not running" or "an old core" are
+        // not things the user can act on: at most the link has not been made
+        // yet, and the status row says where the core lives. Reporting it as a
+        // fault would flash a red band on every start.
+        let answered = self.core_answered || self.portable;
         let banners = page_banners(
           self.page,
           self.state,
-          self.core_answered,
+          answered,
           self.core_stale,
           self.env.clone(),
           self.last_error.as_ref(),
@@ -1622,11 +1729,12 @@ impl App {
                 human(self.info.bytes_out)
               ));
               ui.end_row();
-              // The core is a separate process; say whether one is answering and
-              // which version it runs, so a half-finished upgrade is visible.
-              // The button beside it starts or stops that process: like
-              // `thunet service stop` it never closes this window, which keeps
-              // running and reconnects by itself when a service comes back.
+              // The core is a separate process in service mode, so the row says
+              // whether one is answering and which version it runs, and the
+              // button beside it starts or stops it: like `thunet service stop`
+              // it never closes this window. In portable mode the core is a
+              // thread of this window - there is nothing to start, stop or
+              // restart - so the row only states where it lives.
               let service = self
                 .core
                 .as_ref()
@@ -1636,31 +1744,46 @@ impl App {
               // protocol: it is alive, it just cannot serve this build.
               let stale = self.core_stale.is_some();
               let running = service.is_some() || self.core_answered || stale;
-              ui.label(t.service);
-              // Same shape as the address rows above: the button is laid out
-              // first in a right-to-left row, so it keeps the column's right
-              // edge, and the status text takes the rest from the left. The
-              // children stay inside the cell because the row is given exactly
-              // the width the cell offers.
-              let action = match (stale, running) {
-                (true, _) => t.service_restart,
-                (false, true) => t.service_stop,
-                (false, false) => t.service_start,
-              };
-              ui.horizontal(|ui| {
-                let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-                ui.allocate_ui_with_layout(
-                  size,
-                  egui::Layout::right_to_left(egui::Align::Center),
-                  |ui| {
-                    self.service_button(ui, stale, running, action);
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                      service_status(ui, service.as_ref(), running, t);
-                    });
-                  },
-                );
-              });
-              ui.end_row();
+              if self.portable {
+                ui.label(t.core_row);
+                ui.horizontal(|ui| {
+                  let mut text = egui::RichText::new(t.core_in_window);
+                  if running {
+                    text = text.color(state_color(State::Online));
+                  }
+                  ui.label(text);
+                  if let Some((version, _)) = &service {
+                    ui.label(format!("v{version}"));
+                  }
+                });
+                ui.end_row();
+              } else {
+                ui.label(t.service);
+                // Same shape as the address rows above: the button is laid out
+                // first in a right-to-left row, so it keeps the column's right
+                // edge, and the status text takes the rest from the left. The
+                // children stay inside the cell because the row is given
+                // exactly the width the cell offers.
+                let action = match (stale, running) {
+                  (true, _) => t.service_restart,
+                  (false, true) => t.service_stop,
+                  (false, false) => t.service_start,
+                };
+                ui.horizontal(|ui| {
+                  let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                  ui.allocate_ui_with_layout(
+                    size,
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                      self.service_button(ui, stale, running, action);
+                      ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        service_status(ui, service.as_ref(), running, t);
+                      });
+                    },
+                  );
+                });
+                ui.end_row();
+              }
             });
 
           ui.add_space(10.0);
@@ -1791,26 +1914,34 @@ impl App {
           // report "not running". With the short labels from `i18n.rs` all
           // three fit on the label's row, which is what keeps the page inside
           // the fixed window height.
-          let mut mode = self.autostart_mode;
-          ui.horizontal(|ui| {
-            ui.label(t.autostart);
-            for (value, label) in [
-              (Mode::Off, t.autostart_off),
-              (Mode::Core, t.autostart_core),
-              (Mode::All, t.autostart_all),
-            ] {
-              ui.radio_value(&mut mode, value, label);
+          // Every mode here registers something with the machine's service
+          // manager, so a portable process must not offer them at all: it has
+          // no service, and choosing one is exactly how a portable run would
+          // leave a registration behind on a machine that never asked for one.
+          if self.portable {
+            ui.label(t.portable_autostart);
+          } else {
+            let mut mode = self.autostart_mode;
+            ui.horizontal(|ui| {
+              ui.label(t.autostart);
+              for (value, label) in [
+                (Mode::Off, t.autostart_off),
+                (Mode::Core, t.autostart_core),
+                (Mode::All, t.autostart_all),
+              ] {
+                ui.radio_value(&mut mode, value, label);
+              }
+            });
+            if mode != self.autostart_mode {
+              self.apply_autostart_mode(mode);
             }
-          });
-          if mode != self.autostart_mode {
-            self.apply_autostart_mode(mode);
           }
 
           // Both are startup behaviour, so they share one row: the settings page
           // has to fit the fixed window height. *Start minimised* is only
           // meaningful when the tray is part of the autostart mode.
           let mut start_min = self.cfg.start_minimized;
-          let tray_starts = self.autostart_mode != Mode::Core;
+          let tray_starts = !self.portable && self.autostart_mode != Mode::Core;
           let mut auto_conn = self.cfg.auto_connect;
           ui.horizontal(|ui| {
             if ui
@@ -1917,10 +2048,17 @@ impl App {
             // This row is the only one that does not save as you type, so the
             // button shows when there is anything left to apply. A switch in
             // flight owns the session: a second click would start another one.
+            // The password the core holds can be remembered without retyping
+            // it, but only while the form still names the account it belongs
+            // to - the core refuses to pair a held password with another user.
+            let held_here = self.core_cred.as_ref().is_some_and(|cred| {
+              cred.has_password && cred.username.trim() == self.user_edit.trim()
+            });
             let may_apply = can_apply(
               self.remember,
               &self.user_edit,
               &self.pass_edit,
+              held_here,
               stored.any(),
             );
             let mut apply = egui::Button::new(t.apply);
@@ -2207,10 +2345,12 @@ fn credential_action(
 /// *Remember password* together with an empty field has no meaning: the core
 /// keeps what is stored (the field says "leave blank to keep it"), so the only
 /// thing an Apply could do is the one thing that is not allowed — change the
-/// account without retyping the password. Unticking the box is the explicit
-/// clear and needs neither field; with nothing changed there is nothing to do.
-fn can_apply(remember: bool, username: &str, password: &str, changed: bool) -> bool {
-  changed && (!remember || (!username.trim().is_empty() && !password.is_empty()))
+/// account without retyping the password. An empty field is fine when `held`
+/// says the core holds a password for exactly this account: then the request
+/// only asks to seal that one. Unticking the box is the explicit clear and
+/// needs neither field; with nothing changed there is nothing to do.
+fn can_apply(remember: bool, username: &str, password: &str, held: bool, changed: bool) -> bool {
+  changed && (!remember || (!username.trim().is_empty() && (!password.is_empty() || held)))
 }
 
 /// Which part of the account row differs from what is stored. The other
@@ -3191,18 +3331,43 @@ mod tests {
   #[test]
   fn apply_needs_a_password_before_it_changes_the_account() {
     assert!(
-      !can_apply(true, "alice", "", true),
+      !can_apply(true, "alice", "", false, true),
       "rename without password"
     );
-    assert!(!can_apply(true, "", "pw", true), "password without account");
-    assert!(!can_apply(true, "   ", "pw", true), "a blank account");
-    assert!(can_apply(true, "alice", "pw", true));
+    assert!(
+      !can_apply(true, "", "pw", false, true),
+      "password without account"
+    );
+    assert!(
+      !can_apply(true, "   ", "pw", false, true),
+      "a blank account"
+    );
+    assert!(can_apply(true, "alice", "pw", false, true));
     // Unticking the box clears the stored credential and needs neither field.
-    assert!(can_apply(false, "", "", true));
-    assert!(can_apply(false, "alice", "", true));
+    assert!(can_apply(false, "", "", false, true));
+    assert!(can_apply(false, "alice", "", false, true));
     // Nothing changed: nothing to apply either way.
-    assert!(!can_apply(true, "alice", "pw", false));
-    assert!(!can_apply(false, "", "", false));
+    assert!(!can_apply(true, "alice", "pw", false, false));
+    assert!(!can_apply(false, "", "", false, false));
+  }
+
+  /// Ticking *Remember password* after an Apply that did not save it has no
+  /// plaintext to send — the core holds the password — so the request is to
+  /// seal that one, which is only allowed for the same account.
+  #[test]
+  fn a_held_password_can_be_remembered_without_retyping_it() {
+    assert!(
+      can_apply(true, "alice", "", true, true),
+      "held, same account"
+    );
+    assert!(
+      !can_apply(true, "bob", "", false, true),
+      "a held password only counts for the account it belongs to"
+    );
+    assert!(
+      !can_apply(true, "alice", "", false, true),
+      "nothing held for this form"
+    );
   }
 
   #[test]
@@ -3545,7 +3710,14 @@ impl eframe::App for App {
           {
             self.service_request = None;
             self.push_log(Line::error(format!("service: {e}")));
-            self.toast_err(self.t().service_stop_failed.to_string());
+            // The stop never ran, so this is about the prompt, not about the
+            // service refusing to stop.
+            let msg = if e == crate::elevate::NO_AUTHORIZATION {
+              self.t().admin_unavailable.to_string()
+            } else {
+              self.t().service_stop_failed.to_string()
+            };
+            self.toast_err(msg);
           } else {
             // The core is already gone, so the stop did take effect.
             self.push_log(Line::warn(format!("service: {e} (the core is gone)")));
@@ -3564,13 +3736,14 @@ impl eframe::App for App {
         }
         (ServiceRequest::Start, Err(e)) => {
           let cancelled = e == crate::elevate::CANCELLED;
+          let unauthorized = e == crate::elevate::NO_AUTHORIZATION;
           let recovered = self.core_answered
             && self.link.as_ref().is_some_and(|link| {
-              #[cfg(windows)]
+              #[cfg(any(windows, target_os = "linux"))]
               {
-                link.is_machine()
+                link.is_machine() || crate::ipc::portable()
               }
-              #[cfg(not(windows))]
+              #[cfg(not(any(windows, target_os = "linux")))]
               {
                 let _ = link;
                 true
@@ -3580,7 +3753,9 @@ impl eframe::App for App {
           self.pending_credentials = None;
           self.push_log(Line::error(format!("service: {e}")));
           if !recovered {
-            let msg = if cancelled {
+            let msg = if unauthorized {
+              self.t().admin_unavailable.to_string()
+            } else if cancelled {
               self.t().admin_cancelled.to_string()
             } else {
               self.t().service_start_failed.to_string()
@@ -3647,6 +3822,9 @@ impl eframe::App for App {
     }
 
     // A left click on the tray icon shows the window, a double click hides it.
+    // Windows only: the Linux backend delivers no click event at all, so there
+    // the tray menu is the only way in (and out).
+    #[cfg(windows)]
     match tray_click() {
       Some(true) => self.show_window(ctx),
       Some(false) => self.hide_window(ctx),
@@ -3693,8 +3871,11 @@ impl eframe::App for App {
     }
 
     // Keep ticking while hidden so tray clicks are still processed. The icon
-    // and the tooltip come from the same words as the window's state line.
+    // (and, on Windows, the tooltip) come from the same words as the window's
+    // state line.
     let t = self.t();
+    // `label` feeds the tooltip below only, and that is Windows-only.
+    #[cfg_attr(not(windows), allow(unused_variables))]
     let (label, rgb) = self.state_display(t);
     if self.tray_rgb != Some(rgb) {
       self.tray_rgb = Some(rgb);
@@ -3702,12 +3883,17 @@ impl eframe::App for App {
         let _ = tray.set_icon(Some(make_icon(rgb)));
       }
     }
-    let tip = match self.state {
-      State::Online => format!("THUnet · {label} · {}", dash(&self.info.ip4)),
-      _ => format!("THUnet · {label}"),
-    };
-    if let Some(tray) = &self.tray {
-      let _ = tray.set_tooltip(Some(&tip));
+    // The tooltip is Windows-only: `set_tooltip` is a no-op in the Linux
+    // backend, so there it would just build a string nobody reads.
+    #[cfg(windows)]
+    {
+      let tip = match self.state {
+        State::Online => format!("THUnet · {label} · {}", dash(&self.info.ip4)),
+        _ => format!("THUnet · {label}"),
+      };
+      if let Some(tray) = &self.tray {
+        let _ = tray.set_tooltip(Some(&tip));
+      }
     }
     self
       .connect_item
@@ -3991,13 +4177,34 @@ mod foreground {
 /// Entry time of `run`, for the "startup: N ms to tray" log line.
 static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// Is this a Wayland session with no XWayland behind it?
+///
+/// `run_with` asks for X11 whenever `DISPLAY` is set, and hides the window by
+/// hiding the toplevel; winit cannot do that on Wayland, so the sessions that
+/// end up here need the minimising fallback instead.
+fn wayland_without_x11() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    let forced = std::env::var("THUNET_UNIX_BACKEND").is_ok_and(|v| v == "wayland");
+    (forced || std::env::var_os("DISPLAY").is_none())
+      && std::env::var_os("WAYLAND_DISPLAY").is_some()
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    false
+  }
+}
+
 /// Left clicks counted in the current burst: 0 = nothing pending, 1 = one click
 /// waiting for the double-click deadline, 2 = a double click.
+#[cfg(windows)]
 static CLICKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// When the latest left click arrived, in ms since `STARTED`; 0 = no click yet.
+#[cfg(windows)]
 static LAST_CLICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(windows)]
 fn now_ms() -> u64 {
   // 0 is the "no click yet" sentinel, so the clock starts at 1.
   STARTED
@@ -4008,16 +4215,19 @@ fn now_ms() -> u64 {
 /// A second left click inside this window counts as a double click. 300 ms is
 /// snappier than the 500 ms most desktops use; the delay is a compromise, since
 /// a single click can only be acted on once no second click can follow.
+#[cfg(windows)]
 const DOUBLE_CLICK_MS: u64 = 300;
 
 /// Does the click at `now` follow `previous` closely enough to be the second
 /// half of a double click? `previous == 0` means there was no click.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn is_double_click(previous: u64, now: u64, deadline: u64) -> bool {
   previous != 0 && now.saturating_sub(previous) <= deadline
 }
 
 /// What a pending click burst means: `None` waits for the deadline to pass,
 /// `Some(true)` shows the window, `Some(false)` hides it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn click_outcome(clicks: u8, since_last: u64, deadline: u64) -> Option<bool> {
   match clicks {
     2 => Some(false),
@@ -4027,6 +4237,7 @@ fn click_outcome(clicks: u8, since_last: u64, deadline: u64) -> Option<bool> {
 }
 
 /// Consume the pending left click, if it can be resolved already.
+#[cfg(windows)]
 fn tray_click() -> Option<bool> {
   use std::sync::atomic::Ordering;
 
@@ -4043,6 +4254,10 @@ fn tray_click() -> Option<bool> {
 /// click on the icon feel dead; the handler records the click and wakes egui.
 /// It must be registered before the icon exists, because the crate ignores a
 /// late registration once an event has gone through the default channel.
+///
+/// Windows only: the Linux backend never emits a `TrayIconEvent`, so there is
+/// nothing to handle.
+#[cfg(windows)]
 fn install_tray_events(ctx: &egui::Context) {
   use std::sync::atomic::Ordering;
 
@@ -4130,7 +4345,11 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
       .with_resizable(false)
       .with_visible(!minimized)
       .with_icon(std::sync::Arc::new(app_icon()))
-      .with_title("THUnet"),
+      .with_title(if crate::ipc::portable() {
+        "THUnet Portable"
+      } else {
+        "THUnet"
+      }),
     // The window size is fixed by the layout, so a stale persisted size (or a
     // previous position off-screen) must not override it on the next launch.
     persist_window: false,
@@ -4164,6 +4383,7 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
       // Must happen before `App::new`, which builds the tray menu.
       init_gtk().map_err(std::io::Error::other)?;
       let font = install_fonts(&cc.egui_ctx);
+      #[cfg(windows)]
       install_tray_events(&cc.egui_ctx);
       cc.egui_ctx.add_plugin(LogCopyClick::default());
       Ok(Box::new(App::new(cfg, minimized, font)))

@@ -290,17 +290,38 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
+  /// The uid the machine core runs as: the trust anchor for the machine
+  /// endpoint, and the answer to "may this process serve it?".
+  ///
+  /// `/run/thunet` is the anchor that works. systemd creates it for the unit
+  /// (`RuntimeDirectory=thunet`), owns it by the service account and leaves it
+  /// world-readable, and removes it when the unit stops. The state directory
+  /// cannot serve that purpose under `DynamicUser=` + `StateDirectory=`: the
+  /// real directory lives in `/var/lib/private/thunet` (mode 0700 root:root),
+  /// so the `/var/lib/thunet` symlink cannot even be stat()ed by an
+  /// unprivileged frontend - every window would refuse the real service. The
+  /// fallback keeps unit files that predate the runtime directory working (a
+  /// tarball install, `--state-dir`).
   pub fn expected_service_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata(crate::config::machine_dir())
-      .ok()
-      .map(|m| m.uid())
+    let runtime = std::path::Path::new("/run/thunet");
+    let fallback = crate::config::machine_dir();
+    let anchor = if runtime.is_dir() {
+      runtime
+    } else {
+      fallback.as_path()
+    };
+    std::fs::metadata(anchor).ok().map(|meta| meta.uid())
   }
 
+  /// May this process serve the machine endpoint?
+  ///
+  /// Root always may: it can read the sealed credential anyway, and a
+  /// hand-started `thunet core --machine` runs as root.
   pub fn is_current_service() -> bool {
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    expected_service_uid().is_some_and(|uid| uid == euid)
+    euid == 0 || expected_service_uid().is_some_and(|uid| uid == euid)
   }
 
   pub fn is_current_user(uid: u32) -> bool {

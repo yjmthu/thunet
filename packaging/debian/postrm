@@ -6,15 +6,53 @@ set -e
 # and key.bin, which must not outlive the product. `upgrade` and the
 # `abort-*`/`failed-upgrade` calls keep it, so upgrades and reinstalls do not
 # lose the account.
+#
+# The tray autostart entry is the one registration that lives in each user's
+# home, and XDG has no shared place for it, so the package is the only thing
+# that can remove it. Only the file this application writes is deleted:
+# `~/.config/thunet` (preferences, and the portable credential) and everything
+# else in the home stay, because they belong to the user, not to the package.
+# Homes come from `getent passwd` rather than an assumed `/home` (ostree uses
+# /var/home, root's is /root). A user whose XDG_CONFIG_HOME points somewhere
+# else is missed, which is harmless: a stale entry only makes the desktop try a
+# deleted executable once.
+remove_tray_entries() {
+  for home in $(getent passwd | awk -F: '$3 >= 1000 && $3 != 65534 && $7 !~ /(nologin|false)$/ {print $6}') /root; do
+    file="$home/.config/autostart/thunet.desktop"
+    [ -f "$file" ] || continue
+    grep -q thunet "$file" 2>/dev/null || continue
+    rm -f "$file" || true
+  done
+}
+
 case "${1:-}" in
   remove|purge)
-    rm -rf /var/lib/thunet
+    # `StateDirectory=thunet` under `DynamicUser=yes` keeps the real state in
+    # /var/lib/private/thunet (0700, owned by the transient service user) and
+    # leaves /var/lib/thunet as a symlink to it. `rm -rf` on the link removes
+    # the link only, so the sealed credential and the key would outlive the
+    # product; the private path needs naming explicitly.
+    rm -rf /var/lib/thunet /var/lib/private/thunet
+    remove_tray_entries
+    # Only a real uninstall drops the registration. This used to run for every
+    # invocation, including `upgrade`: dpkg calls the *old* package's
+    # `postrm upgrade` right after unpacking the new files, so installing over
+    # an existing package silently deleted
+    # `/etc/systemd/system/multi-user.target.wants/thunet.service` - autostart
+    # was gone afterwards, and `postinst` then saw the unit as disabled and
+    # never restarted the core.
+    if [ -d /run/systemd/system ]; then
+      systemctl disable thunet.service || true
+      systemctl daemon-reload || true
+    fi
+    ;;
+  *)
+    # upgrade / failed-upgrade / abort-*: the package stays, so its unit, its
+    # boot symlink and its machine state stay too.
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+    fi
     ;;
 esac
-
-if [ -d /run/systemd/system ]; then
-  systemctl disable thunet.service || true
-  systemctl daemon-reload || true
-fi
 
 exit 0

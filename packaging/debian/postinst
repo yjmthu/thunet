@@ -1,11 +1,30 @@
 #!/bin/sh
 set -e
 
+# Fresh install: the unit is unpacked but neither enabled nor started, exactly
+# like the MSI, which leaves the service unregistered. Registering the core is
+# the user's decision - *Start with the system* in the settings page, or
+# `thunet service enable`, both of which ask for administrator rights - and
+# starting it now is a separate, explicit `thunet service start` or the status
+# page's *Start* button. `enable` would make a machine-wide core come back at
+# every boot, and `restart` would put one into the 15-second network probe on a
+# machine whose owner has not asked for it yet.
+#
+# Upgrade: `prerm` stopped the service before dpkg replaced the binary, so
+# something has to bring the new one back, and the previous state decides
+# whether it may. `is-enabled` is the same rule the Windows `service-resume`
+# uses: start type `auto` -> start it again; autostart off -> leave it off, so
+# an upgrade cannot resurrect a session the user turned off. `$2` is the
+# previously configured version, which dpkg leaves empty on a first install.
 if [ -d /run/systemd/system ]; then
+  # dpkg unpacked the unit a moment ago; let the running manager see it so
+  # `systemctl status thunet` works immediately.
   systemctl daemon-reload || true
-  systemctl enable thunet.service || true
-  # Start it now as well; without a stored credential it simply idles.
-  systemctl restart thunet.service || true
+  if [ "${1:-}" = configure ] && [ -n "${2:-}" ]; then
+    if systemctl is-enabled --quiet thunet.service; then
+      systemctl start thunet.service || true
+    fi
+  fi
 fi
 
 exit 0

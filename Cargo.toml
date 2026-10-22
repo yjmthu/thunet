@@ -47,6 +47,12 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# `pixi run -e package deb-debug`. cargo-deb refuses the built-in `dev` profile,
+# so the debug package is built with this one instead: it inherits dev (debug
+# assertions, full symbols) and lands in `target/pkgdebug/`.
+[profile.pkgdebug]
+inherits = "dev"
+
 # Embeds assets/thunet.ico (and the version block) into the Windows executable.
 [build-dependencies]
 winresource = "0.1"
@@ -117,7 +123,10 @@ maintainer-scripts = "packaging/debian"
 # panics when absent, so both are hard dependencies. Alternatives cover
 # Debian <= 12 (libgtk-3-0 / libappindicator3-1) and Ubuntu >= 24.04
 # (libgtk-3-0t64 / libayatana-appindicator3-1).
-depends = "libc6, libgl1, libegl1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libfontconfig1, libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1"
+# `pkexec` is what the window uses to register, start and stop the service
+# (`pkexec` is its own package since polkit 123; Debian 12 still ships the same
+# binary inside `policykit-1`).
+depends = "libc6, libgl1, libegl1, libxkbcommon0, libwayland-client0, libx11-6, libxcursor1, libxi6, libxrandr2, libfontconfig1, libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, pkexec | policykit-1"
 extended-description = """\
 Tray client for the Tsinghua University campus network: logs in through the
 SRun portal, keeps the session alive, shows the assigned addresses and traffic,

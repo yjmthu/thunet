@@ -8,11 +8,13 @@
 //!
 //! * Linux: abstract socket `@thunet-control` in machine mode (any local uid
 //!   can connect; `SO_PEERCRED` is checked), or
-//!   `$XDG_RUNTIME_DIR/thunet/control.sock` (mode 0700) in portable mode,
+//!   `$XDG_RUNTIME_DIR/thunet-<state tag>/control.sock` (mode 0700) in portable
+//!   mode, where the tag comes from the state directory,
 //! * Windows: named pipe `\\.\pipe\thunet-control`, whose DACL grants the
 //!   service account, administrators and interactive users, while the window
 //!   runs in the user's session. The client checks the pipe's owner SID, so a
-//!   user-run process cannot impersonate the service.
+//!   user-run process cannot impersonate the service. A portable core gets
+//!   `\\.\pipe\thunet-control-<user>-<state tag>`, owner-only.
 //!
 //! `interprocess` covers the socket/pipe; on Windows the pipe is created through
 //! the same crate's named-pipe API, which takes the security descriptor.
@@ -40,6 +42,17 @@ use crate::proto::{Cmd, Ev, Failure, Msg, VERSION, Wire};
 
 /// Whether this process serves the machine-wide endpoint. Set by [`serve`].
 static MACHINE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the core runs in a thread of this process instead of a process of
+/// its own (portable mode, see [`host_core`]).
+static HOSTED: AtomicBool = AtomicBool::new(false);
+
+/// Asks a hosted core to end. The accept loop polls it; the worker returns.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// How often a hosted core looks for a stopped flag or a new connection.
+/// Below the shortest controller a human can click, so *Stop* feels immediate.
+const HOST_POLL: Duration = Duration::from_millis(10);
 
 /// How many recent events a frontend that connects late gets to see. Enough to
 /// fill the log pane (which shows a handful of lines) without growing forever.
@@ -91,9 +104,18 @@ fn endpoint(machine: bool) -> String {
   }
   use std::os::unix::fs::PermissionsExt as _;
 
+  // The state directory is part of the name: two portable setups of one user
+  // (two `--state-dir`s) are two independent cores, and a frontend must never
+  // attach to the other one's session.
   let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-    Some(base) => std::path::PathBuf::from(base).join("thunet"),
-    None => std::env::temp_dir().join(format!("thunet-{}", user_tag())),
+    Some(base) => {
+      std::path::PathBuf::from(base).join(format!("thunet-{}", crate::config::state_tag()))
+    }
+    None => std::env::temp_dir().join(format!(
+      "thunet-{}-{}",
+      user_tag(),
+      crate::config::state_tag()
+    )),
   };
   if std::fs::create_dir_all(&dir).is_ok() {
     // The socket inherits the directory's permissions: owner only.
@@ -110,10 +132,14 @@ fn endpoint(machine: bool) -> String {
     // window. Who may connect is decided by the pipe's DACL, not by the name.
     return "thunet-control".into();
   }
-  // A portable core is owned by the user who started it. Give it its own name:
-  // sharing the machine pipe would let it answer frontends while the service is
-  // stopped, and then `sc stop` would look like it did nothing.
-  format!("thunet-control-{}", user_tag())
+  // A portable core is owned by the user who started it, and belongs to one
+  // state directory: the tag keeps two setups of the same user apart, because
+  // sharing a name would let one window drive the other's session.
+  format!(
+    "thunet-control-{}-{}",
+    user_tag(),
+    crate::config::state_tag()
+  )
 }
 
 fn user_tag() -> String {
@@ -162,13 +188,32 @@ pub struct Hub(Arc<Mutex<Shared>>);
 
 #[derive(Default)]
 struct Shared {
-  clients: Vec<Sender<Ev>>,
+  clients: Vec<Client>,
   /// Replayed to late connections: log lines and toasts, newest last.
   history: VecDeque<Ev>,
   state: Option<crate::session::State>,
   env: Option<crate::proto::LoginEnv>,
   info: Option<serde_json::Value>,
   error: Option<Failure>,
+}
+
+/// One attached frontend.
+///
+/// The flag is what makes the count exact at the moment it is asked for: a
+/// `Sender` cannot tell whether its peer is still there (`std`'s `mpsc` has no
+/// `is_closed`), and pruning only inside `publish` means a frontend that left
+/// a moment ago is still counted until the next event happens to be
+/// published — which is exactly the delay an installer polling for "all
+/// windows gone" would pay twice.
+struct Client {
+  tx: Sender<Ev>,
+  live: Arc<AtomicBool>,
+}
+
+impl Client {
+  fn is_live(&self) -> bool {
+    self.live.load(Ordering::Relaxed)
+  }
 }
 
 impl Hub {
@@ -190,8 +235,15 @@ impl Hub {
       // frontend only needs them for the log pane.
       Ev::Log(line) => crate::diag::line(&line.render()),
       // Replies to one-off requests belong to the client that asked; they are
-      // not part of the state a late frontend needs.
-      Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::Credentials(_) | Ev::AcId(_) => {}
+      // not part of the state a late frontend needs. `Quit` is one-shot by
+      // definition: replaying it would end the window that was just started
+      // after the installation finished.
+      Ev::Notify { .. }
+      | Ev::Status(_)
+      | Ev::Core(_)
+      | Ev::Credentials(_)
+      | Ev::AcId(_)
+      | Ev::Quit => {}
     }
     // Only log lines are replayed: a toast belongs to the action that raised
     // it, and replaying one to a fresh frontend would look like news.
@@ -201,11 +253,14 @@ impl Hub {
         shared.history.pop_front();
       }
     }
-    shared.clients.retain(|tx| tx.send(ev.clone()).is_ok());
+    shared
+      .clients
+      .retain(|client| client.is_live() && client.tx.send(ev.clone()).is_ok());
   }
 
-  /// Register a new frontend and hand back what it missed.
-  fn attach(&self) -> (Receiver<Ev>, Vec<Ev>) {
+  /// Register a new frontend and hand back what it missed, plus the liveness
+  /// handle its connection threads have to clear when they end.
+  fn attach(&self) -> (Receiver<Ev>, Vec<Ev>, Arc<AtomicBool>) {
     let (tx, rx) = channel::<Ev>();
     let mut shared = match self.0.lock() {
       Ok(g) => g,
@@ -225,8 +280,12 @@ impl Hub {
       backlog.push(Ev::Error(Some(err)));
     }
     backlog.extend(shared.history.iter().cloned());
-    shared.clients.push(tx);
-    (rx, backlog)
+    let live = Arc::new(AtomicBool::new(true));
+    shared.clients.push(Client {
+      tx,
+      live: live.clone(),
+    });
+    (rx, backlog, live)
   }
 
   /// A `Sender<Ev>`-shaped handle for the worker loop.
@@ -234,11 +293,31 @@ impl Hub {
     Sink(self.clone())
   }
 
+  /// How many frontends are attached right now.
+  ///
+  /// Dead connections are dropped first, so the answer describes this instant
+  /// rather than the last time something happened to be published.
   fn frontends(&self) -> usize {
-    match self.0.lock() {
-      Ok(shared) => shared.clients.len(),
-      Err(poisoned) => poisoned.into_inner().clients.len(),
-    }
+    let mut shared = match self.0.lock() {
+      Ok(g) => g,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    shared.clients.retain(Client::is_live);
+    shared.clients.len()
+  }
+
+  /// End every attached connection.
+  ///
+  /// Closing the listener is not enough when a core stops: the connections it
+  /// already accepted stay open, and a window would sit on a link that never
+  /// answers again. Dropping the senders ends each writer thread, which closes
+  /// the peer's read side, so the frontend sees the ordinary "core went away".
+  fn close_all(&self) {
+    let mut shared = match self.0.lock() {
+      Ok(g) => g,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    shared.clients.clear();
   }
 }
 
@@ -368,49 +447,91 @@ pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
   let worker_hub = hub.clone();
   std::thread::spawn(move || crate::core::worker(cfg, cmd_rx, worker_hub.sink()));
 
-  // One accept loop for the life of the process; each connection gets its own
+  // One accept loop for the life of the core; each connection gets its own
   // reader and writer thread so a stalled frontend cannot block the others.
-  for stream in listener.incoming() {
-    match stream {
-      Ok(stream) => {
-        #[cfg(windows)]
-        {
-          let cmds = cmd_tx.clone();
-          let hub = hub.clone();
-          // Impersonation only works after the server has read from the pipe,
-          // so reading the first line happens in this connection's own thread
-          // (a silent client must not block the accept loop).
-          std::thread::spawn(move || handle_windows_connection(stream, cmds, hub));
-        }
-        #[cfg(unix)]
-        {
-          let peer = peer_of(&stream);
-          crate::diag::line(&format!(
-            "core: accepted connection from {} (interactive={})",
-            peer.label, peer.interactive
-          ));
-          if !peer.interactive {
-            // Fail closed, but tell the frontend why instead of letting it
-            // reconnect every two seconds with no explanation.
-            let (_, mut out) = stream.halves();
-            let line = Wire::ev(Ev::Log(crate::logline::Line::warn(format!(
-              "core rejected frontend: {}",
-              peer.label
-            ))));
-            let _ = write_line(&mut BufWriter::new(&mut out), &line);
-            crate::diag::line(&format!("core: rejected frontend {}", peer.label));
-            continue;
-          }
-          attach(stream, peer, cmd_tx.clone(), hub.clone(), String::new());
-        }
+  //
+  // A hosted core polls instead of blocking in `accept`, because it has to be
+  // stoppable without ending its host: `Cmd::Shutdown` sets the flag and the
+  // next tick breaks out of here. A core with a process of its own keeps the
+  // cheaper blocking wait - ending it means ending the process.
+  let polling = hosted();
+  if polling {
+    allow_polling(&listener)?;
+  }
+  loop {
+    if polling && stopping() {
+      crate::diag::line("core: stopping (its host asked)");
+      // The listener is about to go; the connections it already accepted have
+      // to go with it or the window keeps talking to nobody.
+      hub.close_all();
+      break;
+    }
+    match listener.accept() {
+      Ok(stream) => spawn_connection(stream, &cmd_tx, &hub),
+      Err(e) if polling && e.kind() == std::io::ErrorKind::WouldBlock => {
+        std::thread::sleep(HOST_POLL);
       }
       Err(e) => {
         crate::diag::line(&format!("core: accept failed: {e}"));
-        continue;
+        if polling {
+          std::thread::sleep(HOST_POLL);
+        }
       }
     }
   }
   Ok(Serve::Started)
+}
+
+/// Make `accept` return [`WouldBlock`](std::io::ErrorKind::WouldBlock) instead
+/// of waiting, so the accept loop can look at its stop flag.
+#[cfg(unix)]
+fn allow_polling(listener: &Listener) -> Result<(), String> {
+  use interprocess::local_socket::ListenerNonblockingMode;
+  listener
+    .set_nonblocking(ListenerNonblockingMode::Accept)
+    .map_err(|e| format!("cannot poll the hosted listener: {e}"))
+}
+
+/// The raw named-pipe listener has the same switch, spelled with a `bool`.
+#[cfg(windows)]
+fn allow_polling(listener: &Listener) -> Result<(), String> {
+  listener
+    .set_nonblocking(true)
+    .map_err(|e| format!("cannot poll the hosted listener: {e}"))
+}
+
+/// Hand one accepted connection to its own reader and writer threads.
+fn spawn_connection(stream: Stream, cmds: &Sender<Cmd>, hub: &Hub) {
+  #[cfg(windows)]
+  {
+    let cmds = cmds.clone();
+    let hub = hub.clone();
+    // Impersonation only works after the server has read from the pipe, so
+    // reading the first line happens in this connection's own thread (a silent
+    // client must not block the accept loop).
+    std::thread::spawn(move || handle_windows_connection(stream, cmds, hub));
+  }
+  #[cfg(unix)]
+  {
+    let peer = peer_of(&stream);
+    crate::diag::line(&format!(
+      "core: accepted connection from {} (interactive={})",
+      peer.label, peer.interactive
+    ));
+    if !peer.interactive {
+      // Fail closed, but tell the frontend why instead of letting it reconnect
+      // every two seconds with no explanation.
+      let (_, mut out) = stream.halves();
+      let line = Wire::ev(Ev::Log(crate::logline::Line::warn(format!(
+        "core rejected frontend: {}",
+        peer.label
+      ))));
+      let _ = write_line(&mut BufWriter::new(&mut out), &line);
+      crate::diag::line(&format!("core: rejected frontend {}", peer.label));
+      return;
+    }
+    attach(stream, peer, cmds.clone(), hub.clone(), String::new());
+  }
 }
 
 /// Read one newline-terminated line without consuming bytes past it.
@@ -586,7 +707,7 @@ fn connect(path: &str) -> Result<Stream, String> {
 fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: String) {
   // Subscribe before writing the backlog, so an event published in between
   // arrives exactly once through the channel (the backlog is a snapshot).
-  let (events, backlog) = hub.attach();
+  let (events, backlog, live) = hub.attach();
   crate::diag::line(&format!("core: frontend attached ({})", peer.label));
   hub.publish(Ev::Log(crate::logline::Line::debug(format!(
     "core: attached frontend ({})",
@@ -596,81 +717,95 @@ fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: S
 
   let writer_hub = hub.clone();
   let writer_label = peer.label.clone();
+  let writer_live = live.clone();
   std::thread::spawn(move || {
-    let mut out = BufWriter::new(send_half);
-    for ev in backlog {
-      if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
-        // A window that was closed (or upgraded) takes its pipe with it; that
-        // is the normal end of a frontend, not a failure worth a warning.
-        crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
-        writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-          "core: frontend went away: {e}"
-        ))));
-        return;
+    // The flag is cleared however this thread ends, including the early
+    // returns below: a frontend that is gone must stop being counted at once,
+    // not at the next publish.
+    (move || {
+      let mut out = BufWriter::new(send_half);
+      for ev in backlog {
+        if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
+          // A window that was closed (or upgraded) takes its pipe with it;
+          // that is the normal end of a frontend, not a failure worth a
+          // warning.
+          crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
+          writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+            "core: frontend went away: {e}"
+          ))));
+          return;
+        }
       }
-    }
-    for ev in events {
-      if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
-        crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
-        writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-          "core: frontend went away: {e}"
-        ))));
-        return;
+      for ev in events {
+        if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
+          crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
+          writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+            "core: frontend went away: {e}"
+          ))));
+          return;
+        }
       }
-    }
+    })();
+    writer_live.store(false, Ordering::Relaxed);
   });
 
   let reader_hub = hub.clone();
   let reader_label = peer.label.clone();
+  let reader_live = live;
   std::thread::spawn(move || {
-    let mut initial = first.into_bytes();
-    if !initial.is_empty() {
-      initial.push(b'\n');
-    }
-    let mut lines = BufReader::new(std::io::Cursor::new(initial).chain(recv_half)).lines();
-    loop {
-      let text = match lines.next() {
-        Some(Ok(text)) => text,
-        Some(Err(e)) => {
-          crate::diag::line(&format!("core: reader for {reader_label} failed: {e}"));
-          reader_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-            "core: frontend read failed: {e}"
-          ))));
-          break;
-        }
-        None => {
-          crate::diag::line(&format!("core: frontend {reader_label} disconnected"));
-          break;
-        }
-      };
-      if text.trim().is_empty() {
-        continue;
+    // Same as the writer: the count has to drop the moment the peer is gone,
+    // and this is the thread that notices that first.
+    (move || {
+      let mut initial = first.into_bytes();
+      if !initial.is_empty() {
+        initial.push(b'\n');
       }
-      let Ok(wire) = Wire::parse(&text) else {
-        reader_hub.publish(Ev::Log(crate::logline::Line::warn(
-          "core: malformed command from the frontend",
-        )));
-        continue;
-      };
-      match wire.msg {
-        Msg::Cmd(cmd) if wire.v == VERSION => {
-          if cmds.send(cmd).is_err() {
-            crate::diag::line(&format!("core: worker gone, dropping {reader_label}"));
+      let mut lines = BufReader::new(std::io::Cursor::new(initial).chain(recv_half)).lines();
+      loop {
+        let text = match lines.next() {
+          Some(Ok(text)) => text,
+          Some(Err(e)) => {
+            crate::diag::line(&format!("core: reader for {reader_label} failed: {e}"));
+            reader_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
+              "core: frontend read failed: {e}"
+            ))));
+            break;
+          }
+          None => {
+            crate::diag::line(&format!("core: frontend {reader_label} disconnected"));
+            break;
+          }
+        };
+        if text.trim().is_empty() {
+          continue;
+        }
+        let Ok(wire) = Wire::parse(&text) else {
+          reader_hub.publish(Ev::Log(crate::logline::Line::warn(
+            "core: malformed command from the frontend",
+          )));
+          continue;
+        };
+        match wire.msg {
+          Msg::Cmd(cmd) if wire.v == VERSION => {
+            if cmds.send(cmd).is_err() {
+              crate::diag::line(&format!("core: worker gone, dropping {reader_label}"));
+              return;
+            }
+          }
+          Msg::Cmd(_) => {
+            // Do not act on a message we may be reading with the wrong rules.
+            reader_hub.publish(Ev::Log(crate::logline::Line::error(format!(
+              "frontend speaks protocol {} but the core speaks {VERSION}; upgrade both halves",
+              wire.v
+            ))));
             return;
           }
+          // A core never receives events.
+          Msg::Ev(_) => {}
         }
-        Msg::Cmd(_) => {
-          // Do not act on a message we may be reading with the wrong rules.
-          reader_hub.publish(Ev::Log(crate::logline::Line::error(format!(
-            "frontend speaks protocol {} but the core speaks {VERSION}; upgrade both halves",
-            wire.v
-          ))));
-          return;
-        }
-        // A core never receives events.
-        Msg::Ev(_) => {}
       }
-    }
+    })();
+    reader_live.store(false, Ordering::Relaxed);
   });
 }
 
@@ -794,7 +929,9 @@ fn trusted_stream(stream: Stream, machine: bool) -> Result<Stream, String> {
     .map_err(|e| format!("peer_creds: {e}"))?;
   let uid = creds.euid().ok_or("peer has no effective uid")?;
   let trusted = if machine {
-    crate::ident::expected_service_uid() == Some(uid)
+    // Root is trusted as well: it can read the machine state anyway, and a
+    // hand-started `thunet core --machine` serves as root.
+    crate::ident::expected_service_uid() == Some(uid) || uid == 0
   } else {
     crate::ident::is_current_user(uid)
   };
@@ -940,83 +1077,135 @@ pub fn is_machine() -> bool {
 /// This is what a running frontend uses when reconnecting, so a core that was
 /// stopped on purpose (`systemctl stop`, `sc stop`) stays stopped instead of
 /// being resurrected by the window every two seconds. The machine endpoint is
-/// tried first; the per-user endpoint is the portable fallback.
+/// tried first unless this process is portable (see [`open_result`]).
 pub fn open() -> Option<Link> {
   open_result().ok()
 }
 
+/// Whether this process asked for a portable core.
+///
+/// One definition for the whole program: [`open_result`], [`core_is_service`]
+/// and the window's settings page all have to agree, otherwise "portable"
+/// would mean different things in different places. An empty
+/// `THUNET_STATE_DIR` counts as unset: `--state-dir ""` must not silently turn
+/// the machine service into a portable core.
+pub fn portable() -> bool {
+  std::env::var_os("THUNET_STATE_DIR").is_some_and(|v| !v.is_empty())
+}
+
 /// Like [`open`], but reports why neither endpoint answered.
+///
+/// A portable process only ever tries the portable endpoint. Being shadowed by
+/// the machine service is what made a hand-started portable core look broken:
+/// the window and the CLI would answer from the service (a different credential
+/// store, a different lifecycle) while the portable core sat there serving
+/// nobody. `core_is_service` gives the same answer, so "portable" means one
+/// thing everywhere.
 pub fn open_result() -> Result<Link, String> {
-  #[cfg(windows)]
-  {
-    match Link::connect_result(true) {
-      Ok(link) => Ok(link),
-      Err(machine) => Link::connect_result(false)
-        .map_err(|portable| format!("machine: {machine}; portable: {portable}")),
-    }
+  if portable() {
+    return Link::connect_result(false).map_err(|reason| format!("portable: {reason}"));
   }
-  #[cfg(unix)]
-  {
-    match Link::connect_result(true) {
-      Ok(link) => Ok(link),
-      Err(machine) => Link::connect_result(false)
-        .map_err(|portable| format!("machine: {machine}; portable: {portable}")),
-    }
+  match Link::connect_result(true) {
+    Ok(link) => Ok(link),
+    Err(machine) => Link::connect_result(false)
+      .map_err(|portable| format!("machine: {machine}; portable: {portable}")),
   }
+}
+
+/// Does starting a core here mean starting the machine service?
+///
+/// Linux and Windows have exactly one supported core: the service, started
+/// through systemd / the SCM. macOS has no machine service in this design, and
+/// an explicit `THUNET_STATE_DIR` asks for a portable core on every platform,
+/// so both of those host one instead (see [`host_core`]).
+///
+/// The frontend uses the same answer to decide where a credential belongs: the
+/// machine core reads the machine directory, so a credential typed while no
+/// core answers has to travel with the start that this function predicts.
+pub fn core_is_service() -> bool {
+  !portable() && (cfg!(any(windows, target_os = "linux")) || crate::autostart::core_managed())
 }
 
 /// Ask for a core without waiting for it to answer.
 ///
-/// The service manager is asked when the core is registered with it (a second,
-/// unmanaged copy would make `stop` useless and fight the unit's `Restart=`
-/// policy); otherwise a plain `thunet core` is spawned. The caller keeps its own
-/// reconnect cadence, and registering a start (`systemctl` / `schtasks`) runs
-/// synchronously, so this is a click-sized call, not a request to poll.
+/// One rule for every platform, so "portable" means the same thing everywhere:
+/// with [`core_is_service`] the service manager is asked (systemd on Linux, the
+/// SCM on Windows - both register the core on first use when necessary),
+/// otherwise the core is hosted in a thread of this process by [`host_core`].
+/// A second, unmanaged *machine* core would make `systemctl stop` / `sc stop`
+/// useless and would fight the unit's `Restart=` policy, which is why the two
+/// cases must not be mixed up.
 ///
 /// `restart` is for the upgrade case: a core that is already running keeps
 /// running the replaced image, and starting it again is a no-op, so the service
-/// has to be stopped and started to pick the new binary up.
+/// has to be stopped and started to pick the new binary up. A hosted core is
+/// this build by construction, so there is nothing to restart behind its back.
 pub fn start_core(restart: bool) -> Result<(), String> {
-  #[cfg(windows)]
-  {
-    // Windows has one supported core: the service. `Start` also registers it
-    // on first use, so a fresh MSI install never falls back to a user-run
-    // process that would own the machine endpoint.
-    let action = if restart {
-      crate::autostart::ServiceAction::Restart
-    } else {
-      crate::autostart::ServiceAction::Start
-    };
+  let action = if restart {
+    crate::autostart::ServiceAction::Restart
+  } else {
+    crate::autostart::ServiceAction::Start
+  };
+  if core_is_service() {
     return crate::autostart::Autostart::service(action, false).map(|_| ());
   }
-  #[cfg(not(windows))]
-  {
-    if crate::autostart::core_managed() {
-      let action = if restart {
-        crate::autostart::ServiceAction::Restart
-      } else {
-        crate::autostart::ServiceAction::Start
-      };
-      crate::autostart::Autostart::service(action, false)?;
-      Ok(())
-    } else {
-      // A portable core is not registered anywhere, so there is nothing to
-      // restart: the caller replacing it is the user closing it.
-      spawn_core()
-    }
-  }
+  // Portable: the core is a thread of this process, so there is nothing to
+  // restart by remote control - hosting it again *is* the restart, and a
+  // hosted core is always this build.
+  host_core()
 }
 
-#[cfg(not(windows))]
-fn spawn_core() -> Result<(), String> {
-  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
-  let mut cmd = std::process::Command::new(exe);
-  cmd
-    .arg("core")
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-  cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
+/// Whether the core of this process runs in one of its threads.
+pub fn hosted() -> bool {
+  HOSTED.load(Ordering::Relaxed)
+}
+
+fn stopping() -> bool {
+  STOP.load(Ordering::Relaxed)
+}
+
+/// Ask a hosted core to end: the accept loop and the worker both check it.
+///
+/// The window's *Stop* button and a `Cmd::Shutdown` on the control channel end
+/// up here. Nothing outside this process is touched.
+pub fn request_stop() {
+  STOP.store(true, Ordering::Relaxed);
+}
+
+/// Run a portable core in a thread of this process.
+///
+/// This is what makes portable mode one process: the window owns the core, the
+/// core ends when the window does, and there is no child to orphan. The
+/// endpoint is still served, so `thunet status` and `thunet quit` from a
+/// terminal keep working.
+///
+/// A core that already serves the endpoint (a hand-started `thunet core`, or a
+/// second click) is not an error: the thread ends at once with
+/// [`Serve::AlreadyRunning`] and the window talks to that core instead.
+pub fn host_core() -> Result<(), String> {
+  if HOSTED.swap(true, Ordering::Relaxed) {
+    return Err("this window already runs the core; stop it first".into());
+  }
+  STOP.store(false, Ordering::Relaxed);
+  let spawned = std::thread::Builder::new()
+    .name("thunet-core".into())
+    .spawn(|| {
+      match serve(Config::load(), false) {
+        Ok(Serve::Started) => {}
+        Ok(Serve::AlreadyRunning) => {
+          crate::diag::line("core (hosted): another core already serves the endpoint");
+        }
+        Err(e) => crate::diag::line(&format!("core (hosted): {e}")),
+      }
+      // The next *Start* has to see "nothing is hosted" again, whatever ended
+      // the thread.
+      HOSTED.store(false, Ordering::Relaxed);
+    });
+  if let Err(e) = spawned {
+    HOSTED.store(false, Ordering::Relaxed);
+    return Err(format!("cannot start the core thread: {e}"));
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -1152,7 +1341,7 @@ mod tests {
     hub.publish(Ev::Log(Line::info("first")));
     hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
-    let (_rx, backlog) = hub.attach();
+    let (_rx, backlog, _live) = hub.attach();
     // Snapshot first, then the replayed log lines.
     assert!(matches!(backlog[0], Ev::State(State::Online)));
     assert!(matches!(backlog[1], Ev::Env(LoginEnv::Campus)));
@@ -1163,8 +1352,8 @@ mod tests {
   #[test]
   fn every_attached_frontend_receives_events() {
     let hub = Hub::new();
-    let (first, _) = hub.attach();
-    let (second, _) = hub.attach();
+    let (first, _, _live1) = hub.attach();
+    let (second, _, _live2) = hub.attach();
     hub.publish(Ev::Notify {
       msg: "hi".into(),
       kind: ToastKind::Ok,
@@ -1180,8 +1369,72 @@ mod tests {
     for i in 0..HISTORY + 20 {
       hub.publish(Ev::Log(Line::info(format!("line {i}"))));
     }
-    let (_rx, backlog) = hub.attach();
+    let (_rx, backlog, _live) = hub.attach();
     assert_eq!(backlog.len(), HISTORY);
+  }
+
+  /// A hosted core (portable mode) has to stop on request *without* ending the
+  /// process it lives in, and it has to let go of the endpoint **and** of the
+  /// connections it already accepted. Ignored by default because it binds the
+  /// live per-user endpoint; run it alone:
+  ///
+  /// ```text
+  /// XDG_RUNTIME_DIR=/tmp/tt cargo test -- --ignored a_hosted_core_stops_without_ending_its_host
+  /// ```
+  #[test]
+  #[ignore = "binds the live core endpoint; run by hand"]
+  fn a_hosted_core_stops_without_ending_its_host() {
+    // An empty state directory keeps this from picking up the real account:
+    // the hosted worker would otherwise use whatever `auto_connect` says.
+    // SAFETY: only one test runs in this process (`--ignored` with one name),
+    // and this happens before the core thread starts.
+    let state = std::env::temp_dir().join(format!("thunet-hosted-{}", std::process::id()));
+    unsafe { std::env::set_var("THUNET_STATE_DIR", &state) };
+
+    host_core().expect("hosting the core");
+    let mut link = None;
+    for _ in 0..50 {
+      std::thread::sleep(Duration::from_millis(100));
+      if let Some(l) = Link::connect(false) {
+        link = Some(l);
+        break;
+      }
+    }
+    let link = link.expect("the hosted core never answered");
+
+    // Exactly what the window's *Stop* button sends.
+    link.send(Cmd::Shutdown);
+    // A hosted core cannot report this over the socket - both halves of the
+    // connection live in this process, so no EOF is ever sent. What the window
+    // watches instead is the hosting side: the thread ends and the endpoint
+    // stops accepting. That is what this asserts.
+    let mut released = false;
+    for _ in 0..200 {
+      if !hosted() && Link::connect(false).is_none() {
+        released = true;
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(released, "the hosted core kept serving after Stop");
+    // And the hosting slot is free again - in this very process, which is the
+    // whole point of hosting instead of spawning.
+    host_core().expect("hosting again after a stop");
+    for _ in 0..100 {
+      std::thread::sleep(Duration::from_millis(25));
+      if Link::connect(false).is_some() {
+        break;
+      }
+    }
+    request_stop();
+    for _ in 0..200 {
+      if !hosted() {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!hosted(), "the second hosted core never stopped");
+    let _ = std::fs::remove_dir_all(&state);
   }
 
   /// Full round trip over the real endpoint: a core in a thread, a frontend

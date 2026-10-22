@@ -77,7 +77,7 @@ The window has exactly two pages, switched with the gear in the top-right corner
 | `Link` | Which interface carries the default route: `Ethernet` / `WLAN` / `No link`. With a cable and Wi-Fi both up it names the one the OS actually routes on — the first thing to look at when a session appears to come and go |
 | `IPv4` / `IPv6` | Addresses assigned by the campus network, each with a **Copy** button |
 | `Session traffic` | Bytes downloaded / uploaded during this session |
-| `Service` | Whether a core is answering, with its version and uptime; it turns to `not running` as soon as the core is stopped. The button beside it stops or starts that process — like `thunet service stop`, it never closes the window |
+| `Service` | Whether a core is answering, with its version and uptime; it turns to `not running` as soon as the core is stopped. The button beside it stops or starts that process — like `thunet service stop`, it never closes the window. In a portable setup the row is called `Core`, says `runs in this window`, and has no button: there the core is a thread of the window and cannot outlive it |
 | **Connect** / **Disconnect** / **Refresh** | Manual actions; only the ones that make sense are enabled |
 | Log strip | The most recent events, newest at the bottom |
 
@@ -128,11 +128,11 @@ The build stamp shows the version on the left and, on the right, the local time 
 
 ### Tray icon
 
-**Left-click the tray icon** to show the window (or to bring an existing one back to the front); **double-click** it to hide the window again. Telling the two apart takes a fixed 300 ms, so a single click acts once that delay has passed.
+**Left-click the tray icon** to show the window (or to bring an existing one back to the front); **double-click** it to hide the window again. Telling the two apart takes a fixed 300 ms, so a single click acts once that delay has passed. **Windows only**: the Linux tray is an AppIndicator, which reports no clicks and has no tooltip, so use `Show window` / `Hide window` in its menu there and read the state from the window.
 
 **Right-click** for `Show window`, `Hide window`, `Connect`, `Disconnect` and `Quit`.
 
-Closing the window hides it — the app keeps working. `Quit` ends the window and its tray icon only: the background service keeps running, whatever the autostart mode says, and is stopped explicitly from the status page's *Stop* button or with `thunet service stop`.
+Closing the window hides it — the app keeps working. `Quit` ends the window and its tray icon only: the background service keeps running, whatever the autostart mode says, and is stopped explicitly from the status page's *Stop* button or with `thunet service stop`. A portable setup has no service to outlive the window — the core *is* a thread of it — but the two are tied to the same lifecycle: closing only hides both, and `Quit` ends both.
 
 ### Feedback messages
 
@@ -140,7 +140,9 @@ Every action answers with a coloured strip at the bottom of the window: **green*
 
 ## 3. Everyday tasks
 
-**Start the service** — the window never starts it by itself: while the `Service` row says `not running`, click **Start** next to it (or run `thunet service start`). On Windows, if the service is not registered yet, **Start** registers it first (one administrator prompt) and then asks the SCM to start it; it never falls back to a user-run process. A red banner at the top of the Status page says the same until a service answers again. **Stop** ends the machine service (or asks a portable core to exit through the control channel) and leaves the window open.
+**Start the service** — the window never starts it by itself: while the `Service` row says `not running`, click **Start** next to it (or run `thunet service start`). On Windows, if the service is not registered yet, **Start** registers it first (one administrator prompt) and then asks the SCM to start it; it never falls back to a user-run process. A red banner at the top of the Status page says the same until a service answers again. **Stop** ends the machine service and leaves the window open.
+
+The one exception is a portable setup (`--state-dir` / `THUNET_STATE_DIR`), where both platforms behave identically and there is no service at all: the core is a thread of the window, started with it and ended with it, so the status page has no *Start* / *Stop* / *Restart* — only a `Core` row that says `runs in this window`. Starting it again means naming the same directory (`thunet --state-dir …`); a bare `thunet` is machine mode, and `thunet core --state-dir …` runs the same core without a window. The `thunet service` verbs refuse to run in that mode for the same reason: they would act on the machine service while the window is looking at a separate, portable core.
 
 **Log in and out** — use the buttons on the Status page, the tray menu, or `thunet login` / `thunet logout`. If a session already exists the client says so instead of authenticating twice.
 
@@ -290,7 +292,7 @@ Uninstalling while THUnet is running is safe: the MSI asks the window to quit th
 
 Because that step also runs for upgrades and repairs, every interactive install (UILevel ≥ 4) starts the app again once the transaction is finished. It does so through the desktop shell's own `ShellExecute` (the WiX util extension's `WixUnelevatedShellExec`), which runs the tray with the user's own token instead of inheriting the installer's elevation — asking `explorer.exe` to do it opened a folder window instead of the app on some machines. A silent install (`msiexec /qn`, winget) does not start anything, so it never hijacks a desktop. Double-clicking the package while it is already installed therefore ends with the app running rather than with a closed copy.
 
-Autostart registration is split by platform. The Linux package ships and enables the **system** unit, so the core is already there after `apt install`; on Windows the app registers the service the first time you pick a service mode or click **Start** (administrator), and the tray entry is per user in both cases. The state is read back from the OS instead of stored in `config.json`. There are two entries (tray and background service) and three modes:
+Autostart registration is split by platform, but the rule is the same on both: **installing the package registers nothing that runs**. The Linux package ships the system unit and leaves it disabled; on Windows the service does not even exist until the app creates it. The core is registered the first time you pick a service mode or click **Start** (administrator), and the tray entry is per user. An upgrade keeps the previous state: a service that was enabled comes back on the new binary, one that was off stays off. The state is read back from the OS instead of stored in `config.json`. There are two entries (tray and background service) and three modes:
 
 | Mode | Linux | Windows |
 | --- | --- | --- |
@@ -405,6 +407,7 @@ Packaging lives in the `package` pixi environment and produces everything in `di
 pixi run -e package msi        # Windows: thunet-<version>-x64.msi       (WiX v5)
 pixi run -e package msi-debug  # Windows: thunet-<version>-x64-debug.msi (debug binary, fast)
 pixi run -e package deb        # Debian/Ubuntu: thunet_<version>-1_amd64.deb
+pixi run -e package deb-debug  # Debian/Ubuntu: thunet_<version>-1debug_amd64.deb (debug binary, fast)
 pixi run -e package tarball    # any Linux: thunet-<version>-linux-x64.tar.gz
 ```
 
@@ -426,6 +429,7 @@ Notes:
 
 - **The version has one source of truth: `Cargo.toml`.** The packaging scripts read it and pass it on (`wix build -d Version=…`, `cargo deb`, the tarball name), so nothing has to be edited by hand when bumping. An ad-hoc build can override it: `pwsh -File scripts/build_msi.ps1 -Version 0.2.0` or `bash scripts/build_tarball.sh 0.2.0`.
 - **`msi-debug` packages `target/debug/thunet.exe`** (`build_msi.ps1 -BinPath … -Suffix -debug`) and skips the release profile's LTO, which is what makes the local loop slow. The resulting installer has the same product identity and install location as the release one, so installing it replaces whatever is installed; the settings footer shows `Debug` to make that obvious.
+- **`deb-debug` packages a debug build of the same `.deb`.** cargo-deb refuses the built-in `dev` profile, so the build uses the `pkgdebug` profile (`target/pkgdebug/`, debug assertions and symbols kept, `--no-strip`); the `1debug` revision names the file and sorts above the release package, and the settings footer shows `Debug`.
 - `dotnet` and WiX are installed inside `.pixi/` — nothing is added to your global .NET tool list and no admin rights are needed.
 - Binaries are unsigned; Windows SmartScreen will warn on first run until a code signing certificate is used (`signtool sign /fd sha256 ...`).
 
@@ -454,6 +458,7 @@ Notes:
 - The saved password is sealed with a **random per-install key** (`key.bin`), and both it and `credential.bin` live in a directory only the service account and administrators can read: other users cannot read or copy it, and the control channel has no read-back command. An administrator/root can read the key or dump the core's memory, and a full-disk image without TPM binding can be decrypted. Section 13 explains the threat model and the ACL requirements.
 - **“Connected before login” no longer depends on a user's home directory.** The core's state is in `%ProgramData%\thunet` / `/var/lib/thunet`, created by the installer or by systemd's `StateDirectory=` before the core starts. An encrypted home directory is irrelevant to the machine-wide service.
 - The client trusts the portal's TLS certificate; `--http` exists for debugging only.
+- On Linux the core is a **systemd** unit (`DynamicUser=`, `StateDirectory=`, `Restart=always`), so a running systemd is a requirement. The `.deb` does not depend on the `systemd` package: that would conflict with sysvinit distributions, and a package dependency cannot express "systemd is *running*" (WSL and containers have the package without the daemon). Without systemd only a portable `thunet core` works, and the service modes plus the status page's *Start* report a failure.
 - `netsh`-based SSID detection needs Windows Location permission. Without it the client still works, but it cannot tell `Tsinghua-Secure` from a captive Wi-Fi — the internet probe then decides.
 - On Windows the core runs as a **service** under the virtual account `NT SERVICE\thunet`, because only a service can start before a login. It reads `%ProgramData%\thunet` (the path travels as `--state-dir`), and its control pipe is machine-wide: interactive users may read state and drive the session, while start/stop and registration stay administrator-only.
 - The single-instance guard brings the existing window back on every platform: Windows rings a session-local event, and on Linux/macOS the second launch leaves a marker file that the running instance polls, so the window is raised from inside the process that owns it.
@@ -499,13 +504,15 @@ Invariants:
 
 | | Windows | Linux |
 | --- | --- | --- |
-| Endpoint | service: `\\.\pipe\thunet-control` (global namespace); portable core: `\\.\pipe\thunet-control-<user>` | abstract socket `@thunet-control` (global in the network namespace) |
+| Endpoint | service: `\\.\pipe\thunet-control` (global namespace); portable core: `\\.\pipe\thunet-control-<user>-<state tag>` | abstract socket `@thunet-control` (global in the network namespace); portable core: `$XDG_RUNTIME_DIR/thunet-<state tag>/control.sock` |
 | Who may connect | service pipe: `SYSTEM`/`Administrators` full, `INTERACTIVE` (the well-known SID for users logged on interactively) read/write; portable pipe: only the user who started it | no file permissions; any local uid can connect |
 | Peer identity | `ImpersonateNamedPipeClient` → token SID + session id | `SO_PEERCRED` → `ucred{pid,uid,gid}` |
 | Server identity | `GetSecurityInfo` on the pipe handle → owner SID | `SO_PEERCRED` on the connected socket → server uid |
-| Policy | reject session 0 / non-interactive tokens | reject system accounts / uids without a logind session |
+| Policy | reject session 0 / non-interactive tokens | **any local uid**: the abstract socket carries no permissions and there is no logind lookup, so every account on the machine may drive the shared core |
 
 Both directions are checked. The core verifies that the caller is an interactive user; the window verifies that the process on the other end really is the service. Without the second check, a user could bind the free endpoint while the service is stopped and collect `SetCredentials` from other users' windows.
+
+The two platforms are not equally strict, and the table says so: on Linux the frontend-to-core check reduces to "the caller is local", because the abstract socket has no permissions and `is_interactive()` answers `true` for every uid. Any account on the machine can therefore send `Connect`, `Disconnect` or `SetCredentials` to the shared core, and read its state — the same accounts that could already edit `/var/lib/thunet` once they are root, and root can do anything on either platform. Tightening this (only uids with an active logind session) would need a D-Bus dependency and is deliberately not implemented.
 
 A filesystem socket (`$XDG_RUNTIME_DIR/thunet/control.sock`) is deliberately not used once the core is machine-wide: it is per user, so a second user's core would bind a different path and the "one core" rule would silently fail. An abstract socket has the same global-name property as a named pipe without needing a writable shared directory.
 
@@ -525,7 +532,7 @@ A filesystem socket (`$XDG_RUNTIME_DIR/thunet/control.sock`) is deliberately not
 
 If zero-elevation recovery after the core is stopped were required, both sides would have to be opened up: on Windows, grant `INTERACTIVE` (the well-known SID for users logged on interactively, mentioned above) start/stop rights on the core service's DACL; on Linux, add a polkit rule that allows only `start` and `stop` on `thunet.service`. This project chooses the stricter side: **starting and stopping the core is administrator-only on both platforms**. The service manager starts it at boot and restarts it after a crash; the window can only ask the elevation helper, and the control channel has no command that stops the core.
 
-The machine core has no `Shutdown` command on the control channel: the status page's *Stop* button calls SCM / systemd through the elevation helper, so the same authorization applies everywhere. A portable core does accept `Shutdown`, because it belongs to the user who started it; after the window disconnects, no frontend starts a machine core on its own. A core that exits by itself (fatal error, upgrade) is restarted by the service manager.
+The machine core has no `Shutdown` command on the control channel: the status page's *Stop* button calls SCM / systemd through the elevation helper, so the same authorization applies everywhere. A portable core does accept `Shutdown`: a hosted one stops its own core thread and leaves the window running, and a hand-started `thunet core` exits. After the window disconnects, no frontend starts a machine core on its own. A core that exits by itself (fatal error, upgrade) is restarted by the service manager.
 
 `host`, `https` and the keepalive target are **machine configuration**, not user preferences. Letting an ordinary user change `host` would let them point the core at a portal they control and read the password: the SRun login encrypts `info` with a token chosen by the server, so the server can always decrypt it. The window and the control channel expose no way to change these values.
 
@@ -574,7 +581,7 @@ Two more practices for shared machines:
 - Linux: the package ships a system unit with `DynamicUser=yes` and `StateDirectory=thunet`; `postinst` runs `systemctl enable --now thunet.service`.
 - This version does not migrate older layouts. If an older per-user install left a `credential.bin`, `key.bin` or `systemd --user` unit behind, remove it by hand before enabling the service; leftover files are simply ignored.
 - A real uninstall removes the machine directory: on Windows the MSI runs `service-purge` after deleting the service, on Linux `postrm` removes `/var/lib/thunet`. The account, `credential.bin` and `key.bin` therefore do not outlive the package. An upgrade, a repair or a reinstall keeps them.
-- Portable/dev mode keeps `--state-dir` and a per-user core; it is not the supported multi-user configuration.
+- Portable/dev mode keeps `--state-dir` and a core that runs inside the window's own process; it is not the supported multi-user configuration. Because every autostart mode registers something with systemd / the SCM, the settings page hides that row in portable mode (the core ends with the window). `thunet service <action>` refuses to run under a state directory for the same reason — there is no service to act on — with one exception: the read-only `thunet service status` still reports what the platform's service manager says about the machine service. Adding `--machine` to any command makes it ignore `THUNET_STATE_DIR` for that one invocation (`thunet --machine service start` from a portable shell), which is also what the Windows installer passes to `quit`, so a variable inherited from the shell that started msiexec cannot retarget it at a portable endpoint.
 
 ## 14. License
 

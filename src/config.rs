@@ -107,6 +107,32 @@ fn state_dir() -> PathBuf {
   base.join("thunet")
 }
 
+/// A short, stable tag for a state directory.
+///
+/// Portable mode is keyed by *(user, state directory)*, not by user alone: the
+/// control endpoint and the single-instance guard both carry this tag, so two
+/// portable setups of the same user never share a core, and a window can never
+/// silently talk to the core of another setup.
+///
+/// FNV-1a over the lexically absolute path: no filesystem access, so both
+/// halves compute the same tag whether or not the directory exists yet, and the
+/// value does not change between builds. Eight hex digits are plenty - a
+/// collision would need two state directories of one user to hash together.
+pub fn state_tag_for(dir: &std::path::Path) -> String {
+  let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+  let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+  for byte in dir.to_string_lossy().as_bytes() {
+    hash ^= u64::from(*byte);
+    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+  }
+  format!("{:08x}", hash >> 32)
+}
+
+/// The tag for the state directory this process uses.
+pub fn state_tag() -> String {
+  state_tag_for(&state_dir())
+}
+
 /// Machine-wide state: the shared account, the portal host and the sealed
 /// credential. Only the core (and an administrator) may read it.
 pub fn machine_dir() -> PathBuf {
@@ -260,5 +286,18 @@ mod tests {
     assert!(!cfg.start_minimized, "start-minimized is opt-in");
     assert!(cfg.password.is_empty());
     assert_eq!(cfg.log_level, "info", "debug output is opt-in");
+  }
+
+  /// The endpoint and the single-instance guard are keyed by this tag, so it
+  /// has to be short, deterministic, and different for every state directory.
+  #[test]
+  fn every_state_directory_gets_its_own_tag() {
+    let one = state_tag_for(std::path::Path::new("/tmp/p-one"));
+    let two = state_tag_for(std::path::Path::new("/tmp/p-two"));
+    assert_eq!(one.len(), 8, "the tag has to stay a short name: {one}");
+    assert_ne!(one, two, "two setups must never share an endpoint");
+    // The same directory has to hash the same every time - the core and the
+    // window compute it independently.
+    assert_eq!(one, state_tag_for(std::path::Path::new("/tmp/p-one")));
   }
 }

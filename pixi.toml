@@ -99,3 +99,14 @@ msi-debug = { cmd = "pwsh -NoProfile -File scripts/build_msi.ps1 -BinPath target
 # The conda linker injects an absolute rpath pointing into this pixi
 # environment; strip it so the tarball/deb use the system GTK at runtime.
 release = "cargo build --release && patchelf --remove-rpath target/release/thunet"
+
+# Local debugging: same binary layout as `msi-debug`, without the release
+# profile's LTO. `cargo-deb` refuses the built-in dev profile, so the build uses
+# the `pkgdebug` profile from Cargo.toml, and `--no-strip` keeps its symbols.
+# `--no-build` reuses the binary `debug` already built and patched; the
+# `1debug` revision marks the file and sorts above the plain `-1` package.
+debug = "cargo build --profile pkgdebug && patchelf --remove-rpath target/pkgdebug/thunet"
+deb-debug = { cmd = "cargo deb --no-build --profile pkgdebug --no-strip --deb-revision 1debug -o dist", depends-on = [
+  "deb-tool",
+  "debug",
+] }

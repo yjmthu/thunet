@@ -27,6 +27,7 @@ _thunet() {
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 '-V[Print version]' \
@@ -54,6 +55,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -72,6 +74,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -90,6 +93,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -108,6 +112,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -126,6 +131,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -143,9 +149,9 @@ _arguments "${_arguments_options[@]}" : \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--service[Started by the Windows service manager; not for humans]' \
-'--machine[Run against the machine-wide state directory and endpoint. The Linux system unit passes this; a user-run core stays portable]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -164,6 +170,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':action:((install\:"Register the unit / task without starting anything"
@@ -190,6 +197,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':action:((install\:"Register the unit / task without starting anything"
@@ -216,6 +224,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -234,6 +243,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -250,8 +260,10 @@ _arguments "${_arguments_options[@]}" : \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
+'--all-sessions[Ask the core to end every attached window, not just this session'\''s]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -270,6 +282,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -288,6 +301,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -306,6 +320,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':shell:(bash elvish fish powershell zsh)' \

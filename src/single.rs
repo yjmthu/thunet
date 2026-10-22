@@ -75,10 +75,23 @@ mod imp {
   /// Auto-reset event that asks the primary instance to quit for good.
   static QUIT: AtomicIsize = AtomicIsize::new(0);
 
-  /// Session-local names: one window per session.
-  const SHOW_EVENT: &str = r"Local\thunet-show-window";
-  const QUIT_EVENT: &str = r"Local\thunet-quit";
-  const INSTANCE_MUTEX: &str = r"Local\thunet-single-instance";
+  /// Session-local names: one window per session **and state directory**.
+  ///
+  /// The tag is what keeps two portable setups of one user apart: without it a
+  /// second window would attach to the first one's core and drive that
+  /// session.
+  fn show_name() -> String {
+    format!(r"Local\thunet-{}-show-window", crate::config::state_tag())
+  }
+  fn quit_name() -> String {
+    format!(r"Local\thunet-{}-quit", crate::config::state_tag())
+  }
+  fn instance_name() -> String {
+    format!(
+      r"Local\thunet-{}-single-instance",
+      crate::config::state_tag()
+    )
+  }
 
   /// Primary-instance mutex. Kept here (not in the `Guard`) so a process that
   /// is about to hand over to a freshly spawned successor can close it first.
@@ -90,7 +103,7 @@ mod imp {
 
   pub fn acquire() -> Option<super::Guard> {
     // A session-local mutex: per-user, released automatically on exit.
-    let name = wide(INSTANCE_MUTEX);
+    let name = wide(&instance_name());
     // SAFETY: plain Win32 call; the handle is leaked on purpose so the mutex
     // lives for the rest of the process.
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
@@ -102,10 +115,10 @@ mod imp {
       MUTEX.store(handle as isize, Ordering::Relaxed);
       // Created before the guard is returned, so a second launch can only ever
       // find it once this process is the running instance.
-      let ev = wide(SHOW_EVENT);
+      let ev = wide(&show_name());
       let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, ev.as_ptr()) };
       SHOW.store(ev as isize, Ordering::Relaxed); // 0 = unavailable
-      let quit = wide(QUIT_EVENT);
+      let quit = wide(&quit_name());
       let quit = unsafe { CreateEventW(std::ptr::null(), 0, 0, quit.as_ptr()) };
       QUIT.store(quit as isize, Ordering::Relaxed);
       return Some(super::Guard {});
@@ -113,7 +126,7 @@ mod imp {
 
     // Ring the doorbell instead of touching the other process's window: its
     // own `logic()` turns this into a normal viewport command.
-    let ev = wide(SHOW_EVENT);
+    let ev = wide(&show_name());
     let ev = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, ev.as_ptr()) };
     if !ev.is_null() {
       // SAFETY: the handle came from OpenEventW with EVENT_MODIFY_STATE.
@@ -148,7 +161,7 @@ mod imp {
   /// is destroyed and `OpenMutexW` starts failing with `FILE_NOT_FOUND`. That
   /// is the loop that replaces "spawn taskkill and hope".
   pub fn quit_and_wait(timeout: std::time::Duration) -> Result<(), String> {
-    let event = wide(QUIT_EVENT);
+    let event = wide(&quit_name());
     // SAFETY: plain Win32 calls on NUL-terminated names that outlive them.
     let doorbell = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event.as_ptr()) };
     if doorbell.is_null() {
@@ -160,7 +173,7 @@ mod imp {
       CloseHandle(doorbell);
     }
 
-    let name = wide(INSTANCE_MUTEX);
+    let name = wide(&instance_name());
     let deadline = std::time::Instant::now() + timeout;
     loop {
       // SAFETY: as above; a successful open is closed again immediately.
@@ -202,7 +215,10 @@ mod imp {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
       .map(PathBuf::from)
       .unwrap_or_else(std::env::temp_dir);
-    base.join("thunet.lock")
+    // One running window per **state directory**, not per user: two portable
+    // setups may run side by side, and neither may ring the other's doorbell.
+    // `quit_path`/`show_path` derive from this name, so they follow along.
+    base.join(format!("thunet-{}.lock", crate::config::state_tag()))
   }
 
   fn show_path() -> PathBuf {
@@ -210,6 +226,8 @@ mod imp {
   }
 
   fn quit_path() -> PathBuf {
+    // A `.deb` uninstall rings this marker from `packaging/debian/prerm`
+    // (the MSI uses `thunet quit`); renaming it there in the same commit.
     lock_path().with_extension("quit")
   }
 

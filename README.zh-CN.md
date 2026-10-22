@@ -69,7 +69,7 @@
 | `网络` | 承载本机默认路由的那条链路：`以太网` / `WLAN` / `未连接`。同时插网线和连 Wi-Fi 时，它说的是系统实际走的那条——会话忽然“一会儿在线一会儿离线”时先看这一行 |
 | `IPv4` / `IPv6` | 校园网分配的地址，各带一个**复制**按钮 |
 | `本次流量` | 本次会话的下载 / 上传字节数 |
-| `后台服务` | 是否有 core 在应答，以及它的版本和运行时长；core 一停（例如 `thunet service stop`）就立刻变成 `未运行`。右侧按钮用于在不关闭窗口的前提下停止 / 启动服务：运行中显示 `停止`，否则显示 `启动` |
+| `后台服务` | 是否有 core 在应答，以及它的版本和运行时长；core 一停（例如 `thunet service stop`）就立刻变成 `未运行`。右侧按钮用于在不关闭窗口的前提下停止 / 启动服务：运行中显示 `停止`，否则显示 `启动`。便携配置下这一行叫 `核心`、内容为 `随本窗口运行`，并且没有按钮：那里 core 是窗口的一个线程，不可能比窗口活得久 |
 | **连接** / **断开** / **刷新** | 手动操作，只启用当前有意义的那几个 |
 | 日志条 | 最近发生的事件，最新的在最下面 |
 
@@ -120,11 +120,11 @@
 
 ### 托盘图标
 
-**左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。区分两者需要固定等 300 ms，所以单击会在该延迟后生效。
+**左键单击**托盘图标显示窗口（或把已有窗口带到前台）；**双击**把它重新隐藏。区分两者需要固定等 300 ms，所以单击会在该延迟后生效。**仅 Windows**：Linux 的托盘走 AppIndicator，不上报点击、也没有 tooltip，请在菜单里用 `显示窗口` / `隐藏窗口`，状态看窗口或日志。
 
 **右键**弹出菜单：`显示窗口`、`隐藏窗口`、`连接`、`断开`、`退出`。
 
-关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或 `thunet service stop`。
+关闭窗口只是隐藏 —— 程序继续工作。`退出` 只结束窗口和它的托盘图标，后台服务照常运行（与开机自启档位无关）；要停服务请用状态页的「停止」按钮或 `thunet service stop`。便携配置没有能在窗口之外活下来的服务——核心本身就是窗口的一个线程——但两者的生死绑在一起：关窗只是把两者一起藏起来，`退出` 才是真的结束它们。
 
 ### 提示消息
 
@@ -132,7 +132,9 @@
 
 ## 3. 日常操作
 
-**启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它右边的 **启动**（或执行 `thunet service start`）。Windows 上如果服务还没注册，**启动** 会先注册服务（一次管理员授权），再让 SCM 启动它，不会另起一个用户进程。在服务重新应答之前，状态页顶部会一直有一条红色横幅说明这一点。**停止** 会结束整机服务（便携 core 则通过控制通道退出），但窗口保持打开。
+**启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它右边的 **启动**（或执行 `thunet service start`）。Windows 上如果服务还没注册，**启动** 会先注册服务（一次管理员授权），再让 SCM 启动它，不会另起一个用户进程。在服务重新应答之前，状态页顶部会一直有一条红色横幅说明这一点。**停止** 会结束整机服务，但窗口保持打开。
+
+唯一的例外是便携配置（`--state-dir` / `THUNET_STATE_DIR`）：两个平台行为一致，而且那里根本没有服务——核心是窗口的一个线程，随窗口启动、随窗口结束，所以状态页没有 *启动* / *停止* / *重启*，只有一行 `核心` 写着 `随本窗口运行`。启动它要重新带上同一个状态目录（裸 `thunet` 是机器模式），不想要窗口就用 `thunet core` 跑同一个核心，结束它用 `thunet quit`。`thunet service` 这套动词在这个模式下会直接拒绝，理由相同：它们作用于整机服务，而你眼前这套是独立的便携核心。
 
 **登录与注销** —— 用状态页的按钮、托盘菜单，或者 `thunet login` / `thunet logout`。如果会话已经存在，客户端会直接告诉你，而不是重复认证。
 
@@ -280,7 +282,7 @@ MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安
 
 因为让窗口退出这一步在升级和修复时也会执行，所以每次**交互式**安装（UILevel ≥ 4）在事务结束后会重新启动程序。启动走的是桌面外壳自己的 `ShellExecute`（WiX util 扩展的 `WixUnelevatedShellExec`），托盘拿到的是用户自己的令牌，而不是安装程序的提权令牌；早先让它去调用 `explorer.exe`，在部分机器上会弹出资源管理器窗口而不是启动程序。静默安装（`msiexec /qn`、winget）不会重启程序，因此不会抢占桌面。也就是说，在已安装的情况下再次双击安装包，最后程序是运行状态，而不是被关闭。
 
-开机自启的注册按平台分工：Linux 安装包自带并启用 **系统**单元，所以 `apt install` 之后 core 就已存在；Windows 上则在第一次选择服务档位或第一次点 **启动** 时由应用注册服务（需要管理员），托盘条目始终是每用户的。状态都直接从系统读回来，不写进 `config.json`。条目有两个（托盘、后台服务），模式有三档：
+开机自启的注册按平台分工，但规则一致：**装包不会注册任何会自动运行的东西**。Linux 包安装系统单元但保持未启用；Windows 上服务在应用创建之前根本不存在。core 在第一次选择服务档位或第一次点 **启动** 时才注册（需要管理员），托盘条目始终是每用户的。升级会沿用之前的状态：启用过的服务会用新二进制重新拉起，关着的仍然关着。状态都直接从系统读回来，不写进 `config.json`。条目有两个（托盘、后台服务），模式有三档：
 
 | 模式 | Linux | Windows |
 | --- | --- | --- |
@@ -395,6 +397,7 @@ release profile 使用 `lto`、`opt-level = "z"`、`codegen-units = 1`、`panic 
 pixi run -e package msi        # Windows: thunet-<version>-x64.msi       (WiX v5)
 pixi run -e package msi-debug  # Windows: thunet-<version>-x64-debug.msi（debug 二进制，快）
 pixi run -e package deb        # Debian/Ubuntu: thunet_<version>-1_amd64.deb
+pixi run -e package deb-debug  # Debian/Ubuntu: thunet_<version>-1debug_amd64.deb（debug 二进制，快）
 pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 ```
 
@@ -416,6 +419,7 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 
 - **版本号只有一个来源：`Cargo.toml`。** 打包脚本读取它并向下传递（`wix build -d Version=…`、`cargo deb`、tarball 文件名），所以升级版本号时不需要手改别处。临时构建可以覆盖：`pwsh -File scripts/build_msi.ps1 -Version 0.2.0` 或 `bash scripts/build_tarball.sh 0.2.0`。
 - **`msi-debug` 打包的是 `target/debug/thunet.exe`**（`build_msi.ps1 -BinPath … -Suffix -debug`），跳过 release 的 LTO，本地迭代因此快得多。它的产品标识和安装位置与正式包相同，所以安装它会替换掉已安装的版本；设置页面的构建标记会显示 `Debug`，避免混淆。
+- **`deb-debug` 打包的是同一个 `.deb` 的 debug 版本。** cargo-deb 不接受内置的 `dev` profile，所以用 `pkgdebug` profile 构建（产物在 `target/pkgdebug/`，保留 debug 断言和符号，`--no-strip`）；`1debug` 版本后缀体现在文件名里并排在正式包之后，设置页面的构建标记会显示 `Debug`。
 - `dotnet` 和 WiX 安装在 `.pixi/` 里 —— 不会加到你的全局 .NET 工具列表，也不需要管理员权限。
 - 二进制没有签名；在使用代码签名证书（`signtool sign /fd sha256 ...`）之前，Windows SmartScreen 会在首次运行时提示。
 
@@ -444,6 +448,7 @@ pixi run -e package tarball    # 任意 Linux: thunet-<version>-linux-x64.tar.gz
 - 保存的密码用**随机生成的每安装密钥**（`key.bin`）加密，密钥和 `credential.bin` 都放在只有服务账号和管理员可读的目录里：其他用户读不到、也复制不到，控制通道也没有读回命令。管理员/root 能读密钥或 dump core 内存；没有 TPM 绑定的整盘镜像也能解密。第 13 节给出威胁模型和 ACL 要求。
 - **“登录前联网”不再依赖某个用户的家目录。** core 的状态在 `%ProgramData%\thunet` / `/var/lib/thunet`，由安装器或 systemd 的 `StateDirectory=` 在 core 启动前创建。加密家目录与整机服务无关。
 - 客户端信任门户的 TLS 证书；`--http` 只用于调试。
+- Linux 上 core 是一个 **systemd** 单元（`DynamicUser=`、`StateDirectory=`、`Restart=always`），所以需要运行中的 systemd。`.deb` 不声明 `systemd` 依赖：那会与 sysvinit 发行版冲突，而且包依赖表达不了「systemd **正在运行**」（WSL 和容器里包装着但守护进程没跑）。没有 systemd 时只有便携 `thunet core` 可用，服务档位与状态页的 *启动* 按钮会报失败。
 - 基于 `netsh` 的 SSID 探测需要 Windows 定位权限。没有该权限时客户端仍可工作，但无法区分 `Tsinghua-Secure` 与需要认证的 Wi-Fi —— 此时由外网探测来决定。
 - Windows 上 core 以 **服务**（虚拟账号 `NT SERVICE\thunet`）运行，因为只有服务能比登录更早启动。它读 `%ProgramData%\thunet`（路径通过 `--state-dir` 传进去），控制管道是整机范围的：交互用户可以读状态、驱动会话，但启动/停止和注册服务只允许管理员。
 - 单实例保护在各平台都会把已有窗口叫回来：Windows 上通过会话内的命名事件，Linux/macOS 上第二次启动会留下一个标记文件，由正在运行的实例自己轮询并显示窗口。
@@ -489,13 +494,15 @@ flowchart LR
 
 | | Windows | Linux |
 | --- | --- | --- |
-| 端点 | 服务：`\\.\pipe\thunet-control`（全局命名空间）；便携 core：`\\.\pipe\thunet-control-<用户>` | abstract socket `@thunet-control`（同一网络命名空间内全局） |
+| 端点 | 服务：`\\.\pipe\thunet-control`（全局命名空间）；便携 core：`\\.\pipe\thunet-control-<用户>-<状态标签>` | abstract socket `@thunet-control`（同一网络命名空间内全局）；便携 core：`$XDG_RUNTIME_DIR/thunet-<状态标签>/control.sock` |
 | 谁可以连 | 服务管道：`SYSTEM`/`Administrators` 全权，`INTERACTIVE`（Windows 内置的“交互登录用户”安全标识）读写；便携管道：仅启动它的用户 | 无文件权限；任何本地 uid 都能连 |
 | 对端身份 | `ImpersonateNamedPipeClient` → token SID + session id | `SO_PEERCRED` → `ucred{pid,uid,gid}` |
 | 服务端身份 | 管道句柄的 `GetSecurityInfo` → owner SID | 已连接 socket 的 `SO_PEERCRED` → 服务端 uid |
-| 策略 | 拒绝 session 0 / 非交互 token | 拒绝系统账号 / 没有 logind 会话的 uid |
+| 策略 | 拒绝 session 0 / 非交互 token | **任何本地 uid**：abstract socket 本身没有权限位，也不查 logind，所以机器上每个账号都能驱动共享 core |
 
 两个方向都要检查：core 验证调用者是交互用户，窗口验证对面真的是服务。没有第二项检查，服务停着时任何用户都能抢占空闲端点，从其他用户的窗口里收走 `SetCredentials`。
+
+两个平台并不是一样严格的，上表已经写明了这一点：Linux 上「前端 → core」这一项退化成「调用者是本机进程」，因为 abstract socket 没有权限位，`is_interactive()` 对每个 uid 都返回 `true`。也就是说同一台机器上的其他账号可以给共享 core 发 `Connect`、`Disconnect`、`SetCredentials`，也可以读它的状态——那些账号只要拿到 root 本来也能改 `/var/lib/thunet`，而 root 在两个平台上都能做任何事。要收紧（只允许有活动 logind 会话的 uid）就得引入 D-Bus 依赖，这里刻意不做。
 
 core 变成机器级之后不再使用文件 socket（`$XDG_RUNTIME_DIR/thunet/control.sock`）：它是每用户一个路径，第二个用户的 core 会 bind 到另一个文件，"单 core"规则会静默失效。abstract socket 与命名管道一样具有全局名字，但不需要一个可写的共享目录。
 
@@ -515,7 +522,7 @@ core 变成机器级之后不再使用文件 socket（`$XDG_RUNTIME_DIR/thunet/c
 
 如果希望 core 被停掉后普通用户也能零提权拉起，必须同时放宽两侧：Windows 上修改 core 服务的 DACL，把启动/停止权限授予 `INTERACTIVE`（即上面提到的“交互登录用户”安全标识）；Linux 上增加一条 polkit 规则，只允许对 `thunet.service` 执行 `start` 和 `stop`。本项目选择的是更严格的一侧：**两个平台上启动、停止 core 都只允许管理员**。core 由服务管理器在开机时启动、异常退出后自动重启；窗口只能通过提权助手请求操作，控制通道本身没有停止 core 的命令。
 
-控制通道对整机 core 没有 `Shutdown` 命令：状态页的 *停止* 按钮通过提权助手调用 SCM / systemd，授权规则处处一致。便携 core 接受 `Shutdown`，因为它本来就属于启动它的用户；窗口断开后，也不会由任何前端拉起整机 core。core 自己退出（致命错误、升级）时由服务管理器重启。
+控制通道对整机 core 没有 `Shutdown` 命令：状态页的 *停止* 按钮通过提权助手调用 SCM / systemd，授权规则处处一致。便携 core 接受 `Shutdown`：托管型会停掉自己的核心线程而窗口继续运行，手工 `thunet core` 则直接退出。窗口断开后，也不会由任何前端拉起整机 core。core 自己退出（致命错误、升级）时由服务管理器重启。
 
 `host`、`https` 和 keepalive 目标是**机器配置**，不是用户偏好。允许普通用户改 `host` 等于允许他把 core 指向自己的门户并读走密码：SRun 的 `info` 是用**服务器选择的 token** 加密的，服务器永远能解开。窗口和控制通道都不提供修改这些值的入口。
 
@@ -564,7 +571,7 @@ UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个�
 - Linux：包内提供带 `DynamicUser=yes` 和 `StateDirectory=thunet` 的 system unit；`postinst` 执行 `systemctl enable --now thunet.service`。
 - 本版本不迁移旧布局。如果旧版每用户安装留下了 `credential.bin`、`key.bin` 或 `systemd --user` 单元，请在启用服务前手动删除；残留文件会被直接忽略。
 - 真正的卸载会删除整机目录：Windows 上 MSI 删除服务后执行 `service-purge`，Linux 上 `postrm` 删除 `/var/lib/thunet`。账号、`credential.bin` 和 `key.bin` 因此不会在安装包移除后继续存在；升级、修复和重装则保留。
-- 便携/开发模式保留 `--state-dir` 和每用户 core；它不是受支持的多用户配置。
+- 便携/开发模式保留 `--state-dir`，核心直接跑在窗口自己的进程里；它不是受支持的多用户配置。由于每个自启动档位都要向 systemd / SCM 注册东西，便携模式下设置页会隐藏这一行（核心随窗口结束）。`thunet service <action>` 在状态目录下会拒绝执行，理由同样是「没有服务可操作」；唯一例外是只读的 `thunet service status`，它照旧报告平台服务管理器眼里的整机服务状态。任何命令加上 `--machine` 都会在这一次调用里忽略 `THUNET_STATE_DIR`（例如便携 shell 里执行 `thunet --machine service start`），Windows 安装包给 `quit` 传的也是它，这样从启动 msiexec 的那个 shell 继承来的变量就无法把它指向便携端点。
 
 ## 14. 许可证
 

@@ -374,7 +374,136 @@ mod imp {
 #[cfg(windows)]
 pub use imp::probe_ssid;
 
-#[cfg(not(windows))]
+/// Linux: ask NetworkManager, then read the association with `iw`.
+///
+/// Both are local and privileged-free. `nmcli` covers a desktop install and
+/// costs one short-lived process; `iw` covers a machine without NetworkManager
+/// (a server with `systemd-networkd`, a minimal container). A machine with no
+/// wireless interface at all answers `Ok(None)`, which is what keeps a wired
+/// host quiet instead of logging an unexplained "no ssid" on every probe.
+#[cfg(target_os = "linux")]
+mod linux {
+  use std::process::Command;
+
+  /// `nmcli -t` escapes the field separator and the escape character itself.
+  fn unescape(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+      if c != '\\' {
+        out.push(c);
+        continue;
+      }
+      match chars.next() {
+        Some(':') => out.push(':'),
+        Some('\\') => out.push('\\'),
+        // An escape we do not know: keep both characters rather than guessing.
+        Some(other) => {
+          out.push('\\');
+          out.push(other);
+        }
+        None => out.push('\\'),
+      }
+    }
+    out
+  }
+
+  /// The SSID of the active Wi-Fi link in `nmcli -t -f ACTIVE,SSID dev wifi`.
+  ///
+  /// `--rescan no` keeps a probe that runs every 15 s from starting a scan: the
+  /// access point the machine is associated with is always in the cache.
+  pub(super) fn ssid_from_nmcli(text: &str) -> Option<String> {
+    for line in text.lines() {
+      let Some((active, ssid)) = line.split_once(':') else {
+        continue;
+      };
+      if active.trim() != "yes" {
+        continue;
+      }
+      let ssid = unescape(ssid);
+      let ssid = ssid.trim();
+      // A hidden network is listed as `--` instead of a name.
+      if !ssid.is_empty() && ssid != "--" {
+        return Some(ssid.to_string());
+      }
+    }
+    None
+  }
+
+  /// The SSID in `iw dev <iface> link`, which prints `SSID: name` when the
+  /// interface is associated and `Not connected.` when it is not.
+  pub(super) fn ssid_from_iw(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+      let name = line.trim().strip_prefix("SSID:")?.trim();
+      (!name.is_empty()).then(|| name.to_string())
+    })
+  }
+
+  /// Is this interface wireless? The same test `srun::link_kind` uses.
+  fn is_wireless(iface: &str) -> bool {
+    let sys = std::path::Path::new("/sys/class/net").join(iface);
+    sys.join("wireless").exists() || sys.join("phy80211").exists()
+  }
+
+  fn run(program: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new(program)
+      .args(args)
+      .output()
+      .map_err(|e| format!("cannot run {program}: {e}"))?;
+    if out.status.success() {
+      return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let first = stderr
+      .lines()
+      .map(str::trim)
+      .find(|line| !line.is_empty())
+      .unwrap_or("");
+    Err(if first.is_empty() {
+      format!("{program} exited with {}", out.status)
+    } else {
+      format!("{program}: {first}")
+    })
+  }
+
+  pub fn probe_ssid() -> Result<Option<String>, String> {
+    match run(
+      "nmcli",
+      &[
+        "--terse",
+        "--fields",
+        "ACTIVE,SSID",
+        "device",
+        "wifi",
+        "list",
+        "--rescan",
+        "no",
+      ],
+    ) {
+      Ok(text) => Ok(ssid_from_nmcli(&text)),
+      Err(nm) => {
+        // No NetworkManager (or no `nmcli` on PATH): read the association
+        // straight from the driver instead.
+        let Some(iface) = crate::srun::link_iface() else {
+          // No route either, so there is nothing to name and nothing to report.
+          return Ok(None);
+        };
+        if !is_wireless(&iface) {
+          return Ok(None);
+        }
+        match run("iw", &["dev", &iface, "link"]) {
+          Ok(text) => Ok(ssid_from_iw(&text)),
+          Err(iw) => Err(format!("{nm}; {iw}")),
+        }
+      }
+    }
+  }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::probe_ssid;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn probe_ssid() -> Result<Option<String>, String> {
   Ok(None)
 }
@@ -448,5 +577,42 @@ mod tests {
     for ssid in ["Guest", "eduroam", "THU-Guest", ""] {
       assert!(!is_campus_ssid(ssid), "{ssid}");
     }
+  }
+
+  /// `nmcli -t` rows, including the escaping a real SSID can carry.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn ssid_is_read_from_nmcli() {
+    use super::linux::ssid_from_nmcli;
+
+    let sample = "no:eduroam\nyes:Tsinghua-Secure\nno:THU-Guest\n";
+    assert_eq!(ssid_from_nmcli(sample).as_deref(), Some("Tsinghua-Secure"));
+    // Nothing is associated: every row says `no`.
+    assert_eq!(ssid_from_nmcli("no:eduroam\n"), None);
+    // No wireless hardware at all: nmcli prints nothing and still succeeds.
+    assert_eq!(ssid_from_nmcli(""), None);
+    // A hidden network has no name to classify.
+    assert_eq!(ssid_from_nmcli("yes:--\n"), None);
+    // `-t` escapes the separator, so a name with a colon survives intact.
+    assert_eq!(
+      ssid_from_nmcli("yes:THU\\:Guest").as_deref(),
+      Some("THU:Guest")
+    );
+    // Windows-style duplicate suffix is still the same network.
+    assert!(is_campus_ssid(
+      &ssid_from_nmcli("yes:Tsinghua-IPv4 2").unwrap()
+    ));
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn ssid_is_read_from_iw() {
+    use super::linux::ssid_from_iw;
+
+    let associated =
+      "Connected to 00:11:22:33:44:55 (on wlan0)\n\tSSID: Tsinghua-Secure\n\t\n\tfreq: 5180\n";
+    assert_eq!(ssid_from_iw(associated).as_deref(), Some("Tsinghua-Secure"));
+    assert_eq!(ssid_from_iw("Not connected.\n"), None);
+    assert_eq!(ssid_from_iw(""), None);
   }
 }

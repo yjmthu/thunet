@@ -54,6 +54,9 @@ pub struct Texts {
   pub autostart_off: &'static str,
   pub autostart_core: &'static str,
   pub autostart_all: &'static str,
+  /// Shown instead of the autostart row in portable mode, which has no
+  /// service to start at boot.
+  pub portable_autostart: &'static str,
   pub start_minimized: &'static str,
   pub auto_connect: &'static str,
   pub password: &'static str,
@@ -127,7 +130,7 @@ pub struct Texts {
   /// Shown while the session is already up on that network, so there is nothing
   /// left for the user to do.
   pub secure_wifi_online: &'static str,
-  /// A portal verb was asked for on a network whose session belongs to Windows.
+  /// A portal verb was asked for on a network whose session belongs to the OS.
   pub disconnect_unavailable: &'static str,
   pub credentials_unavailable: &'static str,
   pub language: &'static str,
@@ -155,6 +158,10 @@ pub struct Texts {
   pub session_traffic: &'static str,
   /// Status-page row describing the background service process.
   pub service: &'static str,
+  /// The same row in portable mode, where the core is a thread of the window
+  /// rather than a service: there is nothing to start, stop or restart.
+  pub core_row: &'static str,
+  pub core_in_window: &'static str,
   pub service_running: &'static str,
   pub service_gone: &'static str,
   /// Red banner on the status page while no core is answering.
@@ -196,6 +203,10 @@ pub struct Texts {
   /// The autostart change needs administrator rights and the UAC prompt was
   /// dismissed; nothing was changed.
   pub admin_cancelled: &'static str,
+  /// Administrator rights could not be obtained at all (no polkit agent, no
+  /// graphical session, or the dialog was dismissed - `pkexec` reports both the
+  /// same way), so the action did not run.
+  pub admin_unavailable: &'static str,
   pub already_online: &'static str,
   pub not_connected: &'static str,
   pub status_refreshed: &'static str,
@@ -248,6 +259,7 @@ static ZH: Texts = Texts {
   autostart_off: "关闭",
   autostart_core: "服务",
   autostart_all: "服务 + 托盘",
+  portable_autostart: "便携模式下没有开机自启：后台核心随本会话启动，退出即结束",
   start_minimized: "启动时最小化到托盘",
   auto_connect: "启动时自动连接",
   password: "密码",
@@ -316,6 +328,8 @@ static ZH: Texts = Texts {
   ipv6: "IPv6",
   session_traffic: "本次流量",
   service: "后台服务",
+  core_row: "核心",
+  core_in_window: "随本窗口运行",
   service_running: "运行中",
   service_gone: "未运行",
   service_down: "后台服务当前没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
@@ -337,6 +351,7 @@ static ZH: Texts = Texts {
   disconnect_failed: "断开失败",
   autostart_failed: "自启设置失败",
   admin_cancelled: "需要管理员权限，已取消",
+  admin_unavailable: "未获得管理员授权（可能已取消，或当前会话无法弹出授权框）；请在终端里执行 `sudo thunet service start|stop`",
   already_online: "已经在线，无需重复连接",
   not_connected: "当前未连接",
   status_refreshed: "状态已刷新",
@@ -359,6 +374,7 @@ static EN: Texts = Texts {
   autostart_off: "Off",
   autostart_core: "Service",
   autostart_all: "Service + tray",
+  portable_autostart: "Portable mode has no autostart: the core belongs to this session",
   start_minimized: "Start minimised to tray",
   auto_connect: "Connect on startup",
   password: "Password",
@@ -402,8 +418,8 @@ static EN: Texts = Texts {
   net_other: "The network request failed",
   secure_wifi: "Connected to {} (OS-level 802.1X); no portal login needed",
   secure_wifi_online: "Signed in through {} (OS-level 802.1X); nothing to do",
-  disconnect_unavailable: "This network authenticates in Windows; this app has no portal session here to end",
-  credentials_unavailable: "This network authenticates in Windows; the portal account is not used here",
+  disconnect_unavailable: "This network authenticates at the OS level; this app has no portal session here to end",
+  credentials_unavailable: "This network authenticates at the OS level; the portal account is not used here",
   language: "Language",
   log_level: "Log",
   theme: "Skin",
@@ -427,6 +443,8 @@ static EN: Texts = Texts {
   ipv6: "IPv6",
   session_traffic: "Session traffic",
   service: "Service",
+  core_row: "Core",
+  core_in_window: "runs in this window",
   service_running: "running",
   service_gone: "not running",
   service_down: "The background service is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
@@ -448,6 +466,7 @@ static EN: Texts = Texts {
   disconnect_failed: "Disconnect failed",
   autostart_failed: "Failed to change autostart",
   admin_cancelled: "Administrator rights are required; cancelled",
+  admin_unavailable: "Administrator authorization was not granted (it may have been dismissed, or this session cannot show a prompt); from a terminal run `sudo thunet service start|stop`",
   already_online: "Already online, nothing to do",
   not_connected: "Not connected",
   status_refreshed: "Status refreshed",

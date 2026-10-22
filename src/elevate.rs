@@ -6,9 +6,23 @@
 //! operation and exits, so the privilege is held for the length of that call
 //! and not by anything that keeps running.
 
-/// Error string returned when the user dismisses the UAC prompt. Callers that
-/// show a message can translate it instead of reporting a failure.
+/// Error string returned when the user dismisses the Windows UAC prompt.
+///
+/// Callers that show a message can translate it instead of reporting a
+/// failure. Only Windows can say this for certain: `ERROR_CANCELLED` means the
+/// prompt was dismissed and nothing else.
 pub const CANCELLED: &str = "cancelled";
+
+/// Error string returned when the elevated half did not run for lack of
+/// authorization, without saying which kind.
+///
+/// `pkexec` answers 126 both when the user dismissed the dialog and when the
+/// authorization could not be obtained at all - no polkit agent in the session,
+/// no seat (an SSH login), or a policy that denies the action - and 127 when
+/// `pkexec` itself is missing. The exit code cannot tell those apart, so they
+/// share one answer and the frontend words it as "not granted, here is the way
+/// out" instead of claiming a cancellation.
+pub const NO_AUTHORIZATION: &str = "no-administrator-authorization";
 
 /// `true` when this process already has the rights an SCM mutation needs.
 #[cfg(windows)]
@@ -168,14 +182,12 @@ pub fn run_as_admin(args: &[&str]) -> Result<(), String> {
       let _ = std::fs::remove_file(&log);
       Ok(())
     }
-    // 126: the user dismissed the authentication dialog.
-    Some(126) => {
+    // 126: the dialog was dismissed *or* the authorization could not be
+    // obtained (no agent, no seat, policy); 127: no `pkexec` at all. Neither
+    // tells which, and both mean "this did not run".
+    Some(126 | 127) => {
       let _ = std::fs::remove_file(&log);
-      Err(CANCELLED.into())
-    }
-    Some(127) => {
-      let _ = std::fs::remove_file(&log);
-      Err("pkexec is not available on this system".into())
+      Err(NO_AUTHORIZATION.into())
     }
     Some(code) => Err(helper_failure(code, &log)),
     None => {

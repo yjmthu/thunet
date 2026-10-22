@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_thunet_global_optspecs
-    string join \n host= http timeout= u/username= p/password= ip= ac-id= minimized state-dir= admin-error= h/help V/version
+    string join \n host= http timeout= u/username= p/password= ip= ac-id= minimized state-dir= machine admin-error= h/help V/version
 end
 
 function __fish_thunet_needs_command
@@ -34,6 +34,7 @@ complete -c thunet -n "__fish_thunet_needs_command" -l state-dir -d 'Where `conf
 complete -c thunet -n "__fish_thunet_needs_command" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_needs_command" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_needs_command" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_needs_command" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_needs_command" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_needs_command" -s V -l version -d 'Print version'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "selftest" -d 'Offline protocol self-test (see `cargo test`)'
@@ -61,6 +62,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l state-dir -d 
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l timeout -d 'Request timeout in seconds' -r
@@ -72,6 +74,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l state-dir -d 'Wh
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l timeout -d 'Request timeout in seconds' -r
@@ -83,6 +86,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand status" -l state-dir -d 'W
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand status" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand status" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l timeout -d 'Request timeout in seconds' -r
@@ -94,6 +98,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand login" -l state-dir -d 'Wh
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l timeout -d 'Request timeout in seconds' -r
@@ -105,6 +110,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand logout" -l state-dir -d 'W
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand logout" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l timeout -d 'Request timeout in seconds' -r
@@ -115,9 +121,9 @@ complete -c thunet -n "__fish_thunet_using_subcommand core" -l ac-id -d 'ac_id o
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l service -d 'Started by the Windows service manager; not for humans'
-complete -c thunet -n "__fish_thunet_using_subcommand core" -l machine -d 'Run against the machine-wide state directory and endpoint. The Linux system unit passes this; a user-run core stays portable'
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand core" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand core" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l timeout -d 'Request timeout in seconds' -r
@@ -129,6 +135,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand service" -l state-dir -d '
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand service" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand service" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l timeout -d 'Request timeout in seconds' -r
@@ -140,6 +147,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l state-di
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l timeout -d 'Request timeout in seconds' -r
@@ -151,6 +159,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l state-d
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l timeout -d 'Request timeout in seconds' -r
@@ -162,6 +171,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l state-di
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l timeout -d 'Give up (and report) after this many milliseconds' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l host -d 'Portal host (overrides the config file)' -r
@@ -171,8 +181,10 @@ complete -c thunet -n "__fish_thunet_using_subcommand quit" -l ip -d 'Local IP t
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
+complete -c thunet -n "__fish_thunet_using_subcommand quit" -l all-sessions -d 'Ask the core to end every attached window, not just this session\'s'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand quit" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l timeout -d 'Request timeout in seconds' -r
@@ -184,6 +196,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand config" -l state-dir -d 'W
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand config" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l timeout -d 'Request timeout in seconds' -r
@@ -195,6 +208,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l state-dir -d 
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l timeout -d 'Request timeout in seconds' -r
@@ -206,6 +220,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand completions" -l state-dir 
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
+complete -c thunet -n "__fish_thunet_using_subcommand completions" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help" -f -a "selftest" -d 'Offline protocol self-test (see `cargo test`)'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help" -f -a "ac-id" -d 'Print the portal ac_id the running service is using'

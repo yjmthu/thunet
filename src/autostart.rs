@@ -50,6 +50,50 @@ pub enum ServiceAction {
   Status,
 }
 
+/// Whether `thunet service <action>` must refuse in a portable process.
+///
+/// Portable mode has no service: the core is a thread of the window. Letting
+/// the mutating verbs through would act on the *machine* service while the user
+/// is looking at their own setup - `service start` would even put a second core
+/// on the same portal session. `status` stays usable: it is a read-only query,
+/// and refusing it would only hide whether a machine service exists.
+///
+/// Apply this to `service` only. `service-admin` follows the same rule, but its
+/// callers (the elevated helper and the Windows installer) say `--machine`
+/// explicitly: neither may inherit the mode of whatever started it, and
+/// `--machine` is the one way to say "machine semantics" regardless.
+pub fn service_refused_in_portable(action: ServiceAction) -> bool {
+  !matches!(action, ServiceAction::Status)
+}
+
+#[cfg(test)]
+mod portable_service {
+  use super::{ServiceAction, service_refused_in_portable};
+
+  /// The read-only query survives; everything that changes the machine service
+  /// is refused. Pinned as a whole list so a new verb cannot slip through.
+  #[test]
+  fn only_the_read_only_verb_runs_in_portable_mode() {
+    let refused: Vec<bool> = [
+      ServiceAction::Install,
+      ServiceAction::Uninstall,
+      ServiceAction::Enable,
+      ServiceAction::Disable,
+      ServiceAction::Start,
+      ServiceAction::Stop,
+      ServiceAction::Restart,
+      ServiceAction::Status,
+    ]
+    .into_iter()
+    .map(service_refused_in_portable)
+    .collect();
+    assert_eq!(
+      refused,
+      vec![true, true, true, true, true, true, true, false]
+    );
+  }
+}
+
 #[derive(Clone)]
 pub struct Autostart {
   exe: PathBuf,
@@ -196,6 +240,82 @@ pub fn purge_machine_state() -> Result<(), String> {
 /// the manager to start it instead of spawning a second, unmanaged copy.
 pub fn core_managed() -> bool {
   imp::core_registered()
+}
+
+/// Task names from `schtasks /Query /FO CSV /NH`, filtered by prefix.
+///
+/// `schtasks` puts the task path in the first CSV field (`\thunet-tray-alice`),
+/// quotes every field, and escapes a quote inside a field by doubling it. Only
+/// that first field is read, so a localized header, extra columns or a changed
+/// column order cannot change the answer. Kept free of `cfg` so the parsing is
+/// testable on any host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tray_task_names_from_csv(text: &str, prefix: &str) -> Vec<String> {
+  let mut names = Vec::new();
+  for line in text.lines() {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.first() != Some(&'"') {
+      continue;
+    }
+    let mut name = String::new();
+    let mut i = 1;
+    while i < chars.len() {
+      if chars[i] == '"' {
+        // `""` inside a quoted field is one quote character.
+        if chars.get(i + 1) == Some(&'"') {
+          name.push('"');
+          i += 2;
+          continue;
+        }
+        break; // end of the first field
+      }
+      name.push(chars[i]);
+      i += 1;
+    }
+    // The path is `\thunet-tray-alice`: the separator is not part of the name.
+    let bare = name.trim_start_matches('\\');
+    if bare.starts_with(prefix) {
+      names.push(bare.to_string());
+    }
+  }
+  names
+}
+
+#[cfg(test)]
+mod tray_tasks {
+  use super::tray_task_names_from_csv;
+
+  /// `schtasks /Query /FO CSV /NH` writes one quoted row per task.
+  #[test]
+  fn tray_tasks_are_picked_out_of_the_task_list() {
+    let csv = concat!(
+      "\"\\Microsoft\\Windows\\Defrag\\ScheduledDefrag\",\"N/A\",\"Ready\",\"N/A\"\r\n",
+      "\"\\thunet-tray-alice\",\"N/A\",\"Ready\",\"N/A\"\r\n",
+      "\"\\thunet-tray-bob\",\"N/A\",\"Disabled\",\"N/A\"\r\n",
+      // The core service is not a task here; it must not be touched.
+      "\"\\thunet\",\"N/A\",\"Running\",\"N/A\"\r\n",
+    );
+    assert_eq!(
+      tray_task_names_from_csv(csv, "thunet-tray-"),
+      vec![
+        "thunet-tray-alice".to_string(),
+        "thunet-tray-bob".to_string()
+      ]
+    );
+  }
+
+  #[test]
+  fn an_empty_or_unrelated_list_deletes_nothing() {
+    assert!(tray_task_names_from_csv("", "thunet-tray-").is_empty());
+    assert!(
+      tray_task_names_from_csv("\"\\thunet\",\"N/A\"\r\n", "thunet-tray-").is_empty(),
+      "the core service and other programs' tasks are left alone"
+    );
+    // A task inside a folder is not one of ours.
+    assert!(
+      tray_task_names_from_csv("\"\\Thunet\\thunet-tray-alice\"\r\n", "thunet-tray-").is_empty()
+    );
+  }
 }
 
 #[cfg(windows)]
@@ -388,17 +508,13 @@ mod imp {
 
   /// Start an elevated copy of this executable for one operation.
   ///
-  /// The state directory is spelled out rather than recomputed: the elevated
-  /// process may run as a different administrator, whose `%APPDATA%` is not
-  /// the one the window writes to.
+  /// `--machine`, not `--state-dir`: pkexec clears most of the environment, so
+  /// the helper must not depend on inherited variables, and the machine
+  /// directory is the platform default anyway. It also keeps the helper out of
+  /// portable mode, where `service-admin` refuses to run (see the arm in
+  /// `main::run`).
   fn elevate(action: &str) -> Result<(), String> {
-    let dir = crate::config::machine_dir();
-    crate::elevate::run_as_admin(&[
-      "service-admin",
-      action,
-      "--state-dir",
-      &dir.to_string_lossy(),
-    ])
+    crate::elevate::run_as_admin(&["--machine", "service-admin", action])
   }
 
   /// The action performed by the elevated copy (`thunet service-admin …`).
@@ -413,7 +529,28 @@ mod imp {
         // The tray logon task is the other registration this application
         // creates. The installer calls this action on uninstall, and a task
         // that outlives the package would point at a deleted executable.
+        //
+        // DO NOT DELETE THIS COMMENT. It records the behaviour that was wrong
+        // so that a later failure on a real machine can be traced back to this
+        // change instead of being re-discovered.
+        //
+        // Before: `delete_task(&tray_task_name())` only. `tray_task_name` is
+        // built from `USERNAME`/`USERDOMAIN`, which name *the account this
+        // process runs as*. That is correct for `thunet service uninstall`
+        // started by the user (UAC elevates the same account, so the variables
+        // still name that user) and wrong for the MSI: `RemoveCoreService` runs
+        // `service-admin uninstall` deferred and unimpersonated, i.e. as SYSTEM,
+        // so the name came out as `thunet-tray-SYSTEM` (or the machine account)
+        // and the real `thunet-tray-<user>` task survived the uninstall. Nothing
+        // reported an error, so the leftover only showed up at the next logon,
+        // as a task launching a deleted executable.
+        //
+        // Now: every task whose name starts with `thunet-tray-` is deleted, so
+        // the result does not depend on which account runs the uninstall. The
+        // single-name delete is kept: it is idempotent, and it still works if
+        // the enumeration below cannot run.
         let _ = delete_task(&tray_task_name());
+        delete_all_tray_tasks()?;
         Ok("core service and tray autostart removed".into())
       }
       ServiceAction::Enable => {
@@ -1229,6 +1366,27 @@ mod imp {
     expect_success(&["/Delete", "/TN", name, "/F"])
   }
 
+  /// Delete every `thunet-tray-<user>` logon task on this machine.
+  ///
+  /// The uninstall runs as SYSTEM from the MSI, where no environment variable
+  /// names the user whose task has to go (see the comment on
+  /// `ServiceAction::Uninstall`), so the tasks are enumerated instead. An
+  /// administrator - and SYSTEM - may delete another account's task.
+  ///
+  /// `Err` only when `schtasks` cannot be started at all: one task that refuses
+  /// to go is logged and skipped, because an uninstall that half-finished must
+  /// not be aborted by a stale registration.
+  fn delete_all_tray_tasks() -> Result<(), String> {
+    const PREFIX: &str = "thunet-tray-";
+    let out = run(&["/Query", "/FO", "CSV", "/NH"])?;
+    for name in crate::autostart::tray_task_names_from_csv(&decode(&out.stdout), PREFIX) {
+      if let Err(e) = expect_success(&["/Delete", "/TN", &name, "/F"]) {
+        crate::diag::line(&format!("service: cannot delete the task {name}: {e}"));
+      }
+    }
+    Ok(())
+  }
+
   /// `schtasks /XML` and `sc` print UTF-16 with a BOM on some consoles and
   /// plain (OEM/UTF-8) on others; accept either.
   fn decode(bytes: &[u8]) -> String {
@@ -1471,19 +1629,54 @@ mod imp {
     launcher(a)?.disable().map_err(|e| e.to_string())
   }
 
-  /// Write the unit (if needed) and put it in the boot path. Both steps need
-  /// administrator rights; `Autostart::service` elevates before calling this.
-  pub fn enable_core(a: &Autostart) -> Result<(), String> {
-    if !unit_present() {
-      install_unit(a)?;
+  /// Run `direct` here, or in one elevated copy of this executable.
+  ///
+  /// The settings page (`Autostart::set_mode`) calls the two functions below
+  /// directly, while the CLI goes through [`Autostart::service`], which asks
+  /// for elevation itself. Without this branch the settings page wrote
+  /// `/etc/systemd/system` as the logged-on user, got `EACCES`, left the mode
+  /// unchanged and never reached the tray half of `set_mode`. Windows has the
+  /// same branch inside its `enable_core`/`disable_core`.
+  ///
+  /// Linux only: macOS has no unit to write, so a prompt there would ask for
+  /// rights the call does not need.
+  #[cfg(target_os = "linux")]
+  fn elevated(action: &str, direct: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    if crate::elevate::is_elevated() {
+      direct()
+    } else {
+      // The helper is this same executable (`service-admin <action>`), so the
+      // second call enters through `service_direct` and runs `direct` as root.
+      elevate(action)
     }
-    enable_unit()
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn elevated(_action: &str, direct: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    direct()
+  }
+
+  /// Write the unit (if needed) and put it in the boot path. Both steps need
+  /// administrator rights; `Autostart::service` elevates before calling this,
+  /// and [`elevated`] covers the settings page.
+  pub fn enable_core(a: &Autostart) -> Result<(), String> {
+    elevated("enable", || {
+      if !unit_present() {
+        install_unit(a)?;
+      }
+      enable_unit()
+    })
   }
 
   /// Stop starting the core automatically. A running core keeps running: the
   /// switch is about autostart, not about killing the session.
   pub fn disable_core() -> Result<(), String> {
-    disable_unit()
+    // Nothing is installed, so there is nothing to turn off - and no reason to
+    // ask for a password. (`stop_starting_at_boot` on Windows does the same.)
+    if !unit_present() {
+      return Ok(());
+    }
+    elevated("disable", disable_unit)
   }
 
   /// The tray entry is the only one `--minimized` affects.
@@ -1501,8 +1694,51 @@ mod imp {
     Ok(())
   }
 
-  /// The `.deb` removes `/var/lib/thunet` from `postrm` on a real uninstall, so
-  /// this entry point has nothing to do here.
+  /// Remove the machine state directory. A `.deb` install does this from
+  /// `postrm`, and a package manager owns that path there; this entry point is
+  /// for an installation nobody uninstalls for you (a tarball), after
+  /// `service uninstall` removed the unit. The caller's "still registered"
+  /// guard keeps it away from a live service.
+  ///
+  /// `StateDirectory=thunet` under `DynamicUser=yes` keeps the real state in
+  /// `/var/lib/private/thunet` (0700, owned by the transient service user) and
+  /// leaves `/var/lib/thunet` as a symlink to it. The path this program knows
+  /// is the link, and `remove_dir_all` refuses a symlink outright, so the
+  /// sealed credential and the key used to survive an uninstall: remove the
+  /// target first, then the link.
+  #[cfg(target_os = "linux")]
+  pub fn purge_machine_state() -> Result<(), String> {
+    /// `remove_dir_all`, with "already gone" spelled as success.
+    fn remove_tree(dir: &std::path::Path) -> Result<(), String> {
+      match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+      }
+    }
+
+    let dir = crate::config::machine_dir();
+    let meta = match std::fs::symlink_metadata(&dir) {
+      Ok(meta) => meta,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    if !meta.file_type().is_symlink() {
+      return remove_tree(&dir);
+    }
+    let target = std::fs::read_link(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // A relative target is resolved against the link's own directory.
+    let target = match dir.parent() {
+      Some(parent) if target.is_relative() => parent.join(&target),
+      _ => target,
+    };
+    remove_tree(&target)?;
+    std::fs::remove_file(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+  }
+
+  /// macOS has no machine-wide directory: `machine_dir()` is the user's own
+  /// settings, which an uninstall must not delete.
+  #[cfg(not(target_os = "linux"))]
   pub fn purge_machine_state() -> Result<(), String> {
     Ok(())
   }
@@ -1551,14 +1787,10 @@ mod imp {
     }
   }
 
+  /// The same two knobs as the Windows half above: `--machine` says which
+  /// setup, `service-admin` says the elevation already happened.
   fn elevate(action: &str) -> Result<(), String> {
-    let dir = crate::config::machine_dir();
-    crate::elevate::run_as_admin(&[
-      "service-admin",
-      action,
-      "--state-dir",
-      &dir.to_string_lossy(),
-    ])
+    crate::elevate::run_as_admin(&["--machine", "service-admin", action])
   }
 
   pub fn service_direct(action: ServiceAction, a: &Autostart) -> Result<String, String> {
@@ -1580,6 +1812,14 @@ mod imp {
         Ok("autostart disabled for the core".into())
       }
       ServiceAction::Start => {
+        // Same first-use path as on Windows, where `Start` registers the
+        // service when it does not exist yet: a portable install has no unit,
+        // and plain `systemctl start` would only fail with "Unit thunet.service
+        // not found". This runs inside the elevated helper (`service_direct`),
+        // so writing `/etc/systemd/system` is allowed.
+        if !unit_present() {
+          install_unit(a)?;
+        }
         systemctl(&["start", CORE_UNIT])?;
         Ok("core started".into())
       }
@@ -1618,6 +1858,8 @@ mod imp {
        DynamicUser=yes\n\
        StateDirectory=thunet\n\
        StateDirectoryMode=0700\n\
+       RuntimeDirectory=thunet\n\
+       RuntimeDirectoryMode=0755\n\
        UMask=0077\n\
        ExecStart=\"{}\" core --machine\n\
        Restart=always\n\

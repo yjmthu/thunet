@@ -1,6 +1,82 @@
 #!/bin/sh
 set -e
 
+# Ask every interactive user's window to *end* before the files are touched,
+# the way the MSI runs `thunet.exe quit --timeout 15000` before InstallValidate:
+# closing the window only hides it (a tray app has to), so this has to ring the
+# doorbell `src/single.rs` polls - a `thunet.quit` file next to `thunet.lock`.
+# Without it the window kept running against a deleted image and a stopped
+# core, because nothing in the package touched it.
+#
+# An upgrade rings it as well. A window that survives the file replacement is
+# the *old* build talking to the *new* core - exactly the pairing the protocol
+# check has to refuse - so it has to end instead of lingering. It is not
+# started again afterwards (a maintainer script has no way into a user's
+# session; the MSI can, through the desktop shell's own `ShellExecute`), so the
+# user reopens it from the menu and the autostart entry brings it back at the
+# next login.
+#
+# Ringing is a file write, not a process launch: no `runuser`, no PAM, no
+# environment to reconstruct. `$XDG_RUNTIME_DIR` is what the tray resolved, so
+# ask logind for its authoritative value and fall back to the paths
+# `src/single.rs` itself uses (`/run/user/<uid>`, then `temp_dir`, i.e. /tmp).
+# Root may write into a user's runtime directory: it is 0700, but owned by
+# them, and DAC does not apply to root.
+ring_doorbell() {
+  for dir in "$(loginctl show-user "$1" --property=RuntimePath --value 2>/dev/null)" \
+             "/run/user/$1" /tmp; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    ringing=
+    # One lock per state directory (`thunet-<tag>.lock`), plus the untagged
+    # name a build from before the tag used. The quit marker is the same name
+    # with another extension - that is the rule `src/single.rs` follows.
+    for lock in "$dir/thunet.lock" "$dir"/thunet-*.lock; do
+      [ -f "$lock" ] || continue
+      : >"${lock%.lock}.quit" 2>/dev/null || true
+      ringing=yes
+    done
+    if [ -n "$ringing" ]; then
+      echo "$dir"
+    fi
+  done
+}
+
+# Bounded wait, because a wedged window must neither hang nor fail a removal:
+# Linux keeps a mapped image alive, so the files free themselves anyway. A
+# healthy tray reads the marker once per frame, far below this ~3 s budget.
+wait_for_exit() {
+  n=0
+  while [ "$n" -lt 15 ]; do
+    alive=
+    for dir in $1; do
+      # Any instance still holding a lock keeps this waiting, whatever state
+      # directory it belongs to.
+      if [ -n "$(ls "$dir"/thunet*.lock 2>/dev/null)" ]; then
+        alive=yes
+      fi
+    done
+    if [ -z "$alive" ]; then
+      return 0
+    fi
+    sleep 0.2
+    n=$((n + 1))
+  done
+  return 0
+}
+
+case "${1:-}" in
+  remove|purge|upgrade|remove-in-future)
+    # `getent passwd` rather than an assumed /home (ostree uses /var/home,
+    # root's home is /root). Same filter `postrm` uses for the autostart
+    # entries, here by uid.
+    dirs=$(for uid in $(getent passwd 2>/dev/null |
+      awk -F: '$3 >= 1000 && $3 != 65534 && $7 !~ /(nologin|false)$/ {print $3}'); do
+             ring_doorbell "$uid"
+           done) || dirs=
+    wait_for_exit "$dirs"
+    ;;
+esac
+
 if [ -d /run/systemd/system ]; then
   systemctl stop thunet.service || true
 fi

@@ -556,6 +556,16 @@ pub fn link_kind() -> crate::proto::LinkKind {
   link_imp::link_kind()
 }
 
+/// Name of the interface behind the default route (`wlan0`, `enp3s0`).
+///
+/// The SSID probe needs it for its `iw` fallback, which is per interface;
+/// `nmcli` names the active network without one.
+#[cfg(target_os = "linux")]
+pub fn link_iface() -> Option<String> {
+  let table = std::fs::read_to_string("/proc/net/route").ok()?;
+  default_route(&table)
+}
+
 /// The default-route interface name in `/proc/net/route`.
 ///
 /// The table is hex and little-endian; a default route has a zero destination

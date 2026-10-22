@@ -9,6 +9,14 @@ Type=simple
 DynamicUser=yes
 StateDirectory=thunet
 StateDirectoryMode=0700
+# The trust anchor for the machine endpoint. The state directory cannot serve
+# that purpose: with `DynamicUser=` the real directory lives in
+# /var/lib/private/thunet (mode 0700 root:root), so the /var/lib/thunet symlink
+# cannot even be stat()ed by an unprivileged frontend and every window would
+# refuse the real service. This directory is owned by the service account and
+# world-readable, and systemd removes it again when the unit stops.
+RuntimeDirectory=thunet
+RuntimeDirectoryMode=0755
 UMask=0077
 ExecStart=/usr/bin/thunet core --machine
 Restart=always

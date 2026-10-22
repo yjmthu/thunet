@@ -49,6 +49,16 @@ pub enum Cmd {
     /// memory only and removes any stored entry.
     #[serde(default)]
     remember: bool,
+    /// Seal the password the core already holds, instead of one in `password`.
+    ///
+    /// A frontend never keeps the plaintext, so ticking *Remember password*
+    /// after an Apply that did not save it leaves the field empty; the only
+    /// pair left to seal is the one currently held. The core accepts that only
+    /// while `username` still names the account the held password was proven
+    /// for. `#[serde(default)]` keeps an older core (which ignores the field)
+    /// parsing this message.
+    #[serde(default)]
+    keep_password: bool,
   },
   SetAutoConnect(bool),
   /// Ask what credential the core holds without asking for the password
@@ -68,6 +78,16 @@ pub enum Cmd {
   /// Ask a portable core to exit. A machine core refuses: stopping the service
   /// is the service manager's job, not a frontend's.
   Shutdown,
+  /// Ask every attached window to quit (the installer's entry point).
+  ///
+  /// An upgrade replaces the executable under windows that are still running,
+  /// and an old window talking to a new core is exactly the pairing the
+  /// protocol check has to refuse, so the installer has to end all of them -
+  /// including the ones in other sessions and other users' accounts, which no
+  /// per-session doorbell can reach. The core fans this out through its own
+  /// fan-out, so one request ends every attached frontend; a session with no
+  /// core attached keeps the per-session doorbell as its fallback.
+  QuitAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +244,13 @@ pub enum Ev {
   Credentials(CredentialState),
   /// Answer to [`Cmd::AcId`].
   AcId(String),
+  /// End this window now, because an installer asked through [`Cmd::QuitAll`].
+  ///
+  /// Distinct from closing it: a tray has to hide on close, so this goes
+  /// through the same orderly exit an uninstall uses. Never replayed to a
+  /// late frontend - a window that starts after the installation must not
+  /// read yesterday's news and quit again.
+  Quit,
 }
 
 /// One line on the wire.
@@ -277,6 +304,7 @@ mod tests {
       username: "alice".into(),
       password: "secret".into(),
       remember: true,
+      keep_password: true,
     });
     let text = wire.line().unwrap();
     assert!(!text.contains('\n') || text.ends_with('\n'));
@@ -286,10 +314,30 @@ mod tests {
         username,
         password,
         remember,
+        keep_password,
       }) => {
         assert_eq!(username, "alice");
         assert_eq!(password, "secret");
         assert!(remember);
+        assert!(keep_password);
+      }
+      other => panic!("wrong variant: {other:?}"),
+    }
+  }
+
+  /// A build that predates `keep_password` must still parse this message: the
+  /// field is optional on the wire, and its absence means "no".
+  #[test]
+  fn a_command_without_keep_password_still_parses() {
+    let text = r#"{"v":1,"msg":{"t":"cmd","m":{"SetCredentials":{"username":"alice","password":"secret","remember":true}}}}"#;
+    match Wire::parse(text).unwrap().msg {
+      Msg::Cmd(Cmd::SetCredentials {
+        username,
+        keep_password,
+        ..
+      }) => {
+        assert_eq!(username, "alice");
+        assert!(!keep_password, "an absent flag means a typed password");
       }
       other => panic!("wrong variant: {other:?}"),
     }

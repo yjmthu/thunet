@@ -37,7 +37,7 @@ const SSID_WATCH_STEP: Duration = Duration::from_secs(2);
 const SSID_WATCH_MAX_STEP: Duration = Duration::from_secs(20);
 
 /// Do the portal verbs (Connect, Disconnect, a credential change) mean anything
-/// on this network? On 802.1X Wi-Fi Windows owns the session and the portal
+/// on this network? On 802.1X Wi-Fi the OS owns the session and the portal
 /// entry is only a mirror of it: a logout there would end something this app
 /// never opened, and a login has nothing to prove. The window greys those verbs
 /// out; this is the same rule for a request that arrives over the pipe.
@@ -373,7 +373,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           }
         }
         Cmd::Disconnect => {
-          // The session on an 802.1X network belongs to Windows; ending the
+          // The session on an 802.1X network belongs to the OS; ending the
           // portal's copy of it is a change this app has no business making,
           // whether the request comes from the window or from `thunet logout`.
           if !portal_verbs(&last_env) {
@@ -501,8 +501,24 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           username,
           password,
           remember,
+          keep_password,
         } => {
           let dir = crate::config::dir();
+          // "Remember the password the core already holds". The window never
+          // keeps the plaintext, so after an Apply that did not save it the
+          // password field is empty and the only pair left to seal is the one
+          // in memory. That is allowed only while the form still names the
+          // account the held password was proven for; pairing a held password
+          // with a different account stays refused.
+          let keeps_held = keep_password
+            && password.is_empty()
+            && !session.cfg().password.is_empty()
+            && username.trim() == session.cfg().username.trim();
+          let password = if keeps_held {
+            session.cfg().password.clone()
+          } else {
+            password
+          };
           let ready = !username.is_empty() && !password.is_empty();
           // *Remember password* needs a complete pair: an empty field means
           // "keep what is stored" (the window disables *Apply* in that state),
@@ -699,11 +715,31 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               "ignoring Shutdown: the machine core is stopped through the service manager",
             )))
             .ok();
+          } else if crate::ipc::hosted() {
+            // The core is a thread of the window that started it: the window
+            // stays, the core ends. Exiting the process here would close the
+            // window as well, which is what the pre-host design did.
+            crate::ipc::request_stop();
+            tx.send(Ev::Log(Line::info("stopping: this window hosts the core")))
+              .ok();
+            return;
           } else {
             // A portable core belongs to the user who started it; exiting here
-            // is the same as `systemctl --user stop` / closing its terminal.
+            // is the same as closing its terminal.
             std::process::exit(0);
           }
+        }
+        Cmd::QuitAll => {
+          // One request, every attached window - across sessions and users,
+          // which is why it goes through the fan-out instead of the
+          // per-session doorbell. The core itself keeps running: the installer
+          // stops the service on its own schedule.
+          tx.send(Ev::Log(Line::info(format!(
+            "asked {} attached window(s) to quit",
+            tx.frontends()
+          ))))
+          .ok();
+          tx.send(Ev::Quit).ok();
         }
       }
     }

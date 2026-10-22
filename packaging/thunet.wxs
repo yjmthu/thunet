@@ -51,7 +51,7 @@
 
     <!-- Start the app once the (interactive) transaction is over: a first
          install, an upgrade or a repair all end with a closed copy because of
-         `QuitRunningApp`, so the condition must not be limited to
+         `QuitAllWindows`, so the condition must not be limited to
          `NOT Installed` - otherwise double-clicking the package again silently
          leaves no app running. Silent installs such as `msiexec /qn` or winget
          keep UILevel = 2 and stay quiet.
@@ -73,9 +73,12 @@
          this product's uninstall, and `UPGRADINGPRODUCTCODE` is what tells the
          two apart; without the condition every upgrade would silently drop the
          autostart registration. Deferred + Impersonate="no" because deleting a
-         service needs the SYSTEM token, not the user's. -->
+         service needs the SYSTEM token, not the user's. The machine flag for the
+         same reason as `StopCoreService`: the helper refuses to run when it
+         looks portable, and a custom action must not depend on which
+         environment it inherited. -->
     <CustomAction Id="RemoveCoreService" FileRef="THUnetExe"
-                  ExeCommand="service-admin uninstall"
+                  ExeCommand="--machine service-admin uninstall"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- Uninstall means the package is gone, so the machine state goes with it:
@@ -99,20 +102,38 @@
                   ExeCommand="service-resume"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
-    <!-- Ask the running window to quit and wait for it. Closing it is not
-         enough (a tray hides itself on WM_CLOSE) and killing it skips its
-         shutdown, so this rings the app's quit doorbell and polls the
-         single-instance name until the image is really gone. `WixQuietExec` is
-         what keeps the child's console hidden: a plain immediate custom action
-         ran `taskkill` — a console program in the user's session — and flashed
-         a black window on every install. `Return="check"` because the command
-         succeeds when nothing is running, so the only failure left is "the
-         window refused to quit", and aborting is honest there: the next step
-         would try to replace a file that is still mapped. -->
+    <!-- Ask every running window to quit, and wait for them. Closing a window
+         is not enough (a tray hides itself on WM_CLOSE) and killing it skips
+         its shutdown, so this rings the app's quit doorbell instead.
+
+         One action for the whole machine, not one per session: the core fans
+         `Cmd::QuitAll` out to every attached window, which is the only way to
+         reach a tray in *another* session or *another user's* account — a
+         session-scoped event cannot. Leaving such a window alive is the one
+         outcome that must not happen here: it would keep the old executable
+         mapped (so this step would have aborted a moment later anyway) and,
+         worse, it would drive the new core with the old build's protocol.
+
+         `WixQuietExec` keeps the child's console hidden: a plain immediate
+         custom action ran `taskkill` — a console program in the user's session
+         — and flashed a black window on every install. `Return="check"`
+         because the command succeeds when nothing is running, so the only
+         failure left is "a window refused to quit", and aborting is honest
+         there: the next step would try to replace a file that is still
+         mapped. (The all-sessions flag needs no fallback for older builds: no
+         build without it has ever been installed.) -->
+    <!-- The machine flag because an immediate custom action inherits the
+         environment of whatever started msiexec: with a leftover
+         `THUNET_STATE_DIR` the command would look for a portable endpoint that
+         has nothing to do with the machine setup, fail to find a core, and
+         still exit 0, so the windows would survive and InstallValidate would hit
+         mapped files later, far from the actual cause. The flag clears the
+         variable for this one invocation and leaves the rest of the process
+         alone. -->
     <SetProperty Id="WixQuietExecCmdLine"
-                 Value="&quot;[BINDIR]thunet.exe&quot; quit --timeout 15000"
-                 Before="QuitRunningApp" Sequence="execute" />
-    <CustomAction Id="QuitRunningApp" BinaryRef="Wix4UtilCA_X64"
+                 Value="&quot;[BINDIR]thunet.exe&quot; --machine quit --all-sessions --timeout 15000"
+                 Before="QuitAllWindows" Sequence="execute" />
+    <CustomAction Id="QuitAllWindows" BinaryRef="Wix4UtilCA_X64"
                   DllEntry="WixQuietExec" Execute="immediate" Return="check" />
 
     <!-- The service holds `thunet.exe` open for as long as it runs, and
@@ -120,10 +141,23 @@
          the Restart Manager disabled it waits out its own "file in use"
          timeout, which measured ~56 s on a silent upgrade. Stopping here, while
          the sequence is still in the immediate phase, removes that wait
-         entirely. `service stop` is a no-op when nothing is registered, and it
-         waits for STOPPED itself, so the stop type is not consulted here. -->
+         entirely. It waits for STOPPED itself, so the stop type is not
+         consulted here.
+
+         The human verb, and its self-elevation is the point: an immediate
+         action runs in the installer's client process, and per-machine `Scope`
+         only makes elevation required - it does not perform it. Observed on a
+         double-clicked install: this very step raised its own UAC prompt, so
+         the client was unelevated at that moment. `service stop` asks for the
+         rights when it has to and goes straight through when it already has
+         them, so `Return="check"` holds either way. The helper, which never
+         asks, is kept for the deferred actions below, where the token is
+         SYSTEM and a prompt would be both invisible and fatal. The machine
+         flag covers the other axis: a stray `THUNET_STATE_DIR` inherited from
+         whatever started msiexec must not steer this at a portable endpoint.
+         `RemoveCoreService` below uses the helper for `uninstall`. -->
     <CustomAction Id="StopCoreService" FileRef="THUnetExe"
-                  ExeCommand="service stop"
+                  ExeCommand="--machine service stop"
                   Execute="immediate" Return="check" />
 
     <InstallExecuteSequence>
@@ -134,15 +168,17 @@
            reports STOPPED. Installing, upgrading and uninstalling all pass
            through it, which matters because the service can be registered by
            the application itself without any previous package.
-           The window is asked to quit first, before InstallValidate costs the
-           files: a still-mapped image cannot be replaced with the Restart
-           Manager disabled. -->
-      <Custom Action="QuitRunningApp" Before="InstallValidate"
+
+           Every window is asked to quit first, before InstallValidate costs
+           the files: a still-mapped image cannot be replaced with the Restart
+           Manager disabled. The request travels through the core (it is the
+           only party that can reach another session), so it also has to happen
+           while the core is still running. -->
+      <Custom Action="QuitAllWindows" Before="InstallValidate"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
-      <!-- After the window is gone and still before InstallValidate (that is
-           where QuitRunningApp sits): the service is the other holder of the
-           executable. -->
-      <Custom Action="StopCoreService" After="QuitRunningApp"
+      <!-- After the windows are gone and still before InstallValidate: the
+           service is the other holder of the executable. -->
+      <Custom Action="StopCoreService" After="QuitAllWindows"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <!-- Before RemoveFiles: the helper still has to exist. -->
       <Custom Action="RemoveCoreService" Before="RemoveFiles"

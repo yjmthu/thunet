@@ -177,6 +177,16 @@ struct Cli {
   /// runs under has no profile of its own.
   #[arg(long, global = true, hide = true)]
   state_dir: Option<std::path::PathBuf>,
+  /// Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only.
+  ///
+  /// The Windows installer passes this, because an immediate custom action
+  /// inherits the environment of whatever started msiexec, and a leftover
+  /// portable variable would silently point `quit` at the wrong endpoint. It is
+  /// also the escape hatch for `thunet service …` from a portable shell, where
+  /// those verbs are refused. `core --machine` (what the Linux unit runs) means
+  /// the same thing, plus the machine state directory.
+  #[arg(long, global = true, hide = true)]
+  machine: bool,
   /// Internal: file where the elevated helper records a failure.
   #[arg(long, global = true, hide = true)]
   admin_error: Option<std::path::PathBuf>,
@@ -206,10 +216,6 @@ enum Cmd {
     /// Started by the Windows service manager; not for humans.
     #[arg(long, hide = true)]
     service: bool,
-    /// Run against the machine-wide state directory and endpoint. The Linux
-    /// system unit passes this; a user-run core stays portable.
-    #[arg(long, hide = true)]
-    machine: bool,
   },
   /// Install or control the background service.
   ///
@@ -217,6 +223,9 @@ enum Cmd {
   /// the same verbs work everywhere. Changing the registration, the start type
   /// or the running state needs administrator rights on both platforms, which
   /// this asks for once.
+  ///
+  /// A portable setup (`THUNET_STATE_DIR`) has no service: there only `status`
+  /// runs, and every other verb is refused.
   Service {
     #[arg(value_enum)]
     action: autostart::ServiceAction,
@@ -246,6 +255,15 @@ enum Cmd {
     /// Give up (and report) after this many milliseconds.
     #[arg(long, default_value_t = 20_000)]
     timeout: u64,
+    /// Ask the core to end every attached window, not just this session's.
+    ///
+    /// The per-session doorbell cannot cross a session, so windows in other
+    /// sessions or other users' accounts survive an upgrade that leaves their
+    /// executable replaced — an old window driving a new core is what the
+    /// protocol check has to refuse. The core already fans its events out to
+    /// every attached frontend, so one request ends them all.
+    #[arg(long)]
+    all_sessions: bool,
   },
   /// Print the config path and effective settings.
   Config,
@@ -280,6 +298,21 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+  // `--machine` is the one way to say "this process is not portable", whatever
+  // the environment says: an installer inherits the environment of its caller,
+  // and a leftover `THUNET_STATE_DIR` would silently retarget its commands at a
+  // portable endpoint that nothing is listening on. Clearing the variable here
+  // is enough - `portable()`, `open_result` and the single-instance names all
+  // derive from it, so every downstream decision follows.
+  if cli.machine {
+    if cli.state_dir.is_some() {
+      return Err("`--machine` and `--state-dir` contradict each other".into());
+    }
+    // SAFETY: this runs on the main thread before anything reads the
+    // environment (no other thread exists yet), and `config::dir` is only
+    // reached below.
+    unsafe { std::env::remove_var("THUNET_STATE_DIR") };
+  }
   // The Windows service runs as SYSTEM, whose own `%APPDATA%` is the system
   // profile; `sc create` therefore passes the installing user's directory.
   if let Some(dir) = &cli.state_dir {
@@ -400,6 +433,7 @@ fn run(cli: Cli) -> Result<(), String> {
           password: cfg.password.clone(),
           // Command-line credentials are for this session only.
           remember: false,
+          keep_password: false,
         });
       }
       link.send(CoreCmd::Connect);
@@ -410,14 +444,17 @@ fn run(cli: Cli) -> Result<(), String> {
       link.send(CoreCmd::Disconnect);
       settled(&link, Duration::from_secs(20))
     }
-    Cmd::Core { service, machine } => {
+    Cmd::Core { service } => {
       #[cfg(windows)]
       if service {
         return winsvc::run();
       }
+      // `--service` is the Windows SCM entry point, and it has already been
+      // handled above; the mode itself is always `--machine`, on both
+      // platforms, so a portable core is what a bare `thunet core` starts.
       #[cfg(not(windows))]
       let _ = service;
-      let machine = machine || cfg!(windows) && service;
+      let machine = cli.machine;
       if machine && std::env::var_os("THUNET_STATE_DIR").is_none() {
         // The service manager passes `--state-dir`; this is the fallback for
         // an administrator-started core that did not.
@@ -425,11 +462,12 @@ fn run(cli: Cli) -> Result<(), String> {
         // or any frontend thread exists.
         unsafe { std::env::set_var("THUNET_STATE_DIR", config::machine_dir()) };
       }
-      // The service wrapper points diagnostics at its log file, but it runs
-      // after the config is read: a failure while opening the sealed credential
-      // would otherwise go to a stderr nobody can see. Point it at the same
-      // file here, first.
-      #[cfg(windows)]
+      // The machine core has no stderr anybody can read, and this runs before
+      // the config is loaded: a failure while opening the sealed credential
+      // would otherwise go to a place nobody can see. Point diagnostics at the
+      // log file here, first. `diag::line` still writes to stderr as well, so
+      // under systemd the journal keeps its copy; on Windows this file is the
+      // only copy (`winsvc` sets the same path again).
       if machine {
         diag::set_file(config::machine_dir().join("core.log"));
       }
@@ -448,13 +486,141 @@ fn run(cli: Cli) -> Result<(), String> {
       }
     }
     Cmd::Service { action } => {
+      // Portable mode has no service, so every mutating verb here would act on
+      // the *machine* service instead - the one thing a portable setup is
+      // defined by not using, and `service start` would even put a second core
+      // on the same portal session. Refuse, and name both ways out: the core
+      // belongs to the window, and the machine service is only meaningful
+      // without `THUNET_STATE_DIR`. `status` is a read-only query and still
+      // runs; `service-admin` is deliberately not gated (see its arm below).
+      if ipc::portable() && autostart::service_refused_in_portable(action) {
+        return Err(
+          "portable mode has no service: the core runs inside the window, so it lives exactly as \
+           long as the window does. Closing the window only hides both, and `thunet quit` (or \
+           Quit in the tray menu) ends them. To act on the machine service, run \
+           `thunet --machine service …`"
+            .into(),
+        );
+      }
       println!("{}", autostart::Autostart::service(action, cli.minimized)?);
       Ok(())
     }
-    Cmd::ServiceAdmin { action } => autostart::service_admin(action),
+    // `--machine` is how the two legitimate callers arrive: `elevate` starts the
+    // helper with it, and the Windows installer passes it to its custom
+    // actions. Both need the machine service, and neither may inherit the mode
+    // of whatever started it. Anything else that turns up portable is a person
+    // typing the hidden command in a portable shell - where there is no service
+    // to act on, and `--machine` is the explicit way to say they mean the
+    // machine one.
+    Cmd::ServiceAdmin { action } => {
+      if ipc::portable() {
+        return Err(
+          "portable mode has no service, and this is the machine-only half of `service`. \
+           `thunet --machine service-admin …` acts on the machine service explicitly"
+            .into(),
+        );
+      }
+      autostart::service_admin(action)
+    }
     Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
     Cmd::ServicePurge => autostart::purge_machine_state(),
-    Cmd::Quit { timeout } => single::quit_and_wait(Duration::from_millis(timeout)),
+    Cmd::Quit {
+      timeout,
+      all_sessions,
+    } => {
+      let timeout = Duration::from_millis(timeout);
+      if all_sessions {
+        quit_all(timeout)?;
+      }
+      // This session's own window, and the wait an installer needs before it
+      // may replace the file. A window that was attached to the core is
+      // already gone, so this normally returns at once.
+      single::quit_and_wait(timeout)
+    }
+  }
+}
+
+/// Ask the core to end every attached window, and wait until they are gone.
+///
+/// Only the core can reach windows in other sessions: the per-session doorbell
+/// (`Local\` event, runtime marker) is per session by construction. The wait is
+/// a fact rather than a guess — `Cmd::CoreInfo` reports how many frontends are
+/// still attached, and this connection is one of them.
+fn quit_all(timeout: Duration) -> Result<(), String> {
+  /// How long one question gets. The core answers from its own loop, so a
+  /// single answer can take a beat; a slow answer means "ask again", never
+  /// "nothing is attached", which is why this is not the overall budget.
+  const QUERY: Duration = Duration::from_millis(500);
+  /// Polling interval while waiting for that answer. The answer arrives over a
+  /// socket, so this only has to stay below "instant"; 25 ms is still 40
+  /// wake-ups per second against replies that take hundreds of milliseconds,
+  /// so the interval is never what the user waits for.
+  const POLL: Duration = Duration::from_millis(25);
+
+  let link = match ipc::open_result() {
+    Ok(link) => link,
+    // No core: nobody can be told, and the per-session doorbell the caller
+    // rings afterwards is everything that is left.
+    Err(_) => return Ok(()),
+  };
+  link.send(CoreCmd::QuitAll);
+  let deadline = Instant::now() + timeout;
+  // Whether any answer actually said "more than just me is attached". The two
+  // ways this command can fail are not the same thing: a window that refuses
+  // to quit is a fact, while a core that never answered is only the absence of
+  // one - and the caller (an installer) must not be told a guess.
+  let mut saw_attached = false;
+  loop {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+      return Err(if saw_attached {
+        format!("windows are still attached after {}", brief(timeout))
+      } else {
+        format!(
+          "no answer from the background service within {}",
+          brief(timeout)
+        )
+      });
+    }
+    link.send(CoreCmd::CoreInfo);
+    let ask_until = Instant::now() + remaining.min(QUERY);
+    // Wait for the answer to *this* question only. The log replay, the
+    // broadcast's own `Quit` and anything else on the wire is not news for a
+    // command that exists to end windows, so nothing is echoed here (an
+    // installer would only have to throw it away).
+    let answer = loop {
+      match link.try_recv() {
+        Some(CoreEv::Core(info)) => break Ok(Some(info)),
+        Some(CoreEv::Error(Some(e))) => return Err(e.to_string()),
+        Some(_) => continue,
+        // The core went away (stopped, or being replaced): nothing is attached
+        // to it any more.
+        None if !link.alive() => break Ok(None),
+        // No answer within the question's own budget: the budget for the whole
+        // command may still be there, so try again.
+        None if Instant::now() >= ask_until => break Err(()),
+        None => std::thread::sleep(POLL),
+      }
+    };
+    match answer {
+      // This command counts as a frontend, so one attached means "all done".
+      Ok(Some(info)) if info.frontends > 1 => {
+        saw_attached = true;
+        continue;
+      }
+      Ok(_) => return Ok(()),
+      Err(()) => continue,
+    }
+  }
+}
+
+/// "800 ms" / "15 s" — a timeout the user reads, rather than `Duration`'s
+/// debug form (`400ms`) or a `0 s` that hides a sub-second budget.
+fn brief(d: Duration) -> String {
+  if d.as_secs() >= 1 {
+    format!("{} s", d.as_secs())
+  } else {
+    format!("{} ms", d.as_millis())
   }
 }
 
@@ -463,10 +629,26 @@ fn run(cli: Cli) -> Result<(), String> {
 /// Every session command goes through the core; none of them opens its own
 /// connection to the portal, so there is exactly one owner of the session.
 fn with_core() -> Result<ipc::Link, String> {
-  let link = ipc::open().ok_or_else(|| {
-    "the background service is not running (start it with `thunet core`, \
-     or enable autostart with `thunet service enable`)"
-      .to_string()
+  let link = ipc::open_result().map_err(|reason| {
+    // The reason matters: "nobody listens" and "something answered but is not
+    // the service" are different problems, and the second one is exactly what
+    // a trust anchor that cannot be read looks like. The hint has to match the
+    // mode: portable mode has no service, and `thunet service enable` is
+    // refused there, so pointing at it would send the user to a dead end. It
+    // also has to name the state directory: a bare `thunet` is machine mode,
+    // so "start the window" only helps if it is the same portable setup.
+    let hint = if ipc::portable() {
+      let dir = crate::config::dir();
+      format!(
+        "portable mode: the core runs inside the window - start it with `thunet --state-dir {}`, \
+         or run `thunet core --state-dir {}` for one without a window",
+        dir.display(),
+        dir.display()
+      )
+    } else {
+      "start it with `thunet core`, or enable autostart with `thunet service enable`".to_string()
+    };
+    format!("the background service is not reachable ({hint}): {reason}")
   })?;
   // The core replays its state, the log tail and any active banner on connect.
   // Everything that arrives before the answer to this marker command is that
