@@ -12,6 +12,7 @@ mod i18n;
 mod ident;
 mod ipc;
 mod logline;
+mod prompt;
 mod proto;
 mod secret;
 mod session;
@@ -43,8 +44,8 @@ fn attach_parent_console() {
   use std::os::windows::io::AsRawHandle as _;
   use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
   use windows_sys::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
-    SetStdHandle,
+    ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetStdHandle,
   };
 
   /// A handle the launcher already set up (console, pipe or redirected file)
@@ -61,8 +62,28 @@ fn attach_parent_console() {
     // standard handles with the console's, which would undo a redirection.
     let out_before = GetStdHandle(STD_OUTPUT_HANDLE);
     let err_before = GetStdHandle(STD_ERROR_HANDLE);
+    let in_before = GetStdHandle(STD_INPUT_HANDLE);
 
-    if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+    // Join the launching terminal. When there is no parent console, a console
+    // this process owns itself (`CREATE_NEW_CONSOLE`, `start`) is the other
+    // possibility: the console devices open exactly when one exists, so they
+    // are both the test and the fix - a GUI process starts without usable
+    // standard handles, and `thunet login` has to read from one.
+    let joined = AttachConsole(ATTACH_PARENT_PROCESS) != 0;
+
+    // `thunet login` asks questions, so stdin has to be the console too: a
+    // prompt that reads from an invalid handle looks like an ignored Enter.
+    if inherited(in_before) {
+      SetStdHandle(STD_INPUT_HANDLE, in_before);
+    } else if let Ok(file) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
+      SetStdHandle(
+        STD_INPUT_HANDLE,
+        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+      );
+      std::mem::forget(file);
+    } else if !joined {
+      // No console at all: nothing to print to and nothing to ask on. This is
+      // the tray started from Explorer.
       return;
     }
 
@@ -204,6 +225,10 @@ enum Cmd {
   /// Show portal session / traffic information.
   Status,
   /// Ask the running service to authenticate now.
+  ///
+  /// Started from a terminal it asks for the account, the password (not echoed)
+  /// and whether to keep the password; `--username`/`--password` skip the
+  /// questions and use that pair for this session only.
   Login,
   /// Ask the running service to de-authenticate.
   Logout,
@@ -425,16 +450,34 @@ fn run(cli: Cli) -> Result<(), String> {
     }
     Cmd::Login => {
       let link = with_core()?;
-      // Credentials on the command line still win, but they are handed to the
-      // core (in memory only) instead of being used behind its back.
-      if cli.username.is_some() || cli.password.is_some() {
+      // Interactive unless the pair came in on the command line: typing the
+      // password is the only way it stays out of the shell history and out of
+      // every process listing.
+      let interactive = cli.username.is_none() && cli.password.is_none() && prompt::available();
+      if interactive || cli.username.is_some() || cli.password.is_some() {
+        let (username, password, remember) = if interactive {
+          ask_credentials(&cfg)?
+        } else {
+          (cfg.username.clone(), cfg.password.clone(), false)
+        };
         link.send(CoreCmd::SetCredentials {
-          username: cfg.username.clone(),
-          password: cfg.password.clone(),
-          // Command-line credentials are for this session only.
-          remember: false,
+          username,
+          password,
+          remember,
+          // False: a password answered with Enter is empty, and the core then
+          // keeps the one it already holds (see `Cmd::SetCredentials`).
           keep_password: false,
         });
+        // The answer says whether the pair was actually stored, which is the
+        // difference the user asked about; staying silent would let a typo in
+        // the account name pass as "saved".
+        match wait_for(&link, Duration::from_secs(10), |ev| {
+          matches!(ev, CoreEv::Credentials(_) | CoreEv::Error(Some(_)))
+        })? {
+          CoreEv::Credentials(state) => println!("{}", credential_line(&state, remember)),
+          CoreEv::Error(Some(e)) => return Err(e.to_string()),
+          _ => return Err("the service did not confirm the credentials".into()),
+        }
       }
       link.send(CoreCmd::Connect);
       settled(&link, Duration::from_secs(40))
@@ -700,6 +743,58 @@ where
       ));
     }
     std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
+/// Ask for the account, the password and whether to keep it.
+///
+/// The stored account is offered as the default so that Enter accepts it; an
+/// empty password answer means "keep the one the core already holds", which is
+/// what makes it possible to change only the *remember* choice without typing
+/// the secret again.
+fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), String> {
+  prompt::arm_cancel();
+  let default = cfg.username.trim();
+  let question = if default.is_empty() {
+    "THUnet account: ".to_string()
+  } else {
+    format!("THUnet account [{default}]: ")
+  };
+  let answer = prompt::line(&question)?;
+  let username = if answer.is_empty() {
+    default.to_string()
+  } else {
+    answer
+  };
+  if username.is_empty() {
+    return Err("no account given".into());
+  }
+  let password = prompt::secret("Password (Enter keeps the stored one): ")?;
+  let answer = prompt::line("Remember the password for the next start? [y/N] ")?;
+  let remember = matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes");
+  Ok((username, password, remember))
+}
+
+/// One line about the pair the core now holds: which account, and whether it
+/// survives a restart. The core answers `SetCredentials` even when it stored
+/// nothing (an incomplete pair, or no portal on this network), so the CLI has
+/// to say which of the two happened instead of assuming success.
+fn credential_line(state: &proto::CredentialState, remember: bool) -> String {
+  let account = if state.username.is_empty() {
+    "(none)".to_string()
+  } else {
+    state.username.clone()
+  };
+  match (remember, state.remembered, state.has_password) {
+    (true, true, _) => format!("credentials: {account}, saved for the next start"),
+    (true, false, _) => {
+      format!("credentials: {account}, NOT saved (a complete --username/--password pair is needed)")
+    }
+    (false, true, _) => {
+      format!("credentials: {account}, this session only (the stored copy is untouched)")
+    }
+    (false, _, true) => format!("credentials: {account}, this session only"),
+    (false, _, false) => format!("credentials: {account}, nothing to log in with"),
   }
 }
 
