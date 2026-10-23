@@ -176,7 +176,7 @@ thunet core                  # 后台服务：真正持有网络会话
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # 让运行中的窗口退出，并等到它真正消失
 thunet status                # JSON：服务自身状态 + 门户会话/流量
-thunet login                 # 认证：stdin 三行，或用 -i 让它提问
+thunet login                 # 认证：stdin 三行、-i 提问，--cmd/--bash 打印该敲的命令
 thunet logout                # 让服务注销
 thunet ac-id                 # 服务正在使用的门户 ac_id
 thunet config                # 配置路径 + 生效中的设置
@@ -211,35 +211,28 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 
 第 3 行默认「保存」是有意的：绝大多数人就是想把密码存下来，而且在线时 core 会先把这一对证明给对方看再落盘，门户拒绝时它会退回原来那份凭据。离线时没有东西可证明，这一对会先存下来，等网络恢复后再用。
 
-不加 `-i` 时任何平台都不会提问：可执行文件是 GUI 子系统的程序，本身不拥有控制台，而它附加的那个控制台正被 shell 同时读取——回车会被 shell 自己的行编辑器吃掉，答案会被两边分掉。这就是默认走管道的原因，也是 `-i` 的含义：你明确承诺有一个 shell 正在等着回答。
+不加 `-i` 时任何平台都不会提问：Windows 上的可执行文件是 GUI 子系统的程序，本身不拥有控制台，而它附加的那个控制台正被 shell 同时读取——回车会被 shell 自己的行编辑器吃掉，答案会被两边分掉。这就是默认走管道的原因，也是 `-i` 的含义：你明确承诺有一个 shell 正在等着回答。
 
 `-i` 把这同样三件事问出来而不是读出来：账号（已保存的账号作为默认值，回车即沿用）、密码（不回显，回车则沿用服务当前持有的那个）、以及是否记住——`[Y/n]`，回车表示「是」，只有 `n`、`no`、`0` 或 `false` 表示「否」，而「否」还会删掉之前保存的那份。任何一步按 Ctrl+C 都会取消：终端恢复原样，进程以 130 退出。stdin 是什么，答案就从哪里来：接的是管道，答案就是那三行；那里没有任何可用输入时，问题会立刻失败而不是一直等下去。这个承诺没有任何东西替你检查。
 
-**Windows：** 这个承诺意味着 `cmd /c thunet login -i`——交互式 `cmd.exe` 和 PowerShell 在启动一个 GUI 子系统程序之后立刻回到自己的提示符，会把答案抢走。**Linux 和 macOS：** 任何终端都可以，因为 shell 会等待程序；用 `-i` 不需要额外设置。Windows 上的 Git Bash 实际是 mintty：它是终端模拟器而不是控制台，在它里面启动的原生程序看到的是管道 stdin，所以在那里问题是从那条管道得到答案的，密码也会被终端原样回显——请用 Windows Terminal 里的 bash（真正的控制台）、`cmd /c`，或者管道写法。
+这个承诺在哪些 shell 里成立，取决于 shell 而不是平台：
 
-管道写法有三段可直接粘贴的配方。先看 PowerShell，它通过 `cmd.exe /c` 接管道：PowerShell 会等待控制台子系统程序，但**不会**等待窗口子系统程序，所以它在本命令打印任何东西之前就回到了提示符，输出会乱序甚至丢失；`cmd.exe` 两者都等，输出顺序才是稳定的。
+| Shell | 该敲的命令 |
+| --- | --- |
+| `cmd.exe`、PowerShell 5.1 / 7 | `cmd /c thunet login -i` |
+| bash、zsh、sh、fish（Linux、macOS，以及 Windows 上的 Git Bash） | `thunet login -i` |
 
-```powershell
-$a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
-$r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
-"$a`n$p`n$r" | cmd.exe /c thunet login
-```
+交互式 `cmd.exe` 和 PowerShell 在启动一个 GUI 子系统程序之后立刻回到自己的提示符，会把答案抢走；`cmd /c` 会把这一行剩下的部分当成命令执行，而 cmd 会等它的子进程。bash 和 POSIX 系列在所有平台都等待前台子进程（Git Bash 也一样），所以那里 `-i` 不需要前缀。Git Bash 有两个细节：单个斜杠的开关会被当成路径，所以在那里敲 `cmd /c` 只会把 cmd.exe 单独启动起来（请用不带前缀的写法，或者确实要用 cmd 时写 `cmd //c`）；如果终端给原生程序的是管道而不是控制台，答案就只能从那条管道喂进去。
 
-```bat
-set "a=" & set /p "a=account: "
-set "p=" & set /p "p=password: "
-set "r=y" & set /p "r=remember? [Y/n]: "
-(echo(%a%& echo(%p%& echo(%r%) | thunet login
-```
+`thunet login --cmd`（别名 `--pwsh`）打印 Windows 那一行，`thunet login --bash`（别名 `--zsh`、`--sh`、`--fish`）打印 POSIX 那一行，所以手边有终端时不必翻这一页。两者都只打印一行、别的不打印——问题本身由 `-i` 提出，所以不再需要逐 shell 的粘贴块。
 
-`cmd.exe` 没法隐藏输入，而且值里的 `& | < > ^ %` 会被它解释，所以密码里含这些字符时请用 PowerShell。Linux 和 macOS 上同样三行由 `read` 提供：
+脚本仍然可以把三行喂给 stdin，完全不依赖 shell：
 
 ```bash
-read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}
-printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
+printf 'alice\npw\ny\n' | thunet login
 ```
 
-密码从不进入 `argv`，也不进入 shell 历史：它只会从 stdin 读取，所以任何进程列表里都看不到它。`thunet login --help` 是这套说明的短版本，`thunet login -v` 是长版本，附带配方背后的原因。
+密码从不进入 `argv`，也不进入 shell 历史：它只会从控制台或那条管道读取，所以任何进程列表里都看不到它。`thunet login --help` 是这套说明的短版本，`thunet login -v` 是长版本，附带两条命令背后的原因。
 
 这个命令从不沉默。它先说明打算用哪个账号、这个账号从哪来——直接运行是 `account: alice (stored)`，接了管道则是 `account: alice (stdin, remember yes)` 或 `(stdin, remember no)`，用 `-i` 问出来则是 `account: alice (asked)`——然后打印服务状态，core 持有账号时会一并写出（`session: online as bob`、`session: authenticating as alice`、`session: offline (credential: alice)`，或者干脆只有 `session: offline`），最后说明它做了什么：
 

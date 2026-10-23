@@ -88,6 +88,12 @@ complete -c thunet -n "__fish_thunet_using_subcommand login" -l state-dir -d 'Wh
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand login" -s v -l verbose -d 'Print the long explanation and exit'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -s i -l interactive -d 'Ask for the account, the password and whether to remember, on this console'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l cmd -d 'Print the command line for cmd.exe and PowerShell, then exit'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l bash -d 'Print the command line for any POSIX shell, then exit'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l pwsh -d 'Alias for `--cmd`'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l zsh -d 'Alias for `--bash`'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l sh -d 'Alias for `--bash`'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -l fish -d 'Alias for `--bash`'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'

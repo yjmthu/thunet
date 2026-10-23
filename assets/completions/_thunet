@@ -94,6 +94,12 @@ _arguments "${_arguments_options[@]}" : \
 '--verbose[Print the long explanation and exit]' \
 '-i[Ask for the account, the password and whether to remember, on this console]' \
 '--interactive[Ask for the account, the password and whether to remember, on this console]' \
+'--cmd[Print the command line for cmd.exe and PowerShell, then exit]' \
+'--bash[Print the command line for any POSIX shell, then exit]' \
+'--pwsh[Alias for \`--cmd\`]' \
+'--zsh[Alias for \`--bash\`]' \
+'--sh[Alias for \`--bash\`]' \
+'--fish[Alias for \`--bash\`]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \

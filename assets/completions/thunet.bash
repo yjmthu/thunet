@@ -527,7 +527,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__login)
-            opts="-v -i -h --verbose --interactive --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --help"
+            opts="-v -i -h --verbose --interactive --cmd --bash --pwsh --zsh --sh --fish --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

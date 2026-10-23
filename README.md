@@ -184,7 +184,7 @@ thunet core                  # background service: owns the network session
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # ask the running window to exit and wait until it is gone
 thunet status                # JSON: service state + portal session/traffic
-thunet login                 # authenticate: three lines on stdin, or -i to be asked
+thunet login                 # authenticate: stdin three lines, -i to ask, --cmd/--bash for the line
 thunet logout                # ask the service to de-authenticate
 thunet ac-id                 # portal ac_id the service is using
 thunet config                # config path + effective settings
@@ -219,35 +219,28 @@ The three lines are, with what an empty one means:
 
 The default on line 3 is "store" on purpose: saving the password is what most people want, and while the machine is online the core proves a pair before it writes it, falling back to the credential it already had when the portal refuses it. Offline there is nothing to prove it against, so the pair is stored first and used when the network returns.
 
-Without `-i` nothing is asked on any platform: the executable is a GUI-subsystem binary, so it owns no console of its own, and the console it attaches to is one the shell is reading at the same time — an Enter would be taken by the shell's own line editor and the answers split between the two. That is why the default path is a pipe, and why `-i` is your explicit promise that a shell is waiting to answer.
+Without `-i` nothing is asked on any platform: on Windows the executable is a windowed binary, so it owns no console of its own, and the console it attaches to is one the shell is reading at the same time — an Enter would be taken by the shell's own line editor and the answers split between the two. That is why the default path is a pipe, and why `-i` is your explicit promise that a shell is waiting to answer.
 
 `-i` asks the same three things instead of reading them: the account (the stored one is offered as the default, so Enter keeps it), the password (not echoed; Enter keeps the one the service holds) and remembering — `[Y/n]`, where Enter means yes and only `n`, `no`, `0` or `false` means no, which also deletes a password stored earlier. Ctrl+C cancels at any question, leaves the terminal as it was and exits with status 130. Whatever stdin is, that is where the answers come from: with a pipe they are the three lines, and with nothing usable there the question fails at once rather than waiting. Nothing checks the promise for you.
 
-**Windows:** that promise means `cmd /c thunet login -i` — an interactive `cmd.exe` and PowerShell both return to their prompt as soon as they have started a GUI-subsystem program, and would eat the answers. **Linux and macOS:** any terminal works, because the shell waits; there is no `-i`-specific setup. Git Bash on Windows is mintty, a terminal emulator rather than a console: a native program started there sees a pipe on stdin, so the questions are answered from that pipe and the password is echoed by the terminal as it is typed — use bash inside Windows Terminal (a real console), `cmd /c`, or the pipe form.
+Where that promise holds depends on the shell, not on the platform:
 
-Three copy-paste recipes for the pipe form. PowerShell first, piped through `cmd.exe /c`: PowerShell waits for a console-subsystem program but not for a windowed one, so it returns to its prompt before this command has printed anything and the report would arrive out of order; `cmd.exe` waits for both, which keeps the output in order.
+| Shell | The line that works |
+| --- | --- |
+| `cmd.exe`, PowerShell 5.1 and 7 | `cmd /c thunet login -i` |
+| bash, zsh, sh, fish — Linux, macOS, and Git Bash on Windows | `thunet login -i` |
 
-```powershell
-$a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
-$r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
-"$a`n$p`n$r" | cmd.exe /c thunet login
-```
+An interactive `cmd.exe` and PowerShell return to their prompt as soon as they have started a windowed program, and would eat the answers; `cmd /c` runs the rest of the line as a command, and cmd waits for a command's child. bash and the POSIX shells wait for a foreground child everywhere, Git Bash included, so `-i` needs no prefix there. Two Git Bash details: a single-slash switch reads as a path to that shell, so `cmd /c` typed there merely starts `cmd.exe` by itself (use the plain form, or `cmd //c` if you really want cmd), and a terminal that hands this program a pipe instead of a console can only be answered through that pipe.
 
-```bat
-set "a=" & set /p "a=account: "
-set "p=" & set /p "p=password: "
-set "r=y" & set /p "r=remember? [Y/n]: "
-(echo(%a%& echo(%p%& echo(%r%) | thunet login
-```
+`thunet login --cmd` (alias `--pwsh`) prints the Windows line and `thunet login --bash` (aliases `--zsh`, `--sh`, `--fish`) prints the POSIX one, so a terminal never needs this page. Both print one line and nothing else — the questions come from `-i`, which is why there are no per-shell blocks left to paste.
 
-`cmd.exe` cannot mask what is typed, and `& | < > ^ %` inside a value are interpreted by it, so use PowerShell for a password that contains one. On Linux and macOS the same three lines come from `read`:
+Scripts still feed the three lines through stdin, which needs no shell at all:
 
 ```bash
-read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}
-printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
+printf 'alice\npw\ny\n' | thunet login
 ```
 
-The password never reaches `argv` and never enters the shell history; it is only read from stdin, so no process listing shows it either. `thunet login --help` is the short form of all this and `thunet login -v` the long one, with the reasoning behind the recipes.
+The password never reaches `argv` and never enters the shell history; it is read from the console or from that pipe, so no process listing shows it either. `thunet login --help` is the short form of all this and `thunet login -v` the long one, with the reasoning behind the two commands.
 
 The command is never silent. It first says which account it will use and where that came from — `account: alice (stored)` for a bare run, `account: alice (stdin, remember yes)` or `(stdin, remember no)` when a pair was piped, `account: alice (asked)` when `-i` asked — then the service's state, which names the account the service holds when it has one (`session: online as bob`, `session: authenticating as alice`, `session: offline (credential: alice)`, or a bare `session: offline`), and then what it did:
 

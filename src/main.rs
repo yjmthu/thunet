@@ -205,65 +205,83 @@ struct Cli {
   cmd: Option<Cmd>,
 }
 
-/// What `thunet login --help` shows: the three lines and one recipe per shell.
+/// What `thunet login --help` shows: the three lines and the two commands.
 ///
-/// It stays short on purpose - `-v` carries the reasoning - and both Windows
-/// entry points are named because the PowerShell recipe needs `cmd.exe /c`: a
-/// GUI-subsystem program cannot pick the shell it was started from, and a user
-/// who pastes the wrong thing should see the failure at once.
+/// It stays short on purpose: each command is printed by a flag, and `-v` carries
+/// the reasoning. Nothing here guesses which shell is running - a windowed
+/// program cannot tell, and the reader knows.
+///
+/// The two commands are written out rather than interpolated: this text is
+/// attached with `after_help`, which needs a constant, and the reader may be in
+/// any shell no matter which platform this build runs on.
+const LOGIN_HELP: &str = r#"The account and the password are read from stdin, never from an argument: three
+lines - account, password, remember. An empty account keeps the stored one, an
+empty password keeps the password the service holds, and only n/no/0/false skips
+storing (which removes a stored one). Without a pipe the command connects with
+the pair the service already holds.
+
+  Ask instead:  cmd /c thunet login -i      cmd.exe and PowerShell
+                thunet login -i             bash, zsh, sh, fish, Linux, macOS
+  Print one:    thunet login --cmd          also --pwsh
+                thunet login --bash         also --zsh, --sh, --fish
+  Scripts:      printf 'alice\npw\ny\n' | thunet login
+
+This text in full: thunet login --verbose"#;
+
+/// The three questions, word for word: `-i` asks them, and the tests compare the
+/// wording against these rather than repeating it.
+const ASK_ACCOUNT: &str = "THUnet account";
+const ASK_PASSWORD: &str = "Password (Enter keeps the stored one)";
+const ASK_REMEMBER: &str = "Remember the password for the next start? [Y/n]";
+
+/// The line that makes `-i` work in the shell the reader is using, printed by
+/// `thunet login --cmd` (alias `--pwsh`).
+///
+/// cmd.exe and PowerShell return to their prompt as soon as they have started
+/// this windowed program, so their line editor would take the answers; `cmd /c`
+/// runs the rest of the line as a command, and cmd waits for a command's child.
 #[cfg(windows)]
-const LOGIN_HELP: &str = r#"The account and the password are read from stdin, never from an argument: three
-lines - account, password, remember. An empty account keeps the stored one, an
-empty password keeps the password the service holds, and only n/no/0/false skips
-storing (which removes a stored one). Without a pipe the command connects with
-the pair the service already holds.
-
-  PowerShell:  $a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput; $r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }; "$a`n$p`n$r" | cmd.exe /c thunet login
-  Interactive: cmd /c thunet login -i     (PowerShell does not wait for this program; cmd does)
-  Scripts:     printf 'alice\npw\ny\n' | thunet login
-
-This text in full: thunet login --verbose"#;
-
+const INTERACTIVE_CMD: &str = "cmd /c thunet login -i";
 #[cfg(not(windows))]
-const LOGIN_HELP: &str = r#"The account and the password are read from stdin, never from an argument: three
-lines - account, password, remember. An empty account keeps the stored one, an
-empty password keeps the password the service holds, and only n/no/0/false skips
-storing (which removes a stored one). Without a pipe the command connects with
-the pair the service already holds.
+const INTERACTIVE_CMD: &str = "thunet login -i";
 
-  bash/zsh:    read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}; printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
-  Interactive: thunet login -i
-  Scripts:     printf 'alice\npw\ny\n' | thunet login
-
-This text in full: thunet login --verbose"#;
+/// The same line for the POSIX shells, printed by `--bash` and its aliases.
+///
+/// They wait for a foreground child on every platform - Git Bash on Windows
+/// included - so this one needs no `cfg`.
+const INTERACTIVE_POSIX: &str = "thunet login -i";
 
 /// What `thunet login -v` prints: everything `--help` leaves out.
 ///
 /// The same text on every platform, because it is about the protocol and about
-/// the two Windows shells rather than about the shell the reader happens to use.
+/// the shells that do not wait rather than about the one the reader happens to
+/// use. The two commands are written out for the same reason `LOGIN_HELP` does
+/// it: this is a constant, and a reader may be in a shell of either kind.
 const LOGIN_LONG: &str = r#"thunet login takes the account and the password on stdin, three lines, and asks
-nothing unless you pass -i: the executable is a GUI-subsystem program, so it owns
-no console of its own, and the console it attaches to is one the shell is reading
-at the same time - an Enter would be taken by the shell's own line editor and the
-answers split between the two. stdin is the one channel both sides can share, and
--i is your explicit promise that the shell is waiting and shares its console with
-this command.
+nothing unless you pass -i: on Windows this executable is a windowed program, so
+it owns no console of its own and attaches to the one the shell is reading at the
+same time - an Enter would be taken by the shell's own line editor and the
+answers split between the two. stdin is the one channel both sides can share.
 
   line 1  account    empty keeps the account the service already holds
   line 2  password   empty keeps the password the service already holds
   line 3  remember   stored unless this line says n, no, 0 or false
 
-With -i the same three answers are asked instead of read: the account (the stored
-one is offered as the default, so Enter keeps it), the password (not echoed, and
-Enter keeps the one the service holds) and remember ([Y/n], where Enter means
-yes). The flag is your promise that the shell is waiting, and nothing here
-second-guesses it: on Windows that promise means `cmd /c thunet login -i`, because
-an interactive cmd and PowerShell both return to their prompt as soon as they
-have started a windowed program and would eat the answers. In a mintty Git Bash
-the native stdin is a pipe, so there the questions are answered from the pipe and
-the password is echoed by the terminal - use bash inside Windows Terminal,
-`cmd /c`, or the pipe form (`printf 'alice\npw\ny\n' | thunet login`). On Linux
-and macOS any terminal works, because the shell waits for the program.
+With -i the same three answers are asked instead: the account (the stored one is
+offered as the default, so Enter keeps it), the password (not echoed, and Enter
+keeps the one the service holds) and remember ([Y/n], where Enter means yes). The
+flag is your promise that the shell is waiting, and nothing here second-guesses
+it. Which line keeps that promise depends on the shell, not on the platform:
+
+  cmd /c thunet login -i     cmd.exe and PowerShell (Windows)
+  thunet login -i            bash, zsh, sh, fish, Linux, macOS
+
+cmd.exe and PowerShell return to their prompt as soon as they have started a
+windowed program, and their line editor would take the answers; `cmd /c` runs the
+rest of the line as a command, and cmd waits for a command's child. bash waits
+for a foreground child everywhere, Git Bash on Windows included. A single-slash
+switch reads as a path to Git Bash, so `cmd /c` typed there merely starts cmd.exe
+by itself - use the plain form.
 
 Skipping does not merely leave the disk alone: the answer n, no, 0 or false
 deletes a password stored earlier, the same clear the window does when you untick
@@ -276,26 +294,8 @@ network returns.
 Without a pipe and without -i (a terminal, a bare launch) nothing is read at all;
 the command only asks the service to connect with the pair it already holds.
 
-PowerShell is piped through cmd.exe on purpose: PowerShell waits for a
-console-subsystem program but not for a windowed one, so it returns to its prompt
-before this command has printed anything and the report would arrive out of order
-or not at all. cmd.exe waits for both, so the output stays in order:
-
-  $a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
-  $r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
-  "$a`n$p`n$r" | cmd.exe /c thunet login
-
-The cmd.exe form, four lines, for a shell where that is what you have. It cannot
-mask the password, and `& | < > ^ %` inside a value are interpreted by echo, so
-use PowerShell for a password that contains one:
-
-  set "a=" & set /p "a=account: "
-  set "p=" & set /p "p=password: "
-  set "r=y" & set /p "r=remember? [Y/n]: "
-  (echo(%a%& echo(%p%& echo(%r%) | thunet login
-
 The password never reaches argv and never enters the shell history: it is only
-ever read from that pipe, so no process listing shows it either."#;
+ever read from that pipe or from the console, so no process listing shows it."#;
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -310,9 +310,16 @@ enum Cmd {
   /// Without `-i` nothing is asked: the account and the password come from stdin,
   /// three lines, or from the pair the service already holds. With `-i` the three
   /// questions are asked instead, reading whatever stdin is - the flag is the
-  /// promise that a shell is waiting to answer them. The help below carries one
-  /// pasteable recipe per shell.
-  #[command(after_help = LOGIN_HELP)]
+  /// promise that a shell is waiting to answer them. `--cmd` (alias `--pwsh`)
+  /// prints the line that makes that promise in cmd.exe and PowerShell, and
+  /// `--bash` (aliases `--zsh`, `--sh`, `--fish`) the one every POSIX shell
+  /// already honours.
+  #[command(
+    after_help = LOGIN_HELP,
+    group(clap::ArgGroup::new("recipe")
+      .multiple(false)
+      .conflicts_with_all(["verbose", "interactive"]))
+  )]
   Login {
     /// Print the long explanation and exit.
     #[arg(short, long)]
@@ -320,6 +327,24 @@ enum Cmd {
     /// Ask for the account, the password and whether to remember, on this console.
     #[arg(short, long)]
     interactive: bool,
+    /// Print the command line for cmd.exe and PowerShell, then exit.
+    #[arg(long, group = "recipe")]
+    cmd: bool,
+    /// Print the command line for any POSIX shell, then exit.
+    #[arg(long, group = "recipe")]
+    bash: bool,
+    /// Alias for `--cmd`.
+    #[arg(long, group = "recipe", hide = true)]
+    pwsh: bool,
+    /// Alias for `--bash`.
+    #[arg(long, group = "recipe", hide = true)]
+    zsh: bool,
+    /// Alias for `--bash`.
+    #[arg(long, group = "recipe", hide = true)]
+    sh: bool,
+    /// Alias for `--bash`.
+    #[arg(long, group = "recipe", hide = true)]
+    fish: bool,
   },
   /// Ask the running service to de-authenticate.
   Logout,
@@ -546,7 +571,24 @@ fn run(cli: Cli) -> Result<(), String> {
     Cmd::Login {
       verbose,
       interactive,
+      pwsh,
+      cmd,
+      bash,
+      zsh,
+      sh,
+      fish,
     } => {
+      // A printed command is output and nothing else: it works without a
+      // service, a console or a terminal, and it never looks at the shell that
+      // is running.
+      if cmd || pwsh {
+        say(INTERACTIVE_CMD);
+        return Ok(());
+      }
+      if bash || zsh || sh || fish {
+        say(INTERACTIVE_POSIX);
+        return Ok(());
+      }
       // Before anything touches the service: the long form is documentation, so
       // it has to work on a machine where no core is running at all.
       if verbose {
@@ -584,13 +626,12 @@ fn run(cli: Cli) -> Result<(), String> {
         _ => cfg.username.trim().to_string(),
       };
       if account.is_empty() {
-        return Err(
+        return Err(format!(
           "no account: nothing was piped and the service holds no credential. Put the account, \
            the password and `y` or `no` on the first three lines of stdin and pipe them into \
-           `thunet login`, or run `thunet login -i` to be asked; `thunet login --verbose` shows \
-           the details"
-            .into(),
-        );
+           `thunet login`, or run `{INTERACTIVE_CMD}` to be asked; `thunet login --verbose` \
+           shows the details"
+        ));
       }
       // Never silent: where the account came from, what the service is doing,
       // and then what the answers do to the stored credential.
@@ -979,9 +1020,9 @@ fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), Strin
   prompt::arm_cancel();
   let default = cfg.username.trim();
   let question = if default.is_empty() {
-    "THUnet account: ".to_string()
+    format!("{ASK_ACCOUNT}: ")
   } else {
-    format!("THUnet account [{default}]: ")
+    format!("{ASK_ACCOUNT} [{default}]: ")
   };
   let username = match prompt::line(&question)? {
     answer if answer.is_empty() => default.to_string(),
@@ -990,10 +1031,8 @@ fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), Strin
   if username.is_empty() {
     return Err("no account given".into());
   }
-  let password = prompt::secret("Password (Enter keeps the stored one): ")?;
-  let remember = wants_remember(&prompt::line(
-    "Remember the password for the next start? [Y/n] ",
-  )?);
+  let password = prompt::secret(&format!("{ASK_PASSWORD}: "))?;
+  let remember = wants_remember(&prompt::line(&format!("{ASK_REMEMBER} "))?);
   Ok((username, password, remember))
 }
 
@@ -1135,54 +1174,75 @@ mod tests {
     }
   }
 
-  /// `--help` is the short form and `-v` the long one, so the short form has to
-  /// point at the long one and name both other entry points.
+  /// `--help` is the short form and `-v` the long one, so every fact the reader
+  /// needs to pick a command has to be in one of them.
   #[test]
-  fn the_short_help_points_at_the_long_one() {
-    assert!(
-      LOGIN_HELP.contains("thunet login --verbose"),
-      "{LOGIN_HELP}"
-    );
-    assert!(LOGIN_HELP.contains("login -i"), "{LOGIN_HELP}");
-    assert!(LOGIN_HELP.contains("remember? [Y/n]"), "{LOGIN_HELP}");
-    assert!(LOGIN_HELP.contains("n/no/0/false"), "{LOGIN_HELP}");
-    #[cfg(windows)]
-    {
+  fn the_short_help_names_both_commands_and_their_flags() {
+    for needle in [
+      INTERACTIVE_CMD,
+      INTERACTIVE_POSIX,
+      "--cmd",
+      "--pwsh",
+      "--bash",
+      "n/no/0/false",
+      "printf 'alice\\npw\\ny\\n' | thunet login",
+      "thunet login --verbose",
+    ] {
       assert!(
-        LOGIN_HELP.contains("cmd.exe /c thunet login"),
-        "{LOGIN_HELP}"
+        LOGIN_HELP.contains(needle),
+        "missing {needle:?} in {LOGIN_HELP}"
       );
-      assert!(LOGIN_HELP.contains("-MaskInput"), "{LOGIN_HELP}");
-      assert!(
-        LOGIN_HELP.contains("cmd /c thunet login -i"),
-        "{LOGIN_HELP}"
-      );
-    }
-    #[cfg(not(windows))]
-    {
-      assert!(LOGIN_HELP.contains("bash/zsh:"), "{LOGIN_HELP}");
-      assert!(LOGIN_HELP.contains("printf '%s\\n%s\\n%s\\n'"));
     }
   }
 
-  /// The long form is the one that has to stay complete: the four-line cmd.exe
-  /// recipe, the third-line rule and the reason the default is "store".
+  /// The long form is the one that keeps the rules and the reasoning: the third
+  /// line, the promise `-i` makes, and why a Windows shell needs `cmd /c`.
   #[test]
-  fn the_long_help_carries_the_recipe_and_the_rules() {
+  fn the_long_help_carries_the_rules_and_the_reasoning() {
     for needle in [
-      "set \"a=\" & set /p \"a=account: \"",
-      "set \"p=\" & set /p \"p=password: \"",
-      "set \"r=y\" & set /p \"r=remember? [Y/n]: \"",
-      "(echo(%a%& echo(%p%& echo(%r%) | thunet login",
-      "cmd.exe /c thunet login",
+      "cmd.exe and PowerShell",
+      "cmd /c thunet login -i",
+      "Git Bash",
       "n, no, 0 or false",
       "deletes a password stored earlier",
       "proves a pair before it writes it",
       "argv",
-      "cmd /c thunet login -i",
-      "mintty",
+      "nothing here",
     ] {
       assert!(LOGIN_LONG.contains(needle), "missing {needle:?}");
+    }
+  }
+
+  /// The two printed commands differ exactly where the shells do: cmd.exe and
+  /// PowerShell need `cmd /c`, every POSIX shell (Git Bash included) does not.
+  #[test]
+  fn the_printed_commands_match_the_shells_that_wait() {
+    assert_eq!(INTERACTIVE_POSIX, "thunet login -i");
+    #[cfg(windows)]
+    assert_eq!(INTERACTIVE_CMD, "cmd /c thunet login -i");
+    #[cfg(not(windows))]
+    assert_eq!(INTERACTIVE_CMD, INTERACTIVE_POSIX);
+  }
+
+  /// A printed command is output only, so exactly one of the flags can be meant.
+  #[test]
+  fn the_printed_command_flags_are_exclusive() {
+    for flag in ["--pwsh", "--cmd", "--bash", "--zsh", "--sh", "--fish"] {
+      assert!(
+        Cli::try_parse_from(["thunet", "login", flag]).is_ok(),
+        "{flag} should be accepted"
+      );
+    }
+    for both in [
+      ["--pwsh", "--bash"],
+      ["--cmd", "--fish"],
+      ["--bash", "-i"],
+      ["--bash", "-v"],
+    ] {
+      assert!(
+        Cli::try_parse_from(["thunet", "login", both[0], both[1]]).is_err(),
+        "{both:?} should be refused"
+      );
     }
   }
 
