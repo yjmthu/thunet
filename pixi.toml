@@ -47,9 +47,11 @@ bzip2 = "*"
 scripts = ["scripts/activate_linux.sh"]
 
 [feature.dev.tasks]
-# Refresh `.vscode/settings.json` so rust-analyzer inherits this environment
-# (toolchain paths differ per platform, so the file is generated locally).
+# Refresh `.vscode/settings.json` and `.zed/settings.json` so rust-analyzer
+# inherits this environment (toolchain paths differ per platform, so the files
+# are generated locally).
 vscode-settings = "python scripts/vscode_settings.py"
+zed-settings = "python scripts/vscode_settings.py"
 
 # ------------------------------------------------------------------ packaging
 # `pixi run -e package msi`   -> dist/thunet-<version>-x64.msi      (Windows)

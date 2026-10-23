@@ -452,7 +452,7 @@ pixi run -e dev cargo test
 pixi run -e dev cargo fmt
 ```
 
-Editing with rust-analyzer needs one extra step, because the toolchain lives inside the pixi environment (Windows `Library/bin`, Linux `bin` plus the GTK `PKG_CONFIG_PATH`) and rust-analyzer is a separate process that cannot see it. `pixi run -e dev vscode-settings` writes the local, git-ignored `.vscode/settings.json` with this machine's paths, so the editor gets completion, hover, go-to-definition and diagnostics without being started from a pixi shell.
+Editing with rust-analyzer needs one extra step, because the toolchain lives inside the pixi environment (Windows `Library/bin`, Linux `bin` plus the GTK `PKG_CONFIG_PATH`) and rust-analyzer is a separate process that cannot see it. `pixi run -e dev vscode-settings` writes the local, git-ignored `.vscode/settings.json` with this machine's paths, so the editor gets completion, hover, go-to-definition and diagnostics without being started from a pixi shell. The same command also writes the git-ignored `.zed/settings.json`, which hands the same environment to Zed's rust-analyzer.
 
 The release profile uses `lto`, `opt-level = "z"`, `codegen-units = 1`, `panic = "abort"` and `strip`, so the result is a single self-contained executable with no runtime assets — the window, tray icon and fonts are all created at runtime.
 

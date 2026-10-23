@@ -442,7 +442,7 @@ pixi run -e dev cargo test
 pixi run -e dev cargo fmt
 ```
 
-用 rust-analyzer 编辑还需要一步：工具链装在 pixi 环境里（Windows 是 `Library/bin`，Linux 是 `bin` 加上 GTK 的 `PKG_CONFIG_PATH`），而 rust-analyzer 是独立进程，看不到这些。`pixi run -e dev vscode-settings` 会把本机路径写进被 git 忽略的 `.vscode/settings.json`，这样不用从 pixi shell 启动编辑器，也能有补全、悬浮、跳转和诊断。
+用 rust-analyzer 编辑还需要一步：工具链装在 pixi 环境里（Windows 是 `Library/bin`，Linux 是 `bin` 加上 GTK 的 `PKG_CONFIG_PATH`），而 rust-analyzer 是独立进程，看不到这些。`pixi run -e dev vscode-settings` 会把本机路径写进被 git 忽略的 `.vscode/settings.json`，这样不用从 pixi shell 启动编辑器，也能有补全、悬浮、跳转和诊断。同一条命令还会写出被 git 忽略的 `.zed/settings.json`，把同样的环境交给 Zed 的 rust-analyzer。
 
 release profile 使用 `lto`、`opt-level = "z"`、`codegen-units = 1`、`panic = "abort"` 和 `strip`，产物是单个自包含的可执行文件，不需要任何运行时资源 —— 窗口、托盘图标和字体都在运行时创建。
 
