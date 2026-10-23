@@ -22,6 +22,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
+use crate::core::{POLL_OFFLINE, POLL_ONLINE};
 use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
@@ -187,6 +188,52 @@ fn state_color(state: State) -> egui::Color32 {
   egui::Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// How far one status-poll cycle has run, 0.0 .. 1.0.
+fn heartbeat_fraction(elapsed: Duration, period: Duration) -> f32 {
+  if period.is_zero() {
+    return 0.0;
+  }
+  (elapsed.as_secs_f32() / period.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// The ring beside the state label: it restarts on every status answer and
+/// turns amber after the core has missed a whole cycle.
+fn heartbeat_ring(ui: &mut egui::Ui, state: State, at: Option<Instant>, t: &Texts) {
+  const SIDE: f32 = 14.0;
+  const STROKE: f32 = 2.0;
+  let period = if state == State::Online {
+    POLL_ONLINE
+  } else {
+    POLL_OFFLINE
+  };
+  let (rect, resp) = ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::hover());
+  let painter = ui.painter();
+  let center = rect.center();
+  let radius = SIDE / 2.0 - STROKE / 2.0;
+  let track = ui.visuals().widgets.noninteractive.bg_stroke.color;
+  painter.circle_stroke(center, radius, egui::Stroke::new(STROKE, track));
+
+  let elapsed = at.map_or(Duration::ZERO, |instant| instant.elapsed());
+  let fraction = heartbeat_fraction(elapsed, period);
+  let color = match at {
+    None => ui.visuals().weak_text_color(),
+    Some(_) if elapsed > period.mul_f32(1.8) => level_color(Level::Warn, ui.visuals()),
+    Some(_) => state_color(state),
+  };
+  if fraction > 0.0 {
+    let steps = (64.0 * fraction).ceil() as usize;
+    let start = -std::f32::consts::FRAC_PI_2;
+    let points: Vec<egui::Pos2> = (0..=steps)
+      .map(|i| {
+        let angle = start + std::f32::consts::TAU * fraction * i as f32 / steps as f32;
+        center + egui::vec2(radius * angle.cos(), radius * angle.sin())
+      })
+      .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(STROKE, color)));
+  }
+  let _ = resp.on_hover_text(t.heartbeat_hint);
+}
+
 /// `config.json`'s `theme` setting ("auto" | "light" | "dark"), as egui wants
 /// it. `auto` resolves to the desktop's own preference where it can be read
 /// (see [`crate::theme`]), and otherwise to egui's `System`, which is what
@@ -306,6 +353,9 @@ pub struct App {
   next_uplink: Instant,
   state: State,
   info: Info,
+  /// When the last status answer arrived. The ring beside the state label
+  /// advances over one poll period and restarts here.
+  last_heartbeat: Option<Instant>,
   /// The device badge was clicked and its list is showing.
   devices_open: bool,
   logs: Vec<Line>,
@@ -549,6 +599,7 @@ impl App {
       next_uplink: Instant::now(),
       state: State::Offline,
       info: Info::default(),
+      last_heartbeat: None,
       devices_open: false,
       logs,
       last_error: None,
@@ -632,6 +683,7 @@ impl App {
     self.last_error = None;
     self.state = State::Offline;
     self.info = Info::default();
+    self.last_heartbeat = None;
     if let Some(v) = stale
       && self.core_stale != Some(v)
     {
@@ -1423,7 +1475,10 @@ impl App {
       }
       match ev {
         Ev::State(s) => self.state = s,
-        Ev::Info(v) => self.info = info_from(&v),
+        Ev::Info(v) => {
+          self.info = info_from(&v);
+          self.last_heartbeat = Some(Instant::now());
+        }
         Ev::Log(line) => self.push_log(line),
         Ev::Error(e) => self.last_error = e,
         Ev::Notify { msg, kind } => {
@@ -1556,6 +1611,8 @@ impl App {
                 .size(18.0),
             );
             ui.label(egui::RichText::new(label).size(18.0).strong());
+            ui.add_space(2.0);
+            heartbeat_ring(ui, self.state, self.last_heartbeat, t);
           } else {
             // The same gear as the button that opened this page, so the two
             // read as the same place.
@@ -3643,6 +3700,20 @@ mod tests {
     // Falls back to `ip` when no session address is reported.
     let v: Value = serde_json::from_str(r#"{"ip":"198.51.100.7"}"#).unwrap();
     assert_eq!(info_from(&v).ip4, "198.51.100.7");
+  }
+
+  /// The heartbeat ring is full after one poll period and never wraps.
+  #[test]
+  fn heartbeat_ring_tracks_one_poll_period() {
+    let period = Duration::from_secs(15);
+    assert_eq!(heartbeat_fraction(Duration::ZERO, period), 0.0);
+    assert!((heartbeat_fraction(Duration::from_secs_f32(7.5), period) - 0.5).abs() < 0.01);
+    assert_eq!(heartbeat_fraction(period, period), 1.0);
+    assert_eq!(heartbeat_fraction(Duration::from_secs(40), period), 1.0);
+    assert_eq!(
+      heartbeat_fraction(Duration::from_secs(1), Duration::ZERO),
+      0.0
+    );
   }
 
   /// The account badge counts what the portal lists and marks this machine.

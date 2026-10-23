@@ -26,6 +26,11 @@ use crate::srun::{NetCause, NetEnv, NetError};
 const ENV_PROBE_MS: u64 = 15_000;
 const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
 
+/// The status poll the window draws as a heartbeat: every 15 s while the
+/// session is up, every 10 s while it is not.
+pub(crate) const POLL_ONLINE: Duration = Duration::from_secs(15);
+pub(crate) const POLL_OFFLINE: Duration = Duration::from_secs(10);
+
 /// How long the core keeps trying to establish a session when nothing keeps it
 /// online afterwards, measured in time the link is actually usable.
 ///
@@ -1145,11 +1150,11 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     // Ask the portal what is actually going on, online or not: the session may
     // have been created elsewhere, and "no password saved" is not "offline".
     let poll_every = if session.state == State::Online {
-      15
+      POLL_ONLINE
     } else {
-      10
+      POLL_OFFLINE
     };
-    if last_status.elapsed() >= Duration::from_secs(poll_every) {
+    if last_status.elapsed() >= poll_every {
       if let Ok(v) = session.client().status(&session.cfg().ac_id) {
         let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
         if online && session.state != State::Online {
