@@ -328,11 +328,6 @@ impl Client {
     }
   }
 
-  /// GET an arbitrary URL; used by the keepalive loop to generate traffic.
-  pub fn touch(&self, url: &str) -> Result<usize, NetError> {
-    Ok(self.get(url)?.len())
-  }
-
   pub fn status(&self, ac_id: &str) -> Result<Value, NetError> {
     let page = self.get(&format!(
       "{}://{}/srun_portal_pc?ac_id={}",
@@ -345,6 +340,14 @@ impl Client {
     let mut v = Self::jsonp(&self.get(&url)?)?;
     let online = v.get("error").and_then(Value::as_str) == Some("ok");
     if let Some(obj) = v.as_object_mut() {
+      // The portal nests the per-device list in a JSON *string*; hand it on as
+      // the object it describes. See [`expanded_device_detail`].
+      if let Some(devices) = obj
+        .get("online_device_detail")
+        .and_then(expanded_device_detail)
+      {
+        obj.insert("online_device_detail".into(), devices);
+      }
       obj.insert("ip".into(), json!(ip));
       obj.insert("online".into(), json!(online));
     }
@@ -770,6 +773,20 @@ fn scrape_ip(page: &str) -> Option<String> {
   None
 }
 
+/// The per-device list the portal nests inside a JSON *string*.
+///
+/// `rad_user_info` answers `"online_device_detail": "{\"<id>\":{…},…}"`, so a
+/// reader would otherwise get one long escaped string. This returns the object
+/// it describes; anything that is not a JSON object yields `None`, so the
+/// caller keeps exactly what the portal sent. The field is informational, and
+/// a format change there must not break the rest of the answer.
+fn expanded_device_detail(value: &Value) -> Option<Value> {
+  value
+    .as_str()
+    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    .filter(Value::is_object)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -890,5 +907,23 @@ mod tests {
     assert_eq!(default_route(no_default), None);
     assert_eq!(default_route("Iface\tDestination\tGateway\n"), None);
     assert_eq!(default_route(""), None);
+  }
+
+  /// `rad_user_info` nests the per-device list in a JSON string, so the answer
+  /// the rest of the app sees carries it as an object. A field in any other
+  /// shape keeps exactly what the portal sent.
+  #[test]
+  fn the_device_detail_is_expanded_from_its_json_string() {
+    // Documentation addresses and a made-up session id.
+    let nested = r#"{"1052067690":{"class_name":"","ip":"192.0.2.10","ip6":"2001:db8::1","os_name":"AndroidOS","rad_online_id":"1052067690"}}"#;
+    let expanded = expanded_device_detail(&Value::String(nested.into()))
+      .expect("a JSON object inside a string is expanded");
+    assert_eq!(expanded["1052067690"]["ip"], "192.0.2.10");
+    assert_eq!(expanded["1052067690"]["rad_online_id"], "1052067690");
+
+    // Not JSON, JSON that is not an object, and a value that is not a string.
+    assert_eq!(expanded_device_detail(&Value::String("n/a".into())), None);
+    assert_eq!(expanded_device_detail(&Value::String("[1,2]".into())), None);
+    assert_eq!(expanded_device_detail(&json!({ "a": 1 })), None);
   }
 }

@@ -24,12 +24,19 @@ pub struct Config {
   pub ac_id: String,
   /// Empty lets the portal infer the caller address.
   pub ip: String,
+  /// Sign in by itself right after the core starts. It decides the initial
+  /// value of the core's runtime intent (`want_online`), and nothing else: a
+  /// session that drops later is handled by [`Config::keep_online`].
   pub auto_connect: bool,
+  /// Stay connected once a session exists: sign back in after the session is
+  /// lost behind the user's back, until the user disconnects. `false` leaves a
+  /// dropped session dropped. Defaults to true so a configuration written
+  /// before this field existed keeps its behaviour.
+  #[serde(default = "default_true")]
+  pub keep_online: bool,
   /// Whether the autostart entry starts the app hidden. Manual launches (Start
   /// Menu, desktop shortcut, installer) open the window regardless.
   pub start_minimized: bool,
-  pub keepalive_target: String,
-  pub keepalive_interval_secs: u64,
   pub reconnect_delay_secs: u64,
   /// "auto" (follow OS) | "zh" | "en"
   pub lang: String,
@@ -51,15 +58,19 @@ impl Default for Config {
       ac_id: "auto".into(),
       ip: String::new(),
       auto_connect: true,
+      keep_online: true,
       start_minimized: false,
-      keepalive_target: "https://www.tsinghua.edu.cn/".into(),
-      keepalive_interval_secs: 300,
       reconnect_delay_secs: 5,
       lang: "auto".into(),
       log_level: "info".into(),
       theme: "auto".into(),
     }
   }
+}
+
+/// Serde default for a flag that means "do this unless told otherwise".
+fn default_true() -> bool {
+  true
 }
 
 fn env_path(key: &str) -> PathBuf {
@@ -215,7 +226,16 @@ impl Config {
   /// Save the JSON only. The window uses this when a core owns the credential:
   /// the password must never be written to the user's config directory.
   pub fn save_prefs(&self) -> Result<(), String> {
-    let p = path();
+    self.save_prefs_to(&dir())
+  }
+
+  /// Write the JSON into `dir`, leaving the sealed credential alone.
+  ///
+  /// Preference changes (auto connect, keep online) use this: they never alter
+  /// `remember_password`, so re-sealing the blob on every checkbox click would
+  /// only add a way to fail.
+  pub fn save_prefs_to(&self, dir: &std::path::Path) -> Result<(), String> {
+    let p = path_in(dir);
     if let Some(parent) = p.parent() {
       std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -284,8 +304,26 @@ mod tests {
   fn defaults_do_not_force_minimizing() {
     let cfg = Config::default();
     assert!(!cfg.start_minimized, "start-minimized is opt-in");
+    assert!(cfg.keep_online, "a client that drops silently is useless");
     assert!(cfg.password.is_empty());
     assert_eq!(cfg.log_level, "info", "debug output is opt-in");
+  }
+
+  /// A configuration written before `keep_online` existed has to keep the old
+  /// behaviour (the client stayed online), and the two removed keepalive keys
+  /// must not stop it from loading.
+  #[test]
+  fn an_old_config_keeps_online_by_default() {
+    let old = r#"{
+      "username": "alice", "host": "auth4.tsinghua.edu.cn", "https": true,
+      "ac_id": "auto", "ip": "", "auto_connect": false,
+      "start_minimized": false, "reconnect_delay_secs": 5,
+      "keepalive_target": "https://example.test/", "keepalive_interval_secs": 300,
+      "lang": "auto", "log_level": "info", "theme": "auto"
+    }"#;
+    let cfg: Config = serde_json::from_str(old).expect("an old config still loads");
+    assert!(!cfg.auto_connect, "the stored value is kept");
+    assert!(cfg.keep_online, "absent means the previous behaviour");
   }
 
   /// The endpoint and the single-instance guard are keyed by this tag, so it

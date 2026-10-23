@@ -48,7 +48,7 @@ One executable, no runtime dependencies, no console window, runs on Windows, Lin
 2. **Run it.** Start `THUnet` from the Start Menu / application menu, or run `thunet` in a terminal. A small window opens; everything the app does is written to the log strip at the bottom of that window.
 3. **Open Settings.** Click the gear in the top-right corner of the window.
 4. **Enter your credentials.** Type your TUNET account (for example `1234567890`) and your password, tick **Remember password**, then click **Apply**. The password is sealed with a random per-install key before it touches the disk, and never ends up in the settings file. The core owns that key and the sealed blob; the window never reads them back.
-5. **Connect.** Go back to the Status page and click **Connect** (or just wait a few seconds if *Auto connect* is already enabled). The dot in the header turns green and your IPv4 address appears.
+5. **Connect.** Go back to the Status page and click **Connect** (or just wait a few seconds if *Connect on startup* is already enabled). The dot in the header turns green and your IPv4 address appears.
 
 That is all. From now on the app reconnects by itself whenever the network comes back, and closing the window only hides it in the tray.
 
@@ -73,7 +73,7 @@ The window has exactly two pages, switched with the gear in the top-right corner
 | Element | Meaning |
 | --- | --- |
 | Coloured dot + label | `Online`, `Authenticating` or `Offline` |
-| `Account` | The account the portal reports for the current session |
+| `Account` | The account the portal reports for the current session. The superscript count beside it is the number of devices the account has online across the campus network; clicking it opens the *Online devices* list, one row per device, with an icon per device and a dot on the machine the window runs on. Nothing is shown while the account has no session |
 | `Link` | Which interface carries the default route: `Ethernet` / `WLAN` / `No link`. With a cable and Wi-Fi both up it names the one the OS actually routes on — the first thing to look at when a session appears to come and go |
 | `IPv4` / `IPv6` | Addresses assigned by the campus network, each with a **Copy** button |
 | `Session traffic` | Bytes downloaded / uploaded during this session |
@@ -104,9 +104,10 @@ Right-click on selected log text copies the selection straight to the clipboard.
 
 | Setting | Effect |
 | --- | --- |
-| Start with the system | Three modes on one row: Off / Service / Service + tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running". On both platforms this row needs administrator rights: registering or changing the service, and starting or stopping it. The tray part alone is per user and needs no elevation once the service is already enabled |
-| Start minimised to tray | On the same row as *Auto connect*, and independent of the autostart row above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service*, where no tray starts |
-| Auto connect | Log in as soon as a usable network appears |
+| Start with the system | Three modes on one row: Off / Service only / Service and tray (see [7](#7-install-uninstall-shortcut)). "Tray only" is not offered — the tray never starts a core by itself, so the icon would only ever report "service not running". On both platforms this row needs administrator rights: registering or changing the service, and starting or stopping it. The tray part alone is per user and needs no elevation once the service is already enabled |
+| Start minimised to tray | On the same row as *Connect on startup* and *Stay online*, and independent of the autostart row above: autostart can stay hidden while a manual launch opens the window, or the other way round. Greyed out in *Service only*, where no tray starts |
+| Connect on startup | Log in as soon as a usable network appears. It seeds the core's runtime intent at start and nothing else: a session that drops later is *Stay online*'s business |
+| Stay online | Sign back in after the session is lost behind your back (a kick, a timeout, a logout on the portal website), until you press **Disconnect**. Off means a dropped session stays dropped, and the startup attempt is bounded: it keeps retrying for five minutes of usable link time, then stops with a log line |
 | Create desktop shortcut | Puts a launcher for the running executable on your desktop (the same action as `thunet shortcut`) |
 | Account / Password / Remember password / Apply / Revert | This is the only row that does not save as you type: the button turns into the accent colour and an *Unsaved* marker appears while it differs from what is stored. Applying seals the password into `credential.bin` (never into the JSON file) and passes it to the running session immediately; if the service is down, Apply asks to start it first (administrator) and sends the credential once it answers. The window keeps no copy afterwards: the field goes blank and its placeholder says the saved value is kept, and re-typing the stored password is compared against the core (`CheckCredentials`) so it does not look unsaved. *Revert* drops the edits and restores the stored account, password and checkbox (it is greyed out while *Remember password* is off, since there is nothing stored to go back to) |
 | Language | Follow system (default), 中文, English |
@@ -124,7 +125,7 @@ Having no saved password is not the same as being offline: the client keeps aski
 
 The build stamp shows the version on the left and, on the right, the local time of the compile that produced this binary with its UTC offset (`Built at 2026-10-20 19:23:23 +08:00`). Both are embedded at build time (`build.rs`), so the stamp always matches the running executable — handy when you are not sure whether the update actually took. The wall clock is rendered in the timezone of whoever is looking, so the same binary reads differently on a machine set to another zone; the offset says which one you are seeing.
 
-**Connect is greyed out off-campus.** A login can only succeed behind the campus portal, so the client probes the network every few seconds and disables the button — with the reason on hover — when the machine is on an 802.1X network such as `Tsinghua-Secure`, has no link at all, sits behind someone else's captive portal, or already reaches the internet without a portal. The same reason sits in an amber band at the top of the Status page, so it stays readable without hovering; the band is a warning rather than an error and goes away by itself once the probe sees a campus portal again. The same amber band reports *Auto connect is on, but no account or password is saved* — and, while a leftover portal session is still up, that it will not reconnect on its own. A configuration gap rather than a failure, which is why it is not red. A band that does not fit is cut after three lines with an ellipsis, and hovering it shows the whole text. **Refresh** stays available in every case, and **Disconnect** follows the session state alone, so an existing session can always be ended.
+**Connect is greyed out off-campus.** A login can only succeed behind the campus portal, so the client probes the network every few seconds and disables the button — with the reason on hover — when the machine is on an 802.1X network such as `Tsinghua-Secure`, has no link at all, sits behind someone else's captive portal, or already reaches the internet without a portal. The same reason sits in an amber band at the top of the Status page, so it stays readable without hovering; the band is a warning rather than an error and goes away by itself once the probe sees a campus portal again. The same amber band reports *Connect on startup is on, but no account or password is saved* — and, while a leftover portal session is still up, that it will not reconnect on its own. A configuration gap rather than a failure, which is why it is not red. A band that does not fit is cut after three lines with an ellipsis, and hovering it shows the whole text. **Refresh** stays available in every case, and **Disconnect** works both while a session is up and while the core still wants to be online (retrying, or waiting for a link), so it is also how automatic reconnection is called off.
 
 ### Tray icon
 
@@ -263,7 +264,7 @@ A pair that was piped or asked for always produces the `credentials:` line (`sav
               "host": "auth4.tsinghua.edu.cn",
               "credential": { "username": "1234567890", "has_password": true,
                               "remembered": true, "revision": 2, "matches": null },
-              "auto_connect": true,
+              "auto_connect": true, "keep_online": true,
               "wanted_online": true, "failures": 0, "frontends": 1,
               "endpoint": "/run/user/1000/thunet/control.sock" },
   "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
@@ -301,7 +302,7 @@ Machine-wide files:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | Account name, portal host, auto-connect, keepalive settings and whether the sealed credential should be loaded on the next start. **No password.** |
+| `config.json` | Account name, portal host, the *Connect on startup* and *Stay online* switches, and whether the sealed credential should be loaded on the next start. **No password.** |
 | `credential.bin` | The sealed account/password pair, mode `0600` / service-only ACL. |
 | `key.bin` | A random 32-byte data key, mode `0600` / service-only ACL. |
 | `core.log` | Diagnostics from the background core. |
@@ -353,8 +354,8 @@ Autostart registration is split by platform, but the rule is the same on both: *
 | Mode | Linux | Windows |
 | --- | --- | --- |
 | **Off** | nothing registered | nothing registered |
-| **Service** | systemd system unit `thunet.service` enabled; starts at boot, before anybody logs in | the `thunet` **service** (virtual account `NT SERVICE\thunet`, start type `auto`): up before the login screen, no tray icon |
-| **Service + tray** | unit + `~/.config/autostart/thunet.desktop` | that service + a per-user `thunet-tray-<user>` logon task |
+| **Service only** | systemd system unit `thunet.service` enabled; starts at boot, before anybody logs in | the `thunet` **service** (virtual account `NT SERVICE\thunet`, start type `auto`): up before the login screen, no tray icon |
+| **Service and tray** | unit + `~/.config/autostart/thunet.desktop` | that service + a per-user `thunet-tray-<user>` logon task |
 
 There is deliberately no tray-only mode: the tray never starts a core by itself, so an icon without a service could only report "not running".
 
@@ -437,7 +438,7 @@ Steps 1–3 are automated by [`.github/workflows/release.yml`](.github/workflows
 
 ## 9. How the network login actually works
 
-Everything is plain HTTP(S) against the portal — no browser and no JavaScript. The full walkthrough lives in **[docs/protocol.md](docs/protocol.md)**: network detection, `ac_id` discovery, the challenge token, `{MD5}` / `{SRBX1}` encoding, the checksum, session verification, keepalive and the portal error codes.
+Everything is plain HTTP(S) against the portal — no browser and no JavaScript. The full walkthrough lives in **[docs/protocol.md](docs/protocol.md)**: network detection, `ac_id` discovery, the challenge token, `{MD5}` / `{SRBX1}` encoding, the checksum, session verification, the status poll and the portal error codes.
 
 The implementation is in `src/srun.rs` (protocol) and `src/session.rs` (state machine); `src/crypto.rs` holds MD5/SHA-1/XXTEA. Nothing there is required to use the app.
 
@@ -496,7 +497,7 @@ Notes:
 | `src/main.rs` | CLI entry, console/panic plumbing, GUI launch |
 | `src/srun.rs` | portal HTTP client, `ac_id` detection, request building |
 | `src/crypto.rs` | MD5, SHA-1, XXTEA and the portal base64 alphabet |
-| `src/session.rs` | state machine: refresh, login, keepalive, logout, backoff |
+| `src/session.rs` | state machine: refresh, login, logout, backoff |
 | `src/ui.rs` | worker thread, window, tray, toasts, log strip |
 | `src/config.rs` | settings load/save, platform paths |
 | `src/secret.rs` | sealed credential file (one implementation for every platform) |
@@ -590,7 +591,7 @@ If zero-elevation recovery after the core is stopped were required, both sides w
 
 The machine core has no `Shutdown` command on the control channel: the status page's *Stop* button calls SCM / systemd through the elevation helper, so the same authorization applies everywhere. A portable core does accept `Shutdown`: a hosted one stops its own core thread and leaves the window running, and a hand-started `thunet core` exits. After the window disconnects, no frontend starts a machine core on its own. A core that exits by itself (fatal error, upgrade) is restarted by the service manager.
 
-`host`, `https` and the keepalive target are **machine configuration**, not user preferences. Letting an ordinary user change `host` would let them point the core at a portal they control and read the password: the SRun login encrypts `info` with a token chosen by the server, so the server can always decrypt it. The window and the control channel expose no way to change these values.
+`host` and `https` are **machine configuration**, not user preferences. Letting an ordinary user change `host` would let them point the core at a portal they control and read the password: the SRun login encrypts `info` with a token chosen by the server, so the server can always decrypt it. The window and the control channel expose no way to change these values.
 
 ### 13.4 State and credentials
 

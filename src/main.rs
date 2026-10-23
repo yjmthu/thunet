@@ -19,6 +19,7 @@ mod session;
 mod shortcut;
 mod single;
 mod srun;
+mod theme;
 mod ui;
 mod wifi;
 #[cfg(windows)]

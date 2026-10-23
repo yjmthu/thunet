@@ -1,4 +1,4 @@
-//! Session state machine: ensure online → keepalive → re-login on failure.
+//! Session state machine: ensure online → poll the portal → re-login on a drop.
 //!
 //! This is the "auto connect + keep online" behaviour requested from the
 //! shipped client, minus its GUI. It is deliberately UI-free so the same code
@@ -266,21 +266,6 @@ impl Session {
         )));
       }
       return Err(NetError::msg(self.rejected(&v)));
-    }
-  }
-
-  /// Touch the keepalive target; failure to reach the internet implies the
-  /// session is gone, so the caller should re-authenticate.
-  pub fn keepalive(&mut self) -> Result<(), NetError> {
-    match self.client.touch(&self.cfg.keepalive_target) {
-      Ok(_) => {
-        self.failures = 0;
-        Ok(())
-      }
-      Err(e) => {
-        self.failures += 1;
-        Err(e)
-      }
     }
   }
 

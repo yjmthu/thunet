@@ -2,7 +2,7 @@
 name = "thunet"
 version = "0.1.5"
 edition = "2024"
-description = "Minimal THUnet / SRun3K portal client (login, keepalive, logout, status)"
+description = "Minimal THUnet / SRun3K portal client (login, logout, status)"
 license = "MIT"
 repository = "https://github.com/yjmthu/thunet"
 authors = ["THUnet contributors"]

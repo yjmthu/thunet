@@ -60,7 +60,14 @@ pub enum Cmd {
     #[serde(default)]
     keep_password: bool,
   },
+  /// Sign in by itself right after the core starts (persisted by the core).
+  /// A runtime preference only: it never changes whether the core tries to be
+  /// online now.
   SetAutoConnect(bool),
+  /// Keep a session alive after it was established: sign back in when it is
+  /// lost behind the user's back, until the user disconnects (persisted by
+  /// the core).
+  SetKeepOnline(bool),
   /// Ask what credential the core holds without asking for the password
   /// itself. When `username`/`password` are supplied, the answer also says
   /// whether they are the stored pair, so a frontend can clear an *Unsaved*
@@ -159,7 +166,16 @@ pub struct CoreInfo {
   /// What the core would log in with. The password itself never leaves it.
   #[serde(default)]
   pub credential: CredentialState,
+  /// The core's startup preference, as stored on the machine.
   pub auto_connect: bool,
+  /// The core's stay-connected preference. A core built before this field
+  /// existed reads as `false` here; the window then keeps showing its own
+  /// stored value instead.
+  #[serde(default)]
+  pub keep_online: bool,
+  /// Whether the core wants to be online right now. This is the runtime
+  /// intent behind every automatic login; it is true after a start with
+  /// auto connect on, and after a manual connect.
   pub wanted_online: bool,
   pub failures: u32,
   pub frontends: usize,
@@ -197,7 +213,9 @@ pub enum Failure {
   /// fix. The raw JSON answer goes to the log pane instead.
   Credentials,
   /// The portal could not reach an access controller for the `ac_id` the core
-  /// holds, which on THU means the id belongs to another link.
+  /// holds, which on THU means the id belongs to another link. Retrying it on
+  /// the same link cannot work, so automatic attempts stop until the user
+  /// connects again.
   AcUnreachable,
   /// The request never reached the portal. Only the kind travels: the OS text
   /// is localized by Windows, so the window words this itself.
@@ -405,6 +423,7 @@ mod tests {
         matches: None,
       },
       auto_connect: true,
+      keep_online: true,
       wanted_online: true,
       failures: 0,
       frontends: 1,
@@ -434,6 +453,7 @@ mod tests {
       "endpoint":"x"}"#;
     let info: CoreInfo = serde_json::from_str(old).unwrap();
     assert_eq!(info.link, LinkKind::None);
+    assert!(!info.keep_online, "an old core never reported it");
     assert_eq!(info.version, "0.1.3");
   }
 

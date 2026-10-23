@@ -119,13 +119,14 @@ The RADIUS accounting row appears roughly **20 seconds** after an accepted login
 2. asks `/cgi-bin/rad_user_info?ip=<ip>`, which returns the live session: `online`, `user_ip`, `online_ip`, `sum_bytes`, `sum_seconds`, `user_name`,
 3. polls step 2 once per second for up to ~30 s (`wait_online`).
 
-`rad_user_info` also feeds the traffic counters and the periodic status refresh (every 15 s while online).
+`rad_user_info` also feeds the traffic counters and the periodic status refresh (every 15 s while online). The per-device list in `online_device_detail` arrives as a JSON *string* (an object encoded as text); the client parses it into an object before handing the answer on, and keeps the original text if it is not one.
 
-## 9. Stay online
+## 9. Staying online
 
-- **Keepalive:** a `GET` to `https://www.tsinghua.edu.cn/` every `keepalive_interval_secs` (default 300 s) keeps NAT state and usage counters healthy.
+- **Heartbeat:** the core polls `/srun_portal_pc` and `/cgi-bin/rad_user_info` every 10 s while offline and every 15 s while online. That poll is also the keepalive: `keepalive_time` in the answer always equals the time of the request, so the portal renews the session on it and the client sends no separate keep-alive traffic.
+- **Intent:** an automatic login needs the user's runtime intent (seeded by *Connect on startup*, set by a manual connect) and either *Stay connected* or an open startup window. A logout on the portal website is indistinguishable from a kick or a timeout, so *Stay connected* is what decides whether the core signs back in.
 - **Watchdog:** when the link drops the UDP route lookup fails and the loop waits instead of sending requests; when the link returns the backoff is reset and a login is attempted within ~1 s.
-- **Backoff:** consecutive failures wait `reconnect_delay_secs × 2^(n-1)`, capped at 120 s, so a wrong password cannot lock the account out.
+- **Backoff:** consecutive failures wait `reconnect_delay_secs × 2^(n-1)`, capped at 120 s. A rejected password is not retried automatically (the same pair can only be refused again), and neither is an `ac_id` the portal cannot route: both drop the intent, so every automatic path stops until a manual connect.
 
 ## 10. Error codes
 

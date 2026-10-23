@@ -1,5 +1,5 @@
-//! The background core: session state machine, keepalive, and the event stream
-//! the frontend renders.
+//! The background core: session state machine, network probing, and the event
+//! stream the frontend renders.
 //!
 //! This is the loop that used to live inside the window process. It talks to
 //! the outside world through [`crate::ipc`]: commands arrive over a channel,
@@ -25,6 +25,23 @@ use crate::srun::{NetCause, NetEnv, NetError};
 /// the link at boot.
 const ENV_PROBE_MS: u64 = 15_000;
 const ENV_PROBE_OFFLINE_MS: u64 = 60_000;
+
+/// How long the core keeps trying to establish a session when nothing keeps it
+/// online afterwards, measured in time the link is actually usable.
+///
+/// Booting is not instantaneous: Wi-Fi associates late, DHCP and DNS lag, and
+/// the portal's access controller can take a moment. One attempt would give up
+/// on a perfectly normal start, while retrying forever is the "stay online"
+/// behaviour the user did not ask for. The same window covers a manual connect,
+/// which is a request with the same shape: get online once.
+///
+/// Counting only link-up time keeps a machine that boots with Wi-Fi still off
+/// from spending the budget on a network it never had.
+const CONNECT_WINDOW_BUDGET: Duration = Duration::from_secs(300);
+
+/// A cap on the whole window, link up or not, so a flapping link cannot keep it
+/// alive indefinitely.
+const CONNECT_WINDOW_DEADLINE: Duration = Duration::from_secs(900);
 
 /// Windows names a freshly joined network's profile "Identifying…" for a moment
 /// after the address appears, so the probe that runs on the link change can
@@ -139,10 +156,24 @@ fn core_info(
     link: crate::srun::link_kind(),
     credential,
     auto_connect: session.cfg().auto_connect,
+    keep_online: session.cfg().keep_online,
     wanted_online,
     failures: session.failures,
     frontends,
     endpoint: crate::ipc::endpoint_path(),
+  }
+}
+
+/// Store one of the core's own preferences, so the next start uses it.
+///
+/// A preference the core cannot write would silently revert on the next start
+/// - after an upgrade or a service restart - which is exactly how the window
+/// and the core drifted apart before. Only the JSON is written: the sealed
+/// credential is untouched, so a checkbox click cannot fail on the key.
+fn save_preference(tx: &Sink, session: &Session, what: &str) {
+  if let Err(e) = session.cfg().save_prefs_to(&crate::config::dir()) {
+    tx.send(Ev::Log(Line::error(format!("cannot save {what}: {e}"))))
+      .ok();
   }
 }
 
@@ -275,26 +306,32 @@ fn switch_account(
 
 pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
-  let keepalive = Duration::from_secs(cfg.keepalive_interval_secs.max(30));
   let mut lang = Lang::from_setting(&cfg.lang);
   // `load_machine` only fills `password` when `remember_password` is set and a
   // sealed blob could be opened, so this pair is exactly "the next start will
   // find a credential".
   let mut remembered = cfg.remember_password && !cfg.password.is_empty();
   let mut session = Session::new(cfg);
-  let has_creds = !session.cfg().username.is_empty() && !session.cfg().password.is_empty();
-  let mut want_online = session.cfg().auto_connect && has_creds;
-  if session.cfg().auto_connect && !has_creds {
-    tx.send(Ev::Log(Line::warn(
-      "auto connect is on, but no account and password are saved",
-    )))
-    .ok();
-  }
+  // The runtime intent: "this process should be online". Memory only - the
+  // start seeds it from `auto_connect`, a manual connect sets it, and only a
+  // manual disconnect or a rejected password clears it. Nothing else - a
+  // logout at the portal, a kick, a timeout, a dead link - may change it, or
+  // the core would silently undo what the user just did elsewhere.
+  let mut want_online = session.cfg().auto_connect;
+  // A core that was told to connect at start, but not to stay online, needs a
+  // window to do it in: see [`CONNECT_WINDOW_BUDGET`]. With `keep_online` the
+  // retry loop has no deadline, so the window is not used at all.
+  let mut connect_budget = if want_online && !session.cfg().keep_online {
+    CONNECT_WINDOW_BUDGET
+  } else {
+    Duration::ZERO
+  };
+  let mut connect_deadline = started + CONNECT_WINDOW_DEADLINE;
+  let mut connect_tick = Instant::now();
   // Consecutive refresh failures. One is a hiccup the next one recovers from
   // (a dropped connection, a slow portal); it belongs in the log. A failure
   // that repeats is what the banner is for.
   let mut refresh_failures = 0u32;
-  let mut last_ka = Instant::now();
   let mut last_status = Instant::now() - Duration::from_secs(60);
   let mut last_state = State::Offline;
   // Backoff state so a rejected login does not hammer the portal every tick.
@@ -304,12 +341,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let mut last_failure = String::new();
   // Set when the user pressed "Connect", so a skipped attempt can be reported.
   let mut user_connect = false;
-  // A rejected password is deterministic: the same pair can only be refused
-  // again, and retrying it hammers the portal (and may trip its lockout). So
-  // automatic attempts stop until the pair changes, the user presses Connect,
-  // a login succeeds, or the core restarts (a password fixed on the portal's
-  // own page then gets one more try).
-  let mut rejected = false;
   // What the red banner shows, so the same failure is not re-announced and a
   // routine success (a status refresh) never wipes a rejection still true.
   let mut banner: Option<Failure> = None;
@@ -347,13 +378,15 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     while let Ok(c) = rx.try_recv() {
       match c {
         Cmd::Connect => {
+          // A manual connect is the user's intent whatever state the machine is
+          // in, and it is what lifts a rejected password.
+          want_online = true;
           // Check the current state first so an existing session is not re-authenticated.
           if session.is_online_now() {
             if let Ok(v) = session.refresh() {
               tx.send(Ev::Info(v)).ok();
             }
             tx.send(Ev::State(session.state)).ok();
-            rejected = false;
             set_banner(&tx, &mut banner, None);
             tx.send(Ev::Log(Line::info("already online"))).ok();
             tx.send(Ev::Notify {
@@ -362,14 +395,20 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             })
             .ok();
           } else {
-            want_online = true;
             user_connect = true;
-            // An explicit Connect is the user overriding the pause.
-            rejected = false;
             next_attempt = Instant::now();
             failures = 0;
             last_failure.clear();
             last_status = Instant::now() - Duration::from_secs(60);
+            // A click is a request to get online once: give it the same bounded
+            // window a start has, so a failing network is retried for a while
+            // and then left alone. With `keep_online` the loop has no deadline,
+            // so the window would only add a log line later.
+            if !session.cfg().keep_online {
+              connect_budget = CONNECT_WINDOW_BUDGET;
+              connect_deadline = Instant::now() + CONNECT_WINDOW_DEADLINE;
+              connect_tick = Instant::now();
+            }
           }
         }
         Cmd::Disconnect => {
@@ -386,38 +425,43 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               kind: ToastKind::Err,
             })
             .ok();
-          } else if !session.is_online_now() {
-            if let Ok(v) = session.refresh() {
-              tx.send(Ev::Info(v)).ok();
-            }
-            tx.send(Ev::State(session.state)).ok();
-            tx.send(Ev::Log(Line::info("not connected"))).ok();
-            tx.send(Ev::Notify {
-              msg: t.not_connected.into(),
-              kind: ToastKind::Info,
-            })
-            .ok();
           } else {
-            match session.logout() {
-              Ok(m) => {
-                tx.send(Ev::Log(Line::info(format!("logged out: {m}"))))
-                  .ok();
-                tx.send(Ev::Notify {
-                  msg: t.disconnected.into(),
-                  kind: ToastKind::Ok,
-                })
-                .ok();
-              }
-              Err(e) => {
-                set_banner(&tx, &mut banner, Some(failure_of(t.disconnect_failed, &e)));
-                tx.send(Ev::Notify {
-                  msg: t.disconnect_failed.into(),
-                  kind: ToastKind::Err,
-                })
-                .ok();
-              }
-            };
+            // Whatever the portal answers, the user asked to stop being
+            // online. This is the one place besides a rejected password that
+            // drops the intent, so an offline machine still obeys the click.
             want_online = false;
+            if !session.is_online_now() {
+              if let Ok(v) = session.refresh() {
+                tx.send(Ev::Info(v)).ok();
+              }
+              tx.send(Ev::State(session.state)).ok();
+              tx.send(Ev::Log(Line::info("not connected"))).ok();
+              tx.send(Ev::Notify {
+                msg: t.not_connected.into(),
+                kind: ToastKind::Info,
+              })
+              .ok();
+            } else {
+              match session.logout() {
+                Ok(m) => {
+                  tx.send(Ev::Log(Line::info(format!("logged out: {m}"))))
+                    .ok();
+                  tx.send(Ev::Notify {
+                    msg: t.disconnected.into(),
+                    kind: ToastKind::Ok,
+                  })
+                  .ok();
+                }
+                Err(e) => {
+                  set_banner(&tx, &mut banner, Some(failure_of(t.disconnect_failed, &e)));
+                  tx.send(Ev::Notify {
+                    msg: t.disconnect_failed.into(),
+                    kind: ToastKind::Err,
+                  })
+                  .ok();
+                }
+              };
+            }
           }
         }
         Cmd::Refresh { quiet } => match session.refresh() {
@@ -426,11 +470,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             tx.send(Ev::Info(v)).ok();
             tx.send(Ev::State(session.state)).ok();
             // A refresh proves the portal answers, not that the stored
-            // password is right: a rejection stays on screen (and stays
-            // latched) through it, unless the session turns out to be online.
-            if session.state == State::Online {
-              rejected = false;
-            }
+            // password is right: a rejection stays on screen through it,
+            // unless the session turns out to be online.
             if session.state == State::Online
               || !matches!(
                 banner.as_ref(),
@@ -438,6 +479,11 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               )
             {
               set_banner(&tx, &mut banner, None);
+            }
+            if session.state == State::Online {
+              // Whatever the connect window was still waiting for, the machine
+              // is online now.
+              connect_budget = Duration::ZERO;
             }
             // A refresh the window started by itself only exists to make the
             // page current; it is not news.
@@ -546,7 +592,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           if ready && new_pair && session.state == State::Online {
             match switch_account(&mut session, &tx, t, (&username, &password, remember)) {
               Ok(()) => {
-                rejected = false;
                 want_online = true;
                 failures = 0;
                 last_failure.clear();
@@ -573,11 +618,17 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               Err(failure) => {
                 // Nothing was written, so the stored credential still works and
                 // the loop may keep retrying with it.
-                rejected = false;
                 want_online = session.state != State::Online;
                 failures = 0;
                 last_failure.clear();
                 next_attempt = Instant::now();
+                if !session.cfg().keep_online {
+                  // The user just asked for this pair: give the previous one
+                  // the same bounded chance a manual connect gets.
+                  connect_budget = CONNECT_WINDOW_BUDGET;
+                  connect_deadline = Instant::now() + CONNECT_WINDOW_DEADLINE;
+                  connect_tick = Instant::now();
+                }
                 // The typed pair was refused, but the previous account is back:
                 // the machine is online and its stored credential was *not*
                 // rejected, so the red banner would be a lie that never clears.
@@ -610,7 +661,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               session.set_credentials(String::new(), String::new());
             }
             if new_pair {
-              rejected = false;
               // A cleared pair has no attempt left in it, so a rejection would
               // stay on screen with nothing behind it.
               if !ready {
@@ -640,15 +690,20 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             )))
             .ok();
             // Try a complete pair at once, because the backoff in flight was
-            // chosen for the old one. `auto_connect` only says whether the app
-            // logs in by itself at start-up, so it does not gate an edit; a pair
-            // that was just refused is not tried again either.
-            if ready && session.state != State::Online && !rejected {
+            // chosen for the old one. An edit is the user asking to be online,
+            // so it sets the intent regardless of `auto_connect`; the startup
+            // window is not needed either, since this is a manual attempt.
+            if ready && session.state != State::Online {
               want_online = true;
               next_attempt = Instant::now();
               failures = 0;
               last_failure.clear();
               last_status = Instant::now() - Duration::from_secs(60);
+              if !session.cfg().keep_online {
+                connect_budget = CONNECT_WINDOW_BUDGET;
+                connect_deadline = Instant::now() + CONNECT_WINDOW_DEADLINE;
+                connect_tick = Instant::now();
+              }
             }
           }
         }
@@ -667,10 +722,29 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           .ok();
         }
         Cmd::SetAutoConnect(on) => {
-          want_online = on;
-          if on && session.state != State::Online {
-            next_attempt = Instant::now();
-            last_status = Instant::now() - Duration::from_secs(60);
+          // A startup preference: stored for the next start, and nothing here
+          // touches `want_online`. Turning it off is not "stop being online" -
+          // that is what Disconnect is for.
+          session.cfg_mut().auto_connect = on;
+          save_preference(&tx, &session, "auto connect");
+        }
+        Cmd::SetKeepOnline(on) => {
+          // This preference decides what may happen after a session is lost;
+          // it is not a request to log in now, so `want_online` stays as it is.
+          session.cfg_mut().keep_online = on;
+          save_preference(&tx, &session, "keep online");
+          if on {
+            // The retry loop now owns every attempt, so a connect window that
+            // was still ticking has nothing left to decide.
+            connect_budget = Duration::ZERO;
+            if want_online && session.state != State::Online {
+              // Answer the click: a machine that was waiting for the window to
+              // expire (or for a dropped session to be ignored) tries at once.
+              next_attempt = Instant::now();
+              failures = 0;
+              last_failure.clear();
+              last_status = Instant::now() - Duration::from_secs(60);
+            }
           }
         }
         Cmd::Status => {
@@ -809,6 +883,24 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       link_ready = up;
     }
 
+    // Spend the connect window only while a link exists, so a machine that
+    // boots with Wi-Fi still off does not burn the budget on a network it never
+    // had; the wall-clock cap stops a flapping link from keeping it alive.
+    if !connect_budget.is_zero() {
+      let now = Instant::now();
+      if link_ready {
+        connect_budget = connect_budget.saturating_sub(now.saturating_duration_since(connect_tick));
+      }
+      connect_tick = now;
+      if connect_budget.is_zero() || now >= connect_deadline {
+        connect_budget = Duration::ZERO;
+        tx.send(Ev::Log(Line::info(
+          "connect window closed, staying offline until asked again",
+        )))
+        .ok();
+      }
+    }
+
     // While online, re-read only the name, and only while the last read could
     // not name the network. The full probe stays off while a session is up (it
     // costs three requests), but a name is local, and it is what decides the
@@ -879,10 +971,13 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       tx.send(Ev::Env(env)).ok();
     }
 
+    // Whether an automatic attempt may be made at all. `keep_online` is the
+    // standing permission for it; without it, only an open connect window
+    // allows one, which is what makes "connect at start" mean exactly that.
+    let auto_attempts = want_online && (session.cfg().keep_online || !connect_budget.is_zero());
     if !missing_creds
-      && want_online
+      && auto_attempts
       && session.state != State::Online
-      && !rejected
       && link_ready
       && Instant::now() >= next_attempt
     {
@@ -954,7 +1049,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           failures = 0;
           last_failure.clear();
           user_connect = false;
-          rejected = false;
+          // Connected: the connect window has done its job. Whether the core
+          // keeps it that way is `keep_online`'s decision from here on.
+          connect_budget = Duration::ZERO;
           set_banner(&tx, &mut banner, None);
           tx.send(Ev::Log(Line::info(m))).ok();
           tx.send(Ev::Notify {
@@ -965,16 +1062,31 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         }
         Err(e) => {
           failures = failures.saturating_add(1);
-          // 5s, 10s, 20s, 40s, ... capped at two minutes.
-          let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
-          next_attempt = Instant::now() + Duration::from_secs_f64(backoff.min(120.0));
           let bad_credentials = session.failure == crate::session::FailureKind::Credentials;
           let ac_unreachable = session.failure == crate::session::FailureKind::AcUnreachable;
-          // A rejected password stops the automatic attempts: the same pair
-          // can only be refused again. Only a new pair, a manual Connect or a
-          // restart lifts that. An `ac_id` the portal cannot route this link to
-          // is equally final here, so it pauses the loop as well.
-          rejected = bad_credentials || ac_unreachable;
+          // What the next pass may do differs per kind of failure.
+          //
+          // A rejected password is deterministic: the same pair can only be
+          // refused again, and retrying it hammers the portal (and may trip its
+          // lockout). So is an `ac_id` the portal cannot route - retrying the
+          // same id on the same link cannot work either. Both therefore drop the
+          // intent, the single gate every automatic path goes through, and only
+          // a manual Connect (or a new pair) brings it back.
+          //
+          // The cost is that a machine that moves back to the network its id
+          // belongs to does not recover by itself; the banner says so.
+          //
+          // Everything else is a transport hiccup: back off and try again.
+          let final_refusal = bad_credentials || ac_unreachable;
+          let next_retry = if final_refusal {
+            want_online = false;
+            Duration::ZERO
+          } else {
+            // 5s, 10s, 20s, 40s, ... capped at two minutes.
+            let backoff = retry_delay.as_secs_f64() * 2f64.powi((failures - 1).min(5) as i32);
+            Duration::from_secs_f64(backoff.min(120.0))
+          };
+          next_attempt = Instant::now() + next_retry;
           user_connect = false;
           // A credential rejection carries a long JSON blob that only helps
           // when debugging, so it goes to the log pane while the red banner
@@ -986,8 +1098,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           // usually over by the next attempt, and every such retry painting the
           // page red reads as "everything is broken". The log keeps it, and
           // only a failure that survives one more attempt raises the band.
-          let final_refusal = bad_credentials || ac_unreachable;
-          if final_refusal || failures >= 2 {
+          if bad_credentials || ac_unreachable || failures >= 2 {
             set_banner(
               &tx,
               &mut banner,
@@ -1005,11 +1116,14 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               }),
             );
           }
-          tx.send(Ev::Log(Line::error(format!(
-            "{e} (retry in {}s)",
-            backoff.min(120.0) as u64
-          ))))
-          .ok();
+          // Say what happens next, so the log explains the silence that follows
+          // a rejection instead of leaving the reader wondering about a retry.
+          let note = if bad_credentials || ac_unreachable {
+            "automatic attempts stopped; connect manually to try again".to_string()
+          } else {
+            format!("retry in {}s", next_retry.as_secs())
+          };
+          tx.send(Ev::Log(Line::error(format!("{e} ({note})")))).ok();
           // Only buzz once per distinct reason, otherwise retries spam toasts.
           // A rejected password is not a toast: the banner already says it and
           // stays there, while a toast would flash and vanish.
@@ -1041,9 +1155,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         if online && session.state != State::Online {
           session.state = State::Online;
           failures = 0;
-          // Being online leaves the warning with nothing to act on; if the
-          // session drops later, one attempt re-detects a rejection.
-          rejected = false;
+          // Being online is what the connect window was for: it is done. A
+          // session found here may have been opened elsewhere, which is still
+          // "online" as far as the machine is concerned.
+          connect_budget = Duration::ZERO;
           set_banner(&tx, &mut banner, None);
           tx.send(Ev::Log(Line::info("already online"))).ok();
         } else if !online && session.state == State::Online {
@@ -1067,17 +1182,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         tx.send(Ev::Info(v)).ok();
       }
       last_status = Instant::now();
-    }
-
-    if session.state == State::Online && last_ka.elapsed() >= keepalive {
-      // Without credentials there is nothing a failing keepalive could trigger
-      // but an empty-password login, so only report the state poll above. A
-      // latched rejection stays latched here too, otherwise a dropped session
-      // would quietly retry the refused pair behind the user's back.
-      if session.keepalive().is_err() && !missing_creds && !rejected {
-        let _ = session.ensure_online();
-      }
-      last_ka = Instant::now();
     }
 
     if session.state != last_state {

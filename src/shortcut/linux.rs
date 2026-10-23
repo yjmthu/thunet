@@ -65,7 +65,7 @@ fn write_desktop_file(path: &Path, exe: &Path) -> Result<(), String> {
      Type=Application\n\
      Version=1.0\n\
      Name={title}\n\
-     Comment=Tsinghua campus network client (login, keepalive, status)\n\
+     Comment=Tsinghua campus network client (login, logout, status)\n\
      Exec=\"{exe}\"\n\
      Icon=thunet\n\
      Terminal=false\n\

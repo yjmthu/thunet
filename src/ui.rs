@@ -53,6 +53,26 @@ struct Info {
   bytes_in: u64,
   bytes_out: u64,
   name: String,
+  /// The account's online devices, this machine first. Empty when the portal
+  /// reports no detail (offline, or an answer without the field).
+  devices: Vec<Device>,
+  /// How many devices the account has online, from the detail when there is
+  /// one and from the portal's own total otherwise.
+  devices_total: usize,
+}
+
+/// One device the account has online, as `/cgi-bin/rad_user_info` lists it.
+#[derive(Default, Clone)]
+struct Device {
+  /// Portal session id. Only keeps the order stable inside a group.
+  id: String,
+  ip4: String,
+  ip6: String,
+  os: String,
+  class: String,
+  /// This is the machine the window runs on, judged by the session's own
+  /// addresses.
+  local: bool,
 }
 
 /// The portal reports `::` (or an all-zero address) when nothing is assigned;
@@ -68,16 +88,78 @@ fn norm_ip(s: &str) -> String {
 
 fn info_from(v: &Value) -> Info {
   let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
+  let ip4 = {
+    let ip = norm_ip(s("online_ip"));
+    if ip.is_empty() { norm_ip(s("ip")) } else { ip }
+  };
+  let ip6 = norm_ip(s("online_ip6"));
+  let devices = devices_from(v.get("online_device_detail"), &ip4, &ip6);
+  // The portal reports the total as a *string*, and it can disagree with the
+  // detail: count what is actually listed, and only fall back to the portal's
+  // number when the detail is missing altogether (an older core, or offline).
+  let devices_total = if devices.is_empty() {
+    v.get("online_device_total")
+      .and_then(|n| {
+        n.as_str()
+          .and_then(|text| text.trim().parse().ok())
+          .or_else(|| n.as_u64().map(|n| n as usize))
+      })
+      .unwrap_or(0)
+  } else {
+    devices.len()
+  };
   Info {
-    ip4: {
-      let ip = norm_ip(s("online_ip"));
-      if ip.is_empty() { norm_ip(s("ip")) } else { ip }
-    },
-    ip6: norm_ip(s("online_ip6")),
+    ip4,
+    ip6,
     bytes_in: v.get("bytes_in").and_then(Value::as_u64).unwrap_or(0),
     bytes_out: v.get("bytes_out").and_then(Value::as_u64).unwrap_or(0),
     name: s("user_name").to_string(),
+    devices,
+    devices_total,
   }
+}
+
+/// The per-device list from `rad_user_info`.
+///
+/// The core hands the portal's JSON-in-a-string on as an object, keyed by
+/// session id. A device with no address at all is dropped (it cannot be shown),
+/// and the order is stable so the hover list does not jump around between
+/// polls: this machine, then devices with an IPv4 address, then IPv6-only ones.
+fn devices_from(detail: Option<&Value>, local4: &str, local6: &str) -> Vec<Device> {
+  let mut devices = Vec::new();
+  if let Some(map) = detail.and_then(Value::as_object) {
+    for (id, entry) in map {
+      let s = |k: &str| {
+        entry
+          .get(k)
+          .and_then(Value::as_str)
+          .unwrap_or("")
+          .trim()
+          .to_string()
+      };
+      let ip4 = norm_ip(&s("ip"));
+      let ip6 = norm_ip(&s("ip6"));
+      if ip4.is_empty() && ip6.is_empty() {
+        continue;
+      }
+      let local = (!local4.is_empty() && ip4 == local4) || (!local6.is_empty() && ip6 == local6);
+      devices.push(Device {
+        id: id.clone(),
+        ip4,
+        ip6,
+        os: s("os_name"),
+        class: s("class_name"),
+        local,
+      });
+    }
+  }
+  devices.sort_by(|a, b| {
+    b.local
+      .cmp(&a.local)
+      .then_with(|| a.ip4.is_empty().cmp(&b.ip4.is_empty()))
+      .then_with(|| a.id.cmp(&b.id))
+  });
+  devices
 }
 
 fn human(n: u64) -> String {
@@ -110,12 +192,14 @@ fn state_color(state: State) -> egui::Color32 {
 }
 
 /// `config.json`'s `theme` setting ("auto" | "light" | "dark"), as egui wants
-/// it. `auto` follows the system preference.
+/// it. `auto` resolves to the desktop's own preference where it can be read
+/// (see [`crate::theme`]), and otherwise to egui's `System`, which is what
+/// follows the theme on Windows and macOS.
 fn theme_preference(setting: &str) -> egui::ThemePreference {
   match setting {
     "light" => egui::ThemePreference::Light,
     "dark" => egui::ThemePreference::Dark,
-    _ => egui::ThemePreference::System,
+    _ => crate::theme::system().map_or(egui::ThemePreference::System, Into::into),
   }
 }
 
@@ -471,6 +555,8 @@ pub struct App {
   next_uplink: Instant,
   state: State,
   info: Info,
+  /// The device badge was clicked and its list is showing.
+  devices_open: bool,
   logs: Vec<Line>,
   /// The failure the red banner shows. Stored as a kind rather than as words,
   /// so the banner is re-worded by a language switch instead of keeping the
@@ -503,8 +589,10 @@ pub struct App {
   /// Lowest level rendered in the log pane; older lines are kept and simply
   /// hidden, so raising the threshold again brings them back.
   min_level: Level,
-  /// The theme setting last pushed to the context (`config.json` `theme`).
-  applied_theme: Option<String>,
+  /// The theme last pushed to the context: `config.json` `theme`, already
+  /// resolved, so `auto` is pushed again whenever the desktop switches
+  /// light/dark while the window is open.
+  applied_theme: Option<egui::ThemePreference>,
   autostart: Option<Autostart>,
   autostart_mode: Mode,
   /// This process runs a portable core (`THUNET_STATE_DIR`), so the machine
@@ -710,6 +798,7 @@ impl App {
       next_uplink: Instant::now(),
       state: State::Offline,
       info: Info::default(),
+      devices_open: false,
       logs,
       last_error: None,
       banner_height: 0.0,
@@ -1766,7 +1855,10 @@ impl App {
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
               ui.label(t.account);
-              ui.label(egui::RichText::new(account).monospace());
+              ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(account).monospace());
+                self.device_badge(ui, t);
+              });
               ui.end_row();
               ui.label(t.link);
               ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
@@ -1847,6 +1939,10 @@ impl App {
               }
             });
 
+          // Drawn after the grid, on top of everything else: the popup floats
+          // over the page instead of taking a row of its own.
+          self.device_popup(ui.ctx(), t);
+
           ui.add_space(10.0);
           ui.horizontal(|ui| {
             let online = self.state == State::Online;
@@ -1862,10 +1958,17 @@ impl App {
             }
             if connect.clicked() {
               self.send(Cmd::Connect);
+              // The core's intent changed, and the *Disconnect* button is
+              // drawn from it: ask before the 30 s round is due.
+              self.next_core_query = Instant::now();
             }
+            // A core that still wants to be online is trying or waiting: this
+            // button is how the user calls that off, so it has to work while
+            // the machine is offline too.
+            let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
             if ui
               .add_enabled(
-                online && self.portal_verbs(),
+                (online || wanted) && self.portal_verbs(),
                 egui::Button::new(t.disconnect),
               )
               .on_disabled_hover_text(
@@ -1877,6 +1980,7 @@ impl App {
               .clicked()
             {
               self.send(Cmd::Disconnect);
+              self.next_core_query = Instant::now();
             }
             if ui.button(t.refresh).clicked() {
               self.send(Cmd::Refresh { quiet: false });
@@ -1998,30 +2102,49 @@ impl App {
             }
           }
 
-          // Both are startup behaviour, so they share one row: the settings page
-          // has to fit the fixed window height. *Start minimised* is only
+          // Startup and session behaviour share one row: the settings page has
+          // to fit the fixed window height. *Start minimised* is only
           // meaningful when the tray is part of the autostart mode.
           let mut start_min = self.cfg.start_minimized;
           let tray_starts = !self.portable && self.autostart_mode != Mode::Core;
           let mut auto_conn = self.cfg.auto_connect;
-          ui.horizontal(|ui| {
-            if ui
-              .add_enabled(
-                tray_starts,
-                egui::Checkbox::new(&mut start_min, t.start_minimized),
-              )
-              .changed()
-            {
-              self.apply_start_minimized(start_min);
-            }
-            if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
-              self.cfg.auto_connect = auto_conn;
-              self.send(Cmd::SetAutoConnect(auto_conn));
-              match self.cfg.save() {
-                Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
-                Err(e) => self.toast_err(e),
+          let mut keep_on = self.cfg.keep_online;
+          // These three labels are the widest set on the page, and English is
+          // the tighter one: a slightly narrower gap keeps them on one row in
+          // both languages (`the_startup_switches_fit_on_one_row` pins it).
+          ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.horizontal(|ui| {
+              if ui
+                .add_enabled(
+                  tray_starts,
+                  egui::Checkbox::new(&mut start_min, t.start_minimized),
+                )
+                .changed()
+              {
+                self.apply_start_minimized(start_min);
               }
-            }
+              if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
+                self.cfg.auto_connect = auto_conn;
+                self.send(Cmd::SetAutoConnect(auto_conn));
+                match self.cfg.save() {
+                  Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
+                  Err(e) => self.toast_err(e),
+                }
+              }
+              if ui
+                .checkbox(&mut keep_on, t.keep_online)
+                .on_hover_text(t.keep_online_hint)
+                .changed()
+              {
+                self.cfg.keep_online = keep_on;
+                self.send(Cmd::SetKeepOnline(keep_on));
+                match self.cfg.save() {
+                  Ok(()) => self.toast_toggle(t.keep_online, keep_on),
+                  Err(e) => self.toast_err(e),
+                }
+              }
+            });
           });
           ui.add_space(2.0);
           if ui.button(t.desktop_shortcut).clicked() {
@@ -2296,6 +2419,535 @@ fn dash(s: &str) -> String {
   } else {
     s.to_string()
   }
+}
+
+/// Which icon a device row gets.
+///
+/// The portal's `os_name` is the only real hint (and it is often empty), with
+/// the class name ("Smartphones/PDAs/Tablets") as a weaker one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeviceKind {
+  Android,
+  Apple,
+  Windows,
+  /// Anything unidentified - and what the badge itself shows.
+  Other,
+}
+
+fn device_kind(os: &str, class: &str) -> DeviceKind {
+  let s = format!("{os} {class}").to_ascii_lowercase();
+  if s.contains("android") {
+    DeviceKind::Android
+  } else if ["ios", "iphone", "ipad", "mac os", "macos", "darwin"]
+    .iter()
+    .any(|hint| s.contains(hint))
+  {
+    DeviceKind::Apple
+  } else if s.contains("windows") {
+    DeviceKind::Windows
+  } else {
+    DeviceKind::Other
+  }
+}
+
+/// Brand colours, so a 16 px icon still says which system it is at a glance.
+const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x50, 0x22);
+const LOGO_GREEN: egui::Color32 = egui::Color32::from_rgb(0x7F, 0xBA, 0x00);
+const LOGO_BLUE: egui::Color32 = egui::Color32::from_rgb(0x00, 0xA4, 0xEF);
+const LOGO_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB9, 0x00);
+const ANDROID_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3D, 0xDC, 0x84);
+
+/// A filled polygon.
+///
+/// `epaint` fans fills from the first point, so a fill has to be **convex**;
+/// anything with a notch (the Apple bite) is cut by overdrawing instead.
+fn filled_path(points: Vec<egui::Pos2>, fill: egui::Color32) -> egui::Shape {
+  egui::Shape::Path(egui::epaint::PathShape {
+    points,
+    closed: true,
+    fill,
+    stroke: egui::epaint::PathStroke::NONE,
+  })
+}
+
+/// Sample an ellipse outline, which is always convex.
+fn ellipse_points(center: egui::Pos2, rx: f32, ry: f32, steps: usize) -> Vec<egui::Pos2> {
+  (0..steps)
+    .map(|i| {
+      let a = std::f32::consts::TAU * i as f32 / steps as f32;
+      center + egui::vec2(rx * a.cos(), ry * a.sin())
+    })
+    .collect()
+}
+
+/// Sample the upper half of a circle, left end first: the robot's head.
+fn dome_points(center: egui::Pos2, r: f32, steps: usize) -> Vec<egui::Pos2> {
+  (0..=steps)
+    .map(|i| {
+      let a = std::f32::consts::PI + std::f32::consts::PI * i as f32 / steps as f32;
+      center + egui::vec2(r * a.cos(), r * a.sin())
+    })
+    .collect()
+}
+
+/// Sample a cubic Bézier, both ends included.
+fn cubic_points(
+  from: egui::Pos2,
+  c1: egui::Pos2,
+  c2: egui::Pos2,
+  to: egui::Pos2,
+  steps: usize,
+) -> Vec<egui::Pos2> {
+  (0..=steps)
+    .map(|i| {
+      let t = i as f32 / steps as f32;
+      // de Casteljau, because `Pos2 * f32` is a `Vec2` and the four terms
+      // cannot be summed directly.
+      let lerp = |a: egui::Pos2, b: egui::Pos2, t: f32| a + (b - a) * t;
+      let p01 = lerp(from, c1, t);
+      let p12 = lerp(c1, c2, t);
+      let p23 = lerp(c2, to, t);
+      lerp(lerp(p01, p12, t), lerp(p12, p23, t), t)
+    })
+    .collect()
+}
+
+/// The shapes of one device icon, laid out on a 16 × 16 grid scaled into
+/// `rect`.
+///
+/// Shapes rather than text glyphs on purpose: the Apple logo is a private-use
+/// code point, Windows has no code point at all, and the bundled emoji font is
+/// only a subset, so a glyph would come out as a tofu box on some systems.
+/// Returned instead of painted so the geometry can be checked without a
+/// renderer.
+///
+/// `ink` colours the single-colour logos (the Apple one is monochrome in its
+/// own brand too), and `bg` is what the icon is drawn on - the Apple bite is an
+/// overdraw in that colour, because a concave fill is not something `epaint`
+/// can do.
+fn device_icon_shapes(
+  rect: egui::Rect,
+  kind: DeviceKind,
+  ink: egui::Color32,
+  bg: egui::Color32,
+) -> Vec<egui::Shape> {
+  let s = rect.width() / 16.0;
+  let at = |x: f32, y: f32| rect.min + egui::vec2(x * s, y * s);
+  let line = |from: egui::Pos2, to: egui::Pos2, w: f32| egui::Shape::LineSegment {
+    points: [from, to],
+    stroke: egui::Stroke::new((w * s).max(1.0), ink).into(),
+  };
+  match kind {
+    // The Microsoft window: four panes, brand colours, hairline gap.
+    DeviceKind::Windows => {
+      let pane = 6.4;
+      let gap = 1.2;
+      let (x0, y0) = (1.0, 1.0);
+      let x1 = x0 + pane + gap;
+      let y1 = y0 + pane + gap;
+      let pane_rect = |x: f32, y: f32, c: egui::Color32| {
+        egui::Shape::Rect(egui::epaint::RectShape::filled(
+          egui::Rect::from_min_max(at(x, y), at(x + pane, y + pane)),
+          egui::CornerRadius::same(0),
+          c,
+        ))
+      };
+      vec![
+        pane_rect(x0, y0, LOGO_RED),
+        pane_rect(x1, y0, LOGO_GREEN),
+        pane_rect(x0, y1, LOGO_BLUE),
+        pane_rect(x1, y1, LOGO_YELLOW),
+      ]
+    }
+    // The bugdroid's head: dome, antennae, and eyes that are holes in the
+    // green rather than painted on it.
+    DeviceKind::Android => {
+      let mut shapes = vec![
+        line(at(5.2, 7.3), at(3.6, 4.6), 1.1),
+        line(at(10.8, 7.3), at(12.4, 4.6), 1.1),
+        filled_path(dome_points(at(8.0, 11.4), 5.0 * s, 24), ANDROID_GREEN),
+      ];
+      for x in [6.1, 9.9] {
+        shapes.push(egui::Shape::Circle(egui::epaint::CircleShape {
+          center: at(x, 8.3),
+          radius: 0.9 * s,
+          fill: egui::Color32::from_rgb(0xFA, 0xFA, 0xFA),
+          stroke: egui::Stroke::NONE.into(),
+        }));
+      }
+      shapes
+    }
+    // The apple: an elliptical body, a circle in the background colour for the
+    // bite, a short stem and an almond leaf. The body is a single convex fill
+    // because `epaint` fans fills and cannot draw a concave notch by itself.
+    DeviceKind::Apple => {
+      let leaf = [
+        cubic_points(
+          at(8.7, 3.9),
+          at(10.9, 3.8),
+          at(11.7, 3.3),
+          at(12.5, 1.2),
+          10,
+        ),
+        cubic_points(at(12.5, 1.2), at(10.3, 1.3), at(9.5, 1.8), at(8.7, 3.9), 10),
+      ]
+      .concat();
+      vec![
+        line(at(7.9, 4.6), at(8.3, 3.2), 0.9),
+        filled_path(leaf, ink),
+        filled_path(ellipse_points(at(7.6, 9.8), 5.8 * s, 5.6 * s, 40), ink),
+        egui::Shape::Circle(egui::epaint::CircleShape {
+          center: at(13.9, 8.6),
+          radius: 2.8 * s,
+          fill: bg,
+          stroke: egui::Stroke::NONE.into(),
+        }),
+      ]
+    }
+    // A monitor: screen, stand, base.
+    DeviceKind::Other => {
+      let screen = egui::Rect::from_min_max(at(1.0, 2.3), at(15.0, 10.7));
+      let stroke: egui::Stroke = egui::Stroke::new((1.4 * s).max(1.0), ink);
+      vec![
+        egui::Shape::Rect(egui::epaint::RectShape::new(
+          screen,
+          egui::CornerRadius::same(2),
+          egui::Color32::TRANSPARENT,
+          stroke,
+          egui::StrokeKind::Inside,
+        )),
+        egui::Shape::Rect(egui::epaint::RectShape::filled(
+          egui::Rect::from_min_max(at(6.9, 10.7), at(9.1, 13.4)),
+          egui::CornerRadius::same(0),
+          ink,
+        )),
+        filled_path(
+          vec![at(4.2, 14.5), at(11.8, 14.5), at(11.0, 13.2), at(5.0, 13.2)],
+          ink,
+        ),
+      ]
+    }
+  }
+}
+
+/// Draw one device icon into `rect`.
+///
+/// Clipped to the icon's own box: the Apple bite is drawn as a circle in the
+/// background colour and reaches past the body, so without a clip it would
+/// rub out a few pixels of whatever sits to its right.
+fn paint_device_icon(
+  painter: &egui::Painter,
+  rect: egui::Rect,
+  kind: DeviceKind,
+  ink: egui::Color32,
+  bg: egui::Color32,
+) {
+  let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+  painter.extend(device_icon_shapes(rect, kind, ink, bg));
+}
+
+/// A close button in the macOS window-controls style.
+///
+/// A flat 13 px red circle with no outline; the cross only appears while the
+/// pointer is over it, in a dark tint of the same red rather than white, which
+/// is what keeps it from shouting. Drawn rather than made of a text glyph: the
+/// bundled fonts may not carry a cross that looks like one.
+fn close_button(ui: &mut egui::Ui) -> egui::Response {
+  const HIT: f32 = 16.0;
+  const DIA: f32 = 13.0;
+  let (rect, resp) = ui.allocate_exact_size(egui::vec2(HIT, HIT), egui::Sense::click());
+  let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+  let hovered = resp.hovered();
+  let fill = if hovered {
+    egui::Color32::from_rgb(255, 120, 112)
+  } else {
+    egui::Color32::from_rgb(255, 95, 87)
+  };
+  let painter = ui.painter();
+  painter.circle_filled(rect.center(), DIA / 2.0, fill);
+  if hovered {
+    let r = DIA * 0.22;
+    let stroke = egui::Stroke::new(1.3, egui::Color32::from_rgba_unmultiplied(90, 8, 6, 200));
+    painter.line_segment(
+      [
+        rect.center() + egui::vec2(-r, -r),
+        rect.center() + egui::vec2(r, r),
+      ],
+      stroke,
+    );
+    painter.line_segment(
+      [
+        rect.center() + egui::vec2(-r, r),
+        rect.center() + egui::vec2(r, -r),
+      ],
+      stroke,
+    );
+  }
+  resp
+}
+
+/// The device list sizes itself to its content: a short list must not open a
+/// wide dialog with an empty right margin. The height is capped instead, with a
+/// scroll bar for an account with many devices.
+const DEVICES_WIDTH_MIN: f32 = 180.0;
+const DEVICES_WIDTH_MAX: f32 = 360.0;
+const DEVICES_SCROLL_MAX: f32 = 180.0;
+/// The local dot, the device icon and the gaps between the columns.
+const DEVICES_DOT: f32 = 8.0;
+const DEVICES_ICON: f32 = 16.0;
+const DEVICES_GAP: f32 = 8.0;
+/// Room between the last column and the right edge, so a floating scroll bar
+/// does not sit on top of the local dot.
+const DEVICES_EDGE_PAD: f32 = 6.0;
+/// Widest the system/type column may get before it is elided.
+const DEVICES_KIND_MAX: f32 = 110.0;
+
+impl App {
+  /// The account's online-device count beside its name, and the click that
+  /// opens the list.
+  ///
+  /// The portal lists the devices of the *account*, campus-wide, not this
+  /// machine's session, so the count belongs next to the account. A drawn icon
+  /// plus `×` with the count as a superscript fits in the row without eating
+  /// the log pane; nothing is drawn while the account has no session, so an
+  /// offline machine keeps the plain row it always had.
+  fn device_badge(&mut self, ui: &mut egui::Ui, t: &Texts) {
+    let n = self.info.devices_total;
+    if n == 0 {
+      // No session: no badge, and no list to keep open.
+      self.devices_open = false;
+      return;
+    }
+    let ink = ui.visuals().weak_text_color();
+    // The count is written as a power on the icon's corner: smaller, raised,
+    // and with no multiplication sign in between.
+    let count = ui
+      .painter()
+      .layout_no_wrap(n.to_string(), egui::FontId::proportional(9.5), ink);
+    let icon = 14.0;
+    let gap = 2.0;
+    let pad = 5.0;
+    let width = pad * 2.0 + icon + gap + count.size().x;
+    let (rect, resp) = ui.allocate_exact_size(
+      egui::vec2(width, ui.spacing().interact_size.y.max(18.0)),
+      egui::Sense::click(),
+    );
+    let resp = resp
+      .on_hover_cursor(egui::CursorIcon::PointingHand)
+      .on_hover_text(format!("{}{n}", t.devices_title));
+    if resp.hovered() || self.devices_open {
+      let fill = if self.devices_open {
+        ui.visuals().selection.bg_fill
+      } else {
+        ui.visuals().widgets.hovered.bg_fill
+      };
+      ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(4), fill);
+    }
+    let icon_rect = egui::Rect::from_min_size(
+      egui::pos2(rect.left() + pad, rect.center().y - icon / 2.0),
+      egui::vec2(icon, icon),
+    );
+    paint_device_icon(
+      ui.painter(),
+      icon_rect,
+      DeviceKind::Other,
+      ink,
+      ui.visuals().window_fill(),
+    );
+    // Level with the icon's top edge, just past its right side.
+    ui.painter().galley(
+      egui::pos2(icon_rect.right() + gap, icon_rect.top() - 2.5),
+      count,
+      ink,
+    );
+    if resp.clicked() {
+      self.devices_open = !self.devices_open;
+    }
+  }
+
+  /// The device list, as a modal.
+  ///
+  /// A modal instead of a floating area: egui dims the page behind it and
+  /// swallows its clicks, which is what makes the list read as "look, then
+  /// dismiss". The framework centres it, so no anchor arithmetic is needed.
+  fn device_popup(&mut self, ctx: &egui::Context, t: &Texts) {
+    if !self.devices_open {
+      return;
+    }
+    let devices = &self.info.devices;
+    let n = self.info.devices_total;
+    let mut open = true;
+    let modal = egui::Modal::new(egui::Id::unique("thunet_devices_popup")).show(ctx, |ui| {
+      devices_list(ui, devices, n, t, &mut open);
+    });
+    // The dimmed backdrop and Escape are the framework's own dismissal, so the
+    // close button is one more way out rather than the only one.
+    if !open || modal.should_close() {
+      self.devices_open = false;
+    }
+  }
+}
+
+/// What one device list occupied, so the dialog's width can be checked against
+/// its content instead of being eyeballed.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct DevicesLayout {
+  /// Width the columns asked for (the value handed to the body's max rect).
+  planned: f32,
+  /// Width of the body itself, close button and rule included.
+  used: f32,
+  /// Width of one row inside the scroll area.
+  grid: f32,
+}
+
+/// Draw the dialog body: the title row with its close button, then the rows.
+///
+/// The width is measured before anything is laid out. The title row, the rule
+/// and the rows all size themselves from `available_width()`, so they are only
+/// bound to it once they sit in a sub-ui whose max rect *is* that width.
+fn devices_list(
+  ui: &mut egui::Ui,
+  devices: &[Device],
+  n: usize,
+  t: &Texts,
+  open: &mut bool,
+) -> DevicesLayout {
+  let title = format!("{}{n}", t.devices_title);
+  let body = egui::TextStyle::Body.resolve(ui.style());
+  let mono = egui::TextStyle::Monospace.resolve(ui.style());
+  let measure = |text: &str, font: &egui::FontId| {
+    ui.fonts_mut(|f| {
+      f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x
+    })
+  };
+  let mut addr_w = 0.0_f32;
+  let mut kind_w = 0.0_f32;
+  for d in devices {
+    let addr = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+    let kind = if d.os.is_empty() { &d.class } else { &d.os };
+    addr_w = addr_w.max(measure(addr, &mono));
+    kind_w = kind_w.max(measure(kind, &body).min(DEVICES_KIND_MAX));
+  }
+  // Each column gets what its widest entry needs, so an address is only elided
+  // when the dialog hits its cap - never because a neighbouring column was
+  // reserved for nothing.
+  let rows_w = DEVICES_EDGE_PAD
+    + DEVICES_DOT
+    + DEVICES_GAP
+    + DEVICES_ICON
+    + DEVICES_GAP
+    + addr_w
+    + if kind_w > 0.0 {
+      DEVICES_GAP + kind_w
+    } else {
+      0.0
+    };
+  let header_w = measure(&title, &body) + DEVICES_GAP + 16.0;
+  let width = rows_w
+    .max(header_w)
+    .clamp(DEVICES_WIDTH_MIN, DEVICES_WIDTH_MAX);
+
+  // The body is bounded with an explicit max rect: `set_max_width` alone is a
+  // no-op here, because a vertical layout with a centred cross axis makes every
+  // widget fill the *available* width (`Layout::next_frame`), so the title row
+  // and the separator kept stretching to the panel's width.
+  let avail = ui.available_rect_before_wrap();
+  let body_rect = egui::Rect::from_min_size(avail.min, egui::vec2(width, avail.height()));
+  let row_h = ui
+    .text_style_height(&egui::TextStyle::Body)
+    .max(ui.text_style_height(&egui::TextStyle::Monospace))
+    .max(DEVICES_ICON);
+  let mut grid = 0.0_f32;
+  let body = ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+    ui.horizontal(|ui| {
+      ui.label(egui::RichText::new(&title).strong());
+      ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if close_button(ui).clicked() {
+          *open = false;
+        }
+      });
+    });
+    ui.separator();
+    if devices.is_empty() {
+      return;
+    }
+    // The rows fill the body: the dots line up against the dialog's right edge
+    // instead of floating after the shortest address.
+    egui::ScrollArea::vertical()
+      .max_height(DEVICES_SCROLL_MAX)
+      .auto_shrink([false, true])
+      .show(ui, |ui| {
+        for d in devices {
+          let ink = ui.visuals().text_color();
+          let bg = ui.visuals().window_fill();
+          let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = DEVICES_GAP;
+            let (icon, _) =
+              ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::hover());
+            paint_device_icon(ui.painter(), icon, device_kind(&d.os, &d.class), ink, bg);
+            fixed_cell(ui, (&d.id, "addr"), addr_w, row_h, |ui| {
+              let addr = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+              // `truncate` elides at the column's width and, by default, shows
+              // the whole address on hover when it had to.
+              ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
+            });
+            if kind_w > 0.0 {
+              fixed_cell(ui, (&d.id, "kind"), kind_w, row_h, |ui| {
+                let kind = if d.os.is_empty() { &d.class } else { &d.os };
+                ui.add(egui::Label::new(kind).truncate());
+              });
+            }
+            // The dot closes the row in a column of its own, so the marks line
+            // up on the right edge instead of floating after a short address.
+            // The space goes first in a right-to-left row, which is what puts
+            // it outside the dot rather than inside it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+              ui.add_space(DEVICES_EDGE_PAD);
+              let (dot, _) =
+                ui.allocate_exact_size(egui::vec2(DEVICES_DOT, DEVICES_DOT), egui::Sense::hover());
+              if d.local {
+                ui.painter()
+                  .circle_filled(dot.center(), 3.0, ui.visuals().selection.bg_fill);
+              }
+            });
+          });
+          grid = grid.max(row.response.rect.width());
+        }
+      });
+  });
+  DevicesLayout {
+    planned: width,
+    // The body's own rect, not `min_rect`: a panel's ui starts with a min rect
+    // as wide as the panel, so it says nothing about the content.
+    used: body.response.rect.width(),
+    grid,
+  }
+}
+
+/// Reserve exactly `w` × `h` in the row, then draw inside it.
+///
+/// The reservation is what keeps the columns aligned: a sub-ui sized from its
+/// content would let a short address pull every later column left. The child is
+/// made with `new_child`, which does not advance the cursor a second time.
+fn fixed_cell(
+  ui: &mut egui::Ui,
+  id_salt: impl std::hash::Hash + std::fmt::Debug,
+  w: f32,
+  h: f32,
+  add: impl FnOnce(&mut egui::Ui),
+) {
+  let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+  let mut cell = ui.new_child(
+    egui::UiBuilder::new()
+      .id_salt(id_salt)
+      .max_rect(rect)
+      .layout(egui::Layout::left_to_right(egui::Align::Center)),
+  );
+  add(&mut cell);
 }
 
 /// One copyable address row: the address against the left edge of the value
@@ -2847,6 +3499,54 @@ mod tests {
     assert!(!is_double_click(0, 10, 500));
     assert!(is_double_click(10, 510, 500));
     assert!(!is_double_click(10, 511, 500));
+  }
+
+  /// The three switches share one row in a fixed-width window, so the labels
+  /// have to fit in both languages. This pins it instead of trusting that they
+  /// look fine: the row may not be wider than the page's inner width.
+  #[test]
+  fn the_startup_switches_fit_on_one_row() {
+    for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
+      let t = lang.texts();
+      let ctx = egui::Context::default();
+      let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+          egui::Pos2::ZERO,
+          egui::vec2(DEFAULT_WIDTH, WINDOW_HEIGHT),
+        )),
+        ..Default::default()
+      };
+      let mut row = 0.0;
+      let mut out = ctx.run_ui(input, |ui| {
+        egui::Frame::new()
+          .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 14,
+            bottom: 8,
+          })
+          .show(ui, |ui| {
+            let mut start_min = true;
+            let mut auto_conn = true;
+            let mut keep_on = true;
+            row = ui
+              .horizontal(|ui| {
+                ui.checkbox(&mut start_min, t.start_minimized);
+                ui.checkbox(&mut auto_conn, t.auto_connect);
+                ui.checkbox(&mut keep_on, t.keep_online);
+              })
+              .response
+              .rect
+              .width();
+          });
+      });
+      out.textures_delta.clear();
+      let inner = DEFAULT_WIDTH - 28.0;
+      assert!(
+        row <= inner,
+        "{lang:?}: the three switches need {row} px, the page has {inner}"
+      );
+    }
   }
 
   /// Right-clicking a log selection must copy only the selection. egui collapses
@@ -3459,6 +4159,224 @@ mod tests {
     assert_eq!(info_from(&v).ip4, "198.51.100.7");
   }
 
+  /// The account badge counts what the portal lists and marks this machine.
+  /// Documentation addresses (RFC 5737 / RFC 3849) and made-up session ids.
+  #[test]
+  fn the_account_lists_its_devices_with_this_machine_first() {
+    let v: Value = serde_json::from_str(
+      r#"{
+        "online_ip": "192.0.2.10", "online_ip6": "2001:db8::1",
+        "user_name": "1234567890", "bytes_in": 1, "bytes_out": 2,
+        "online_device_total": "3",
+        "online_device_detail": {
+          "1221087022": {"class_name": "", "ip": "198.51.100.7", "ip6": "::", "os_name": ""},
+          "1052067690": {"class_name": "Smartphones/PDAs/Tablets", "ip": "192.0.2.10",
+                         "ip6": "2001:db8::1", "os_name": "AndroidOS"},
+          "1222833864": {"class_name": "", "ip": "::", "ip6": "2001:db8::2", "os_name": ""}
+        }
+      }"#,
+    )
+    .unwrap();
+    let info = info_from(&v);
+    assert_eq!(info.devices_total, 3);
+    assert_eq!(info.devices.len(), 3);
+    // This machine first, then an IPv4 address, then IPv6-only.
+    assert!(info.devices[0].local);
+    assert_eq!(info.devices[0].ip4, "192.0.2.10");
+    assert_eq!(info.devices[0].os, "AndroidOS");
+    assert_eq!(info.devices[1].ip4, "198.51.100.7");
+    assert_eq!(info.devices[2].ip6, "2001:db8::2");
+    assert!(!info.devices[1].local);
+
+    // A device with no address at all cannot be shown and is dropped, while
+    // the portal's own total still says how many there are.
+    let v: Value = serde_json::from_str(
+      r#"{"online_device_total":"2","online_device_detail":{
+            "1":{"ip":"::","ip6":"::"},"2":{"ip":"192.0.2.11","ip6":"::"}}}"#,
+    )
+    .unwrap();
+    let info = info_from(&v);
+    assert_eq!(info.devices.len(), 1);
+
+    // An answer without the detail (an older core, or offline) still carries
+    // the count, and no list.
+    let v: Value = serde_json::from_str(r#"{"online_device_total":"2"}"#).unwrap();
+    let info = info_from(&v);
+    assert_eq!(info.devices_total, 2);
+    assert!(info.devices.is_empty());
+  }
+
+  /// The portal names an OS only sometimes (`os_name`), so the class name is
+  /// the fallback; anything unrecognised gets the generic icon.
+  #[test]
+  fn devices_are_told_apart_by_their_os_name() {
+    assert_eq!(device_kind("AndroidOS", ""), DeviceKind::Android);
+    assert_eq!(device_kind("iOS", ""), DeviceKind::Apple);
+    assert_eq!(device_kind("Mac OS X", ""), DeviceKind::Apple);
+    assert_eq!(device_kind("Windows", ""), DeviceKind::Windows);
+    assert_eq!(device_kind("Linux", ""), DeviceKind::Other);
+    assert_eq!(
+      device_kind("", "Smartphones/PDAs/Tablets"),
+      DeviceKind::Other
+    );
+    assert_eq!(device_kind("", ""), DeviceKind::Other);
+  }
+
+  /// Does one shape paint over `p`?
+  fn icon_covers(shape: &egui::Shape, p: egui::Pos2) -> bool {
+    use egui::Color32;
+    let on_edge = |points: &[egui::Pos2], closed: bool, width: f32| {
+      let n = points.len();
+      let last = if closed { n } else { n - 1 };
+      (0..last).any(|i| {
+        let (a, b) = (points[i], points[(i + 1) % n]);
+        let ab = b - a;
+        let len2 = ab.length_sq();
+        let t = if len2 > 0.0 {
+          ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+        } else {
+          0.0
+        };
+        (a + ab * t).distance(p) <= width / 2.0
+      })
+    };
+    match shape {
+      egui::Shape::Path(path) => {
+        (path.fill != Color32::TRANSPARENT && point_in_polygon(&path.points, p))
+          || on_edge(&path.points, true, path.stroke.width)
+      }
+      egui::Shape::Circle(circle) => {
+        let r = circle.center.distance(p);
+        (circle.fill != Color32::TRANSPARENT && r <= circle.radius)
+          || (circle.stroke.width > 0.0 && (r - circle.radius).abs() <= circle.stroke.width / 2.0)
+      }
+      egui::Shape::Rect(rect) => {
+        if !rect.rect.contains(p) {
+          return false;
+        }
+        let w = rect.stroke.width;
+        rect.fill != Color32::TRANSPARENT || w <= 0.0 || !rect.rect.shrink(w / 2.0).contains(p)
+      }
+      egui::Shape::LineSegment { points, stroke } => on_edge(points, false, stroke.width),
+      _ => false,
+    }
+  }
+
+  /// Ray casting, for the convex fills the icons are made of.
+  fn point_in_polygon(points: &[egui::Pos2], p: egui::Pos2) -> bool {
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+      let (a, b) = (points[i], points[j]);
+      if (a.y > p.y) != (b.y > p.y) {
+        let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+        if p.x < x {
+          inside = !inside;
+        }
+      }
+      j = i;
+    }
+    inside
+  }
+
+  /// Every icon stays inside its box and covers a fair share of it: a shape
+  /// pushed off the rect, or an icon that lost its fill, would otherwise only
+  /// show up in a screenshot.
+  #[test]
+  fn every_device_icon_fills_its_box() {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0));
+    let bg = egui::Color32::from_rgb(1, 2, 3);
+    // Each icon's share of the box, with room for the shapes being tuned: a
+    // filled window is most of the box, a robot head only its lower half.
+    for (kind, least) in [
+      (DeviceKind::Windows, 0.50),
+      (DeviceKind::Android, 0.12),
+      (DeviceKind::Apple, 0.25),
+      (DeviceKind::Other, 0.08),
+    ] {
+      let shapes = device_icon_shapes(rect, kind, egui::Color32::BLACK, bg);
+      assert!(!shapes.is_empty(), "{kind:?} draws nothing");
+      for shape in &shapes {
+        // The bite is a background-coloured circle that deliberately reaches
+        // past the body; `paint_device_icon` clips it to the box.
+        if matches!(shape, egui::Shape::Circle(circle) if circle.fill == bg) {
+          continue;
+        }
+        let bounds = shape.visual_bounding_rect();
+        assert!(
+          rect.expand(0.6).contains_rect(bounds),
+          "{kind:?} paints outside its box: {bounds:?}"
+        );
+      }
+      let cells = 16;
+      let covered = (0..cells)
+        .flat_map(|y| (0..cells).map(move |x| (x, y)))
+        .filter(|(x, y)| {
+          let p = egui::pos2(*x as f32 + 0.5, *y as f32 + 0.5);
+          shapes.iter().any(|s| icon_covers(s, p))
+        })
+        .count();
+      let share = covered as f32 / (cells * cells) as f32;
+      assert!(share > least, "{kind:?} only covers {share:.2} of its box");
+    }
+  }
+
+  /// The dialog must be no wider than the columns it shows. A separator or a
+  /// scroll area that quietly stretches it leaves the close button and the rule
+  /// hanging in the middle of the dialog, which is exactly what happened while
+  /// the body was laid out with a minimum width only: a vertical layout with a
+  /// centred cross axis stretches every widget to the *available* width, so the
+  /// body has to be bounded with a max rect of its own.
+  #[test]
+  fn the_device_dialog_is_only_as_wide_as_its_rows() {
+    let t = crate::i18n::Lang::En.texts();
+    // Documentation addresses (RFC 5737) of the same length as real ones.
+    let devices = vec![
+      Device {
+        id: "1".into(),
+        ip4: "192.0.2.191".into(),
+        os: "AndroidOS".into(),
+        local: true,
+        ..Default::default()
+      },
+      Device {
+        id: "2".into(),
+        ip4: "198.51.100.241".into(),
+        ..Default::default()
+      },
+      Device {
+        id: "3".into(),
+        ip4: "203.0.113.138".into(),
+        ..Default::default()
+      },
+    ];
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(DEFAULT_WIDTH, WINDOW_HEIGHT),
+      )),
+      ..Default::default()
+    };
+    let mut layout = None;
+    let mut out = ctx.run_ui(input, |ui| {
+      egui::CentralPanel::default().show(ui, |ui| {
+        let mut open = true;
+        layout = Some(devices_list(ui, &devices, devices.len(), t, &mut open));
+      });
+    });
+    out.textures_delta.clear();
+    let layout = layout.expect("the list is laid out at least once");
+    assert!(
+      layout.grid <= layout.planned + 0.5,
+      "the row grid is wider than the dialog: {layout:?}"
+    );
+    assert!(
+      layout.used <= layout.planned + 0.5,
+      "the body used more width than it planned: {layout:?}"
+    );
+  }
+
   #[test]
   fn only_a_newer_core_build_restarts_the_window() {
     // Same build (manual stop/start, plain restart): leave the window alone.
@@ -3564,9 +4482,9 @@ fn page_banners(
   }
   // Auto connect with nothing to connect with. Offline the machine sits there
   // until someone fills the form in; online it looks healthy but cannot sign in
-  // again — a leftover portal session, which survives a core restart because
-  // keepalive needs no credential, hides exactly that. Information, not a
-  // failure, so it uses the amber band either way.
+  // again — a leftover portal session, which outlives a core restart because
+  // nothing ends it, hides exactly that. Information, not a failure, so it uses
+  // the amber band either way.
   if page == Page::Status && core_answered && auto_connect && !credentials_ready {
     let text = if state == State::Online {
       t.auto_connect_without_credentials_online
@@ -3657,10 +4575,13 @@ impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     // The stored theme is pushed here rather than in `App::new`, which runs
     // before there is a context to apply it to. `applied_theme` remembers what
-    // was sent, so this is a no-op on the frames in between.
-    if self.applied_theme.as_deref() != Some(self.cfg.theme.as_str()) {
-      ctx.set_theme(theme_preference(&self.cfg.theme));
-      self.applied_theme = Some(self.cfg.theme.clone());
+    // was sent, so this is a no-op on the frames in between. It holds the
+    // resolved theme, not the setting, so `auto` also picks up a light/dark
+    // switch of the desktop itself.
+    let theme = theme_preference(&self.cfg.theme);
+    if self.applied_theme != Some(theme) {
+      ctx.set_theme(theme);
+      self.applied_theme = Some(theme);
     }
 
     // GTK delivers the appindicator menu callbacks through its own event loop,
@@ -4460,6 +5381,9 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
     Box::new(move |cc| {
       // Must happen before `App::new`, which builds the tray menu.
       init_gtk().map_err(std::io::Error::other)?;
+      // Also before the first frame, so `auto` starts on the desktop's theme
+      // instead of drawing one frame dark and switching afterwards.
+      crate::theme::watch(cc.egui_ctx.clone());
       let font = install_fonts(&cc.egui_ctx);
       #[cfg(windows)]
       install_tray_events(&cc.egui_ctx);
