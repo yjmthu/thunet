@@ -745,8 +745,26 @@ fn run(cli: Cli) -> Result<(), String> {
             .into(),
         );
       }
-      println!("{}", autostart::Autostart::service(action, cli.minimized)?);
-      Ok(())
+      match autostart::Autostart::service(action, cli.minimized) {
+        Ok(line) => {
+          println!("{line}");
+          Ok(())
+        }
+        // `pkexec` answers 126 both for a dismissed dialog and for a session
+        // that could never show one - a terminal outside the logind session
+        // (VS Code's integrated one, an SSH login) fails this way even with
+        // the right password. Repeating the bare code leaves the user with no
+        // way forward, so name the command the dialog would have run.
+        Err(e) if e == crate::elevate::NO_AUTHORIZATION => Err(format!(
+          "no administrator authorization was granted: the polkit dialog was dismissed, or this \
+           session cannot show one. Run it as root instead:\n  sudo {} --machine service {}",
+          crate::exe_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "thunet".into()),
+          action.name()
+        )),
+        Err(e) => Err(e),
+      }
     }
     // `--machine` is how the two legitimate callers arrive: `elevate` starts the
     // helper with it, and the Windows installer passes it to its custom

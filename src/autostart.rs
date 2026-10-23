@@ -50,6 +50,25 @@ pub enum ServiceAction {
   Status,
 }
 
+impl ServiceAction {
+  /// The word the CLI takes for this action.
+  ///
+  /// Public because `main` repeats it in the "run this as root instead" hint:
+  /// the elevated copy is started with exactly `--machine service <name>`.
+  pub fn name(self) -> &'static str {
+    match self {
+      Self::Install => "install",
+      Self::Uninstall => "uninstall",
+      Self::Enable => "enable",
+      Self::Disable => "disable",
+      Self::Start => "start",
+      Self::Stop => "stop",
+      Self::Restart => "restart",
+      Self::Status => "status",
+    }
+  }
+}
+
 /// Whether `thunet service <action>` must refuse in a portable process.
 ///
 /// Portable mode has no service: the core is a thread of the window. Letting
