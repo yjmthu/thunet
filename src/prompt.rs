@@ -1,13 +1,13 @@
-//! Terminal prompts for `thunet login -i`.
+//! Terminal prompts for the verbs that ask questions.
 //!
-//! The binary uses the GUI subsystem, so it attaches to the launching console
-//! first (see `main::attach_parent_console`). `-i` is the user's promise that a
-//! shell is waiting to answer, so nothing here checks for a console: the prompts
-//! read whatever stdin is. The plain pipe path never comes here - it reads whole
-//! lines with [`piped_line`].
+//! Only `thunet login -i` reaches this. The binary uses the GUI subsystem, so it
+//! attaches to the launching console first (see `main::attach_parent_console`),
+//! and the flag is the caller's promise that the shell is waiting for it: an
+//! interactive cmd or PowerShell would otherwise read the same console and eat
+//! the answers. The secret read and the Ctrl+C handler come from `rpassword` and
+//! `ctrlc`, so no console or termios call is written here.
 //!
-//! Ctrl+C is part of the contract: a prompt must be cancellable, and the
-//! terminal must not be left with echo switched off.
+//! The pipe path uses none of this: `piped_line` reads plain lines from stdin.
 
 use std::io::{IsTerminal as _, Write};
 
@@ -16,17 +16,29 @@ pub fn available() -> bool {
   std::io::stdin().is_terminal()
 }
 
-/// Make Ctrl+C end the questions cleanly, whatever they are showing at the
-/// time.
+/// End the command on Ctrl+C instead of leaving a question unanswered.
 ///
-/// Installed before the first question rather than when echo is switched off:
-/// a cancel has to work at the account prompt too, and it must leave the
-/// terminal exactly as it found it.
+/// A cancel can arrive from the console handler thread, and `rpassword` returns
+/// its own interrupt when the terminal delivers Ctrl+C as a character (POSIX
+/// clears `ISIG`, and Windows hands the byte through with echo off). Both kinds
+/// end here, so the message and the status are the same either way, and the
+/// terminal is already back: `rpassword` restores it as its read returns.
 pub fn arm_cancel() {
-  #[cfg(windows)]
-  console::install();
-  #[cfg(unix)]
-  tty::install();
+  let _ = ctrlc::set_handler(|| cancel());
+}
+
+/// Report the cancel once and leave with 130.
+fn cancel() -> ! {
+  static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    println!();
+    println!("cancelled");
+  }
+  // The call is the tail expression on purpose: it returns `!`, so the block
+  // diverges by construction. As a statement it still satisfies `-> !` for
+  // rustc, but rust-analyzer then types the block as `()` and reports
+  // "expected `!`, found `()`" on the closing brace.
+  std::process::exit(130)
 }
 
 /// Ask for one line, showing `prompt` first. Surrounding whitespace is dropped:
@@ -41,34 +53,28 @@ pub fn line(prompt: &str) -> Result<String, String> {
   Ok(answer.trim().to_string())
 }
 
-/// Ask for a secret: the same read, but nothing is echoed.
+/// Ask for a secret: only the line terminator is stripped, because a password may
+/// end in spaces.
 ///
-/// Only the line terminator is stripped - a password may end in spaces, and
-/// trimming them would change it.
-#[cfg(windows)]
+/// A terminal is read by `rpassword`, which turns the echo off for the duration
+/// and restores it when the read returns. Anything else - a pipe, `NUL` - is a
+/// plain line: there is no echo to suppress and no terminal to configure.
 pub fn secret(prompt: &str) -> Result<String, String> {
   print!("{prompt}");
   std::io::stdout().flush().map_err(|e| e.to_string())?;
-  let echo = Echo::off()?;
-  let read = read_stdin_line();
-  drop(echo);
-  // No newline here: a console echoes the line break of the Enter even with echo
-  // off, so printing one as well is what left a blank line behind the question.
-  // With no console (a pipe, `NUL`) there is no cursor to move either.
-  read
-}
-
-/// The same, for a POSIX terminal. With `ECHO` cleared the terminal does not
-/// echo the Enter, so the newline printed here is the only one.
-#[cfg(unix)]
-pub fn secret(prompt: &str) -> Result<String, String> {
-  print!("{prompt}");
-  std::io::stdout().flush().map_err(|e| e.to_string())?;
-  let echo = Echo::off()?;
-  let read = read_stdin_line();
-  drop(echo);
-  println!();
-  read
+  if available() {
+    let answer = match rpassword::read_password() {
+      Ok(answer) => answer,
+      Err(e) if e.kind() == std::io::ErrorKind::Interrupted => cancel(),
+      Err(e) => return Err(format!("cannot read the password: {e}")),
+    };
+    // A Windows console echoes the line break of the Enter even with echo off; a
+    // POSIX terminal does not, so the newline is ours there.
+    #[cfg(unix)]
+    println!();
+    return Ok(answer.trim_end_matches(['\r', '\n']).to_string());
+  }
+  read_stdin_line()
 }
 
 /// One line from stdin, terminator removed and nothing else touched.
@@ -83,192 +89,14 @@ fn read_stdin_line() -> Result<String, String> {
 /// One line from a redirected stdin, terminator removed.
 ///
 /// `None` means there was no line at all: the pipe was empty or closed, or a
-/// launch with no console and no pipeline (the tray started from Explorer) has
-/// no usable handle. The caller falls back to the stored credential instead of
-/// treating that as an answer - which is what separates "nothing was piped"
-/// from "the first line was left empty".
+/// launch with no console and no pipeline (the tray started from Explorer) has no
+/// usable handle. The caller falls back to the stored credential instead of
+/// treating that as an answer - which is what separates "nothing was piped" from
+/// "the first line was left empty".
 pub fn piped_line() -> Option<String> {
   let mut answer = String::new();
   match std::io::stdin().read_line(&mut answer) {
     Ok(0) | Err(_) => None,
     Ok(_) => Some(answer.trim_end_matches(['\r', '\n']).to_string()),
-  }
-}
-
-/// Echo turned off for as long as this value lives, plus a Ctrl+C hook that
-/// puts it back before the process ends.
-///
-/// Without the hook a cancelled prompt leaves the console without echo, so
-/// everything typed into that window afterwards is invisible - and on Windows
-/// a Ctrl+C does nothing at all, because a GUI-subsystem process has no default
-/// console handler to end it.
-#[cfg(windows)]
-struct Echo(Option<u32>);
-
-#[cfg(windows)]
-mod console {
-  use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-  use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
-    SetConsoleCtrlHandler, SetConsoleMode,
-  };
-
-  /// The mode in force before the questions started; `0` means "nothing was
-  /// changed", which is also a value `GetConsoleMode` never reports.
-  static SAVED: AtomicU32 = AtomicU32::new(0);
-  static INSTALLED: AtomicBool = AtomicBool::new(false);
-
-  /// Turn echo off and report the previous mode, or `None` when stdin is not a
-  /// console (a pipe or a file never echoes anyway).
-  ///
-  /// Only `ENABLE_ECHO_INPUT` is cleared: line editing stays with the console, so
-  /// the read below is an ordinary `read_line`, backspace works, and the console
-  /// emits the line break of the Enter the user pressed. `ENABLE_PROCESSED_INPUT`
-  /// stays on as well, so Ctrl+C arrives as a control event for [`install`]'s
-  /// handler instead of as a character.
-  pub fn quiet() -> Option<CONSOLE_MODE> {
-    // SAFETY: plain console calls on the process's own stdin handle.
-    unsafe {
-      let handle = GetStdHandle(STD_INPUT_HANDLE);
-      let mut mode: CONSOLE_MODE = 0;
-      if GetConsoleMode(handle, &mut mode) == 0 {
-        return None;
-      }
-      if SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) == 0 {
-        return None;
-      }
-      SAVED.store(mode, Ordering::SeqCst);
-      install();
-      Some(mode)
-    }
-  }
-
-  /// Put the saved mode back, if it is still changed.
-  pub fn restore() {
-    let mode = SAVED.swap(0, Ordering::SeqCst);
-    if mode != 0 {
-      // SAFETY: restoring the mode that was read from this same handle.
-      unsafe { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), mode) };
-    }
-  }
-
-  pub fn install() {
-    if INSTALLED.swap(true, Ordering::SeqCst) {
-      return;
-    }
-    // SAFETY: the handler only touches the console and this process.
-    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
-  }
-
-  /// Ctrl+C: cancel the prompt, leaving the terminal usable.
-  ///
-  /// Returning `FALSE` would hand the event to a default handler this process
-  /// does not have, so it is handled here and the exit is explicit.
-  unsafe extern "system" fn on_ctrl(_event: u32) -> i32 {
-    restore();
-    println!();
-    println!("cancelled");
-    std::process::exit(130);
-  }
-}
-
-#[cfg(windows)]
-impl Echo {
-  fn off() -> Result<Self, String> {
-    Ok(Self(console::quiet()))
-  }
-}
-
-#[cfg(windows)]
-impl Drop for Echo {
-  fn drop(&mut self) {
-    if self.0.is_some() {
-      console::restore();
-    }
-  }
-}
-
-/// The same, for a POSIX terminal.
-#[cfg(unix)]
-struct Echo(Option<libc::termios>);
-
-#[cfg(unix)]
-mod tty {
-  use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-
-  /// The mode to restore, boxed and handed to the signal handler. Leaked on
-  /// purpose: freeing from a handler is not worth the risk, and it costs one
-  /// allocation per password prompt.
-  static SAVED: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
-  static INSTALLED: AtomicBool = AtomicBool::new(false);
-
-  /// Turn echo off, returning the mode to restore, or `None` when stdin is not
-  /// a terminal.
-  pub fn quiet() -> Option<libc::termios> {
-    // SAFETY: both calls take fd 0 and a buffer this frame owns.
-    unsafe {
-      let mut term: libc::termios = std::mem::zeroed();
-      if libc::tcgetattr(0, &mut term) != 0 {
-        return None;
-      }
-      let mut without_echo = term;
-      without_echo.c_lflag &= !libc::ECHO;
-      if libc::tcsetattr(0, libc::TCSAFLUSH, &without_echo) != 0 {
-        return None;
-      }
-      SAVED.store(Box::into_raw(Box::new(term)), Ordering::SeqCst);
-      install();
-      Some(term)
-    }
-  }
-
-  pub fn restore() {
-    let saved = SAVED.swap(std::ptr::null_mut(), Ordering::SeqCst);
-    if !saved.is_null() {
-      // SAFETY: the pointer came from `Box::into_raw` in `quiet`, and the
-      // buffer is still alive because it is deliberately never freed.
-      unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, saved) };
-    }
-  }
-
-  pub fn install() {
-    if INSTALLED.swap(true, Ordering::SeqCst) {
-      return;
-    }
-    // SAFETY: `on_sigint` is a plain C function, and `SA_RESETHAND` restores
-    // the default disposition before it runs.
-    unsafe {
-      let mut action: libc::sigaction = std::mem::zeroed();
-      action.sa_sigaction = on_sigint as usize;
-      action.sa_flags = libc::SA_RESETHAND;
-      libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
-    }
-  }
-
-  /// Ctrl+C: put the terminal back, then let the default action end the process.
-  extern "C" fn on_sigint(_signal: libc::c_int) {
-    restore();
-    // SAFETY: the disposition is the default one again, so raising SIGINT from
-    // its own handler simply terminates the process.
-    unsafe {
-      libc::raise(libc::SIGINT);
-    }
-  }
-}
-
-#[cfg(unix)]
-impl Echo {
-  fn off() -> Result<Self, String> {
-    Ok(Self(tty::quiet()))
-  }
-}
-
-#[cfg(unix)]
-impl Drop for Echo {
-  fn drop(&mut self) {
-    if self.0.is_some() {
-      tty::restore();
-    }
   }
 }

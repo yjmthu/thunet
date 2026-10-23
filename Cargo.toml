@@ -39,6 +39,11 @@ eframe = { version = "0.37.0", default-features = false, features = [
 tray-icon = "0.26.1"
 sys-locale = "0.3.2"
 interprocess = "2.4.6"
+# Password prompt (`thunet login -i`): echo off with the terminal restored
+# afterwards, and a Ctrl+C handler, without a hand-written console or termios call
+# in this crate.
+rpassword = "7.5"
+ctrlc = "3.5"
 
 [profile.release]
 lto = true
