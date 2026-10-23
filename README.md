@@ -257,7 +257,7 @@ A pair that was piped or asked for always produces the `credentials:` line (`sav
 
 ```json
 {
-  "core":   { "version": "0.1.4", "build_epoch": 1792571000, "pid": 1234,
+  "core":   { "version": "0.1.5", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
               "host": "auth4.tsinghua.edu.cn",

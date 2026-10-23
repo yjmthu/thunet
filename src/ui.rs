@@ -2346,7 +2346,7 @@ fn address_cell(ui: &mut egui::Ui, value: &str, t: &Texts) -> bool {
   address_row(ui, value, t).1.clicked()
 }
 
-/// The service row's status: "running v0.1.4 · 1m", or why nothing answers.
+/// The service row's status: "running v0.1.5 · 1m", or why nothing answers.
 fn service_status(ui: &mut egui::Ui, service: Option<&(String, u64)>, running: bool, t: &Texts) {
   match service {
     Some((version, uptime)) => {
