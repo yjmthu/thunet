@@ -766,7 +766,19 @@ fn run(cli: Cli) -> Result<(), String> {
       autostart::service_admin(action)
     }
     Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
-    Cmd::ServicePurge => autostart::purge_machine_state(),
+    // Same rule as `service-admin`: the installer passes `--machine`, and a
+    // portable caller must not delete the window's own state directory with a
+    // verb that claims to be about the machine.
+    Cmd::ServicePurge => {
+      if ipc::portable() {
+        return Err(
+          "portable mode has no machine state to purge; \
+           `thunet --machine service-purge` removes the machine directory explicitly"
+            .into(),
+        );
+      }
+      autostart::purge_machine_state()
+    }
     Cmd::Quit {
       timeout,
       all_sessions,

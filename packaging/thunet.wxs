@@ -88,9 +88,12 @@
          after the service is deleted and before RemoveFiles, so the helper
          still exists and nothing holds the directory open. `Return="ignore"`:
          the helper itself refuses while the service is still registered, and a
-         refused or failed purge must never abort an installation. -->
+         refused or failed purge must never abort an installation. The machine
+         flag for the same reason as `RemoveCoreService`: a leftover
+         `THUNET_STATE_DIR` would turn this into a delete of the portable state
+         directory. -->
     <CustomAction Id="PurgeMachineState" FileRef="THUnetExe"
-                  ExeCommand="service-purge"
+                  ExeCommand="--machine service-purge"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <!-- The install stopped the service above; bring the new build back — but
