@@ -9,6 +9,7 @@ mod crypto;
 mod diag;
 mod elevate;
 mod i18n;
+mod icons;
 mod ident;
 mod ipc;
 mod logline;
