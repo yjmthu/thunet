@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_thunet_global_optspecs
-    string join \n host= http timeout= u/username= p/password= ip= ac-id= minimized state-dir= machine admin-error= h/help V/version
+    string join \n host= http timeout= ip= ac-id= minimized state-dir= machine admin-error= h/help V/version
 end
 
 function __fish_thunet_needs_command
@@ -26,8 +26,6 @@ end
 
 complete -c thunet -n "__fish_thunet_needs_command" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_needs_command" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_needs_command" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_needs_command" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_needs_command" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_needs_command" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_needs_command" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -54,8 +52,6 @@ complete -c thunet -n "__fish_thunet_needs_command" -f -a "completions" -d 'Prin
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand selftest" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand selftest" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -66,8 +62,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand selftest" -l machine -d 'A
 complete -c thunet -n "__fish_thunet_using_subcommand selftest" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -78,8 +72,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -l machine -d 'Act 
 complete -c thunet -n "__fish_thunet_using_subcommand ac-id" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand status" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand status" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand status" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -90,20 +82,18 @@ complete -c thunet -n "__fish_thunet_using_subcommand status" -l machine -d 'Act
 complete -c thunet -n "__fish_thunet_using_subcommand status" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand login" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand login" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
+complete -c thunet -n "__fish_thunet_using_subcommand login" -s v -l verbose -d 'Print the long explanation and exit'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -s i -l interactive -d 'Ask for the account, the password and whether to remember, on this console'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l http -d 'Use plain http instead of https'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l minimized -d 'Start minimised to the tray (used by the autostart entry)'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
-complete -c thunet -n "__fish_thunet_using_subcommand login" -s h -l help -d 'Print help'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand logout" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand logout" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -114,8 +104,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand logout" -l machine -d 'Act
 complete -c thunet -n "__fish_thunet_using_subcommand logout" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand core" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand core" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand core" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -127,8 +115,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand core" -l machine -d 'Act a
 complete -c thunet -n "__fish_thunet_using_subcommand core" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -139,8 +125,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand service" -l machine -d 'Ac
 complete -c thunet -n "__fish_thunet_using_subcommand service" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -151,8 +135,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -l machine 
 complete -c thunet -n "__fish_thunet_using_subcommand service-admin" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -163,8 +145,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -l machine
 complete -c thunet -n "__fish_thunet_using_subcommand service-resume" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -175,8 +155,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -l machine 
 complete -c thunet -n "__fish_thunet_using_subcommand service-purge" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l timeout -d 'Give up (and report) after this many milliseconds' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l host -d 'Portal host (overrides the config file)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand quit" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand quit" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -188,8 +166,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand quit" -l machine -d 'Act a
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand config" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand config" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -200,8 +176,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand config" -l machine -d 'Act
 complete -c thunet -n "__fish_thunet_using_subcommand config" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
@@ -212,8 +186,6 @@ complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l machine -d 'A
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -s h -l help -d 'Print help'
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l timeout -d 'Request timeout in seconds' -r
-complete -c thunet -n "__fish_thunet_using_subcommand completions" -s u -l username -d 'TUNET account (overrides the saved one)' -r
-complete -c thunet -n "__fish_thunet_using_subcommand completions" -s p -l password -d 'Password (otherwise read from the saved credential, or prompted)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l ac-id -d 'ac_id override; empty means auto-detect' -r
 complete -c thunet -n "__fish_thunet_using_subcommand completions" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F

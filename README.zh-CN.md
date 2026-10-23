@@ -176,7 +176,7 @@ thunet core                  # 后台服务：真正持有网络会话
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # 让运行中的窗口退出，并等到它真正消失
 thunet status                # JSON：服务自身状态 + 门户会话/流量
-thunet login                 # 询问账号和密码，然后认证
+thunet login                 # 认证：stdin 三行，或用 -i 让它提问
 thunet logout                # 让服务注销
 thunet ac-id                 # 服务正在使用的门户 ac_id
 thunet config                # 配置路径 + 生效中的设置
@@ -201,7 +201,56 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 
 `status`、`login`、`logout`、`ac-id` 同样是前端：它们通过同一个套接字请求正在运行的服务，而不是自己连门户，所以会话始终只有一个持有者。服务没在跑时它们直接报错，并提示该用哪个命令启动——**绝不会**退回自己去开第二个连接。
 
-`thunet login` 在终端里运行时依次问三个问题：账号（已保存的账号作为默认值，直接回车即沿用）、密码（不回显）、以及是否记住密码供下次启动使用。密码留空表示沿用 core 已保存的那个，这是只改*是否记住*而不重新输入密码的办法。提问过程中随时可以按 Ctrl+C 取消 —— 终端回显会恢复，而且什么都没有发给服务。它会在登录之前先打印一行结果：`saved for the next start`、`this session only`，或者凭据不完整时的 `NOT saved`。没有终端时（stdin 被重定向，或根本没有控制台）提问会被跳过，只让 core 拿已保存的凭据去连接。`-u/--username` 和 `-p/--password` 可以为脚本跳过提问，代价是密码会出现在 shell 历史和所有进程列表里。
+`thunet login` 有两种拿到账号密码的方式：往 stdin 写三行（什么都不问），或者用 `-i`（在控制台上依次提问）。两者都不用时，它只用服务已保存的那一对连接。账号密码永远不来自参数；三种情况下报告都一样，只是第一行说明账号从哪来：`account: alice (stored)`、`account: alice (stdin, remember yes)` 或 `account: alice (asked)`。
+
+三行分别是什么、留空代表什么：
+
+1. 账号——留空则沿用 core 当前持有的账号；
+2. 密码——留空则沿用 core 当前持有的密码；
+3. 是否记住——默认「保存」。只有明确写 `n`、`no`、`0` 或 `false` 才跳过保存，而这同时会删掉之前保存的那份：和窗口里取消勾选*记住密码*是同一个动作。
+
+第 3 行默认「保存」是有意的：绝大多数人就是想把密码存下来，而且在线时 core 会先把这一对证明给对方看再落盘，门户拒绝时它会退回原来那份凭据。离线时没有东西可证明，这一对会先存下来，等网络恢复后再用。
+
+不加 `-i` 时任何平台都不会提问：可执行文件是 GUI 子系统的程序，本身不拥有控制台，而它附加的那个控制台正被 shell 同时读取——回车会被 shell 自己的行编辑器吃掉，答案会被两边分掉。这就是默认走管道的原因，也是 `-i` 的含义：你明确承诺有一个 shell 正在等着回答。
+
+`-i` 把这同样三件事问出来而不是读出来：账号（已保存的账号作为默认值，回车即沿用）、密码（不回显，回车则沿用服务当前持有的那个）、以及是否记住——`[Y/n]`，回车表示「是」，只有 `n`、`no`、`0` 或 `false` 表示「否」，而「否」还会删掉之前保存的那份。任何一步按 Ctrl+C 都会取消：终端恢复原样，进程以 130 退出。stdin 是什么，答案就从哪里来：接的是管道，答案就是那三行；那里没有任何可用输入时，问题会立刻失败而不是一直等下去。这个承诺没有任何东西替你检查。
+
+**Windows：** 这个承诺意味着 `cmd /c thunet login -i`——交互式 `cmd.exe` 和 PowerShell 在启动一个 GUI 子系统程序之后立刻回到自己的提示符，会把答案抢走。**Linux 和 macOS：** 任何终端都可以，因为 shell 会等待程序；用 `-i` 不需要额外设置。Windows 上的 Git Bash 实际是 mintty：它是终端模拟器而不是控制台，在它里面启动的原生程序看到的是管道 stdin，所以在那里问题是从那条管道得到答案的，密码也会被终端原样回显——请用 Windows Terminal 里的 bash（真正的控制台）、`cmd /c`，或者管道写法。
+
+管道写法有三段可直接粘贴的配方。先看 PowerShell，它通过 `cmd.exe /c` 接管道：PowerShell 会等待控制台子系统程序，但**不会**等待窗口子系统程序，所以它在本命令打印任何东西之前就回到了提示符，输出会乱序甚至丢失；`cmd.exe` 两者都等，输出顺序才是稳定的。
+
+```powershell
+$a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
+$r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
+"$a`n$p`n$r" | cmd.exe /c thunet login
+```
+
+```bat
+set "a=" & set /p "a=account: "
+set "p=" & set /p "p=password: "
+set "r=y" & set /p "r=remember? [Y/n]: "
+(echo(%a%& echo(%p%& echo(%r%) | thunet login
+```
+
+`cmd.exe` 没法隐藏输入，而且值里的 `& | < > ^ %` 会被它解释，所以密码里含这些字符时请用 PowerShell。Linux 和 macOS 上同样三行由 `read` 提供：
+
+```bash
+read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}
+printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
+```
+
+密码从不进入 `argv`，也不进入 shell 历史：它只会从 stdin 读取，所以任何进程列表里都看不到它。`thunet login --help` 是这套说明的短版本，`thunet login -v` 是长版本，附带配方背后的原因。
+
+这个命令从不沉默。它先说明打算用哪个账号、这个账号从哪来——直接运行是 `account: alice (stored)`，接了管道则是 `account: alice (stdin, remember yes)` 或 `(stdin, remember no)`，用 `-i` 问出来则是 `account: alice (asked)`——然后打印服务状态，core 持有账号时会一并写出（`session: online as bob`、`session: authenticating as alice`、`session: offline (credential: alice)`，或者干脆只有 `session: offline`），最后说明它做了什么：
+
+```
+account: alice (stdin, remember yes)
+session: offline (credential: bob)
+credentials: alice, saved for the next start
+online
+```
+
+接了管道或用了 `-i` 时，在登录结果之前一定会有 `credentials:` 这一行（`saved for the next start`、`this session only`，凭据不完整时是 `NOT saved`）。直接运行且服务已经用同一个账号在线时，它打印 `nothing to change`：既不发送凭据变更，也不再尝试登录。完全没有账号时（新机器、没有接管道也没用 `-i`），它会报错，提示把三行接进管道（或者用 `-i`），并指向 `thunet login --help`。
 
 `thunet status` 输出一个对象，两半都在：
 
@@ -224,11 +273,11 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 
 在已经运行时再次启动 `thunet` **不会**启动第二个副本：只会把已有窗口带回前台。
 
-全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`-u/--username`、`-p/--password`、`--ip <addr>`、`--ac-id <id>`。
+全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`--ip <addr>`、`--ac-id <id>`。
 
-优先级是 **命令行 > 配置文件 > 凭据存储**。`-u` / `-p` 会在 `login` 时交给服务（只在内存里，不落盘），`--host` / `--http` / `--timeout` 则决定 `thunet core` 连谁：`thunet -u 1234567890 -p secret login`。
+优先级是 **命令行 > 配置文件 > 凭据存储**。`--host` / `--http` / `--timeout` / `--ip` / `--ac-id` 作用于一次性的命令，也作用于便携模式的 core（`thunet --host … core`），所以拿假门户做测试才可行；机器服务与窗口只从配置文件读设置，而账号和密码从不来自命令行：`thunet login` 从 stdin 读取它们。
 
-共享机器上不要把密码放进 `argv`：Linux 的 `/proc/<pid>/cmdline` 对其他用户可读（除非 `hidepid=2`）。用窗口，或者用已保存的凭据执行 `thunet login`。
+密码根本没有 `argv` 形式：它只会从 stdin 读取，所以不会出现在 shell 历史和进程列表里（Linux 的 `/proc/<pid>/cmdline` 对其他用户可读，除非 `hidepid=2`）。
 
 ## 6. 数据存在哪里
 
@@ -576,7 +625,7 @@ UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个�
 
 共享机器上还有两条实践：
 
-- **不要把密码放进 `argv`。** `thunet -p secret login` 会出现在 `/proc/<pid>/cmdline`（Linux，除非 `hidepid=2`）和进程列表里，其他用户能看到。用窗口，或者用已保存的凭据执行 `thunet login`。
+- **密码没有 `argv` 形式。** 它只会从 stdin 读取（把三行接进 `thunet login`），所以不会出现在 shell 历史和进程列表里——Linux 的 `/proc/<pid>/cmdline` 对其他用户可读，除非 `hidepid=2`。用窗口、`thunet login`，或上面的管道写法。
 - 控制通道是本地的（命名管道 / Unix socket），密码以明文经过它，但它不对网络开放，其他用户也读不到不属于自己的连接流。安全边界是对端检查加凭据文件的 ACL。
 
 ### 13.6 升级与卸载

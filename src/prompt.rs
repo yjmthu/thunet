@@ -1,10 +1,10 @@
-//! Terminal prompts for the CLI verbs that need a secret.
+//! Terminal prompts for `thunet login -i`.
 //!
-//! Only reached when the command was started from a terminal: the binary uses
-//! the GUI subsystem, so it attaches to the launching console first (see
-//! `main::attach_parent_console`). A start from Explorer has no stdin to ask
-//! on, and those verbs keep their old behaviour instead of waiting for an
-//! answer nobody can type.
+//! The binary uses the GUI subsystem, so it attaches to the launching console
+//! first (see `main::attach_parent_console`). `-i` is the user's promise that a
+//! shell is waiting to answer, so nothing here checks for a console: the prompts
+//! read whatever stdin is. The plain pipe path never comes here - it reads whole
+//! lines with [`piped_line`].
 //!
 //! Ctrl+C is part of the contract: a prompt must be cancellable, and the
 //! terminal must not be left with echo switched off.
@@ -41,21 +41,58 @@ pub fn line(prompt: &str) -> Result<String, String> {
   Ok(answer.trim().to_string())
 }
 
-/// Ask for a secret: the same read, but the terminal does not echo it.
+/// Ask for a secret: the same read, but nothing is echoed.
 ///
 /// Only the line terminator is stripped - a password may end in spaces, and
 /// trimming them would change it.
+#[cfg(windows)]
 pub fn secret(prompt: &str) -> Result<String, String> {
   print!("{prompt}");
   std::io::stdout().flush().map_err(|e| e.to_string())?;
   let echo = Echo::off()?;
-  let mut answer = String::new();
-  let read = std::io::stdin().read_line(&mut answer);
+  let read = read_stdin_line();
   drop(echo);
-  // The user pressed Enter, but the terminal never showed it.
+  // No newline here: a console echoes the line break of the Enter even with echo
+  // off, so printing one as well is what left a blank line behind the question.
+  // With no console (a pipe, `NUL`) there is no cursor to move either.
+  read
+}
+
+/// The same, for a POSIX terminal. With `ECHO` cleared the terminal does not
+/// echo the Enter, so the newline printed here is the only one.
+#[cfg(unix)]
+pub fn secret(prompt: &str) -> Result<String, String> {
+  print!("{prompt}");
+  std::io::stdout().flush().map_err(|e| e.to_string())?;
+  let echo = Echo::off()?;
+  let read = read_stdin_line();
+  drop(echo);
   println!();
-  read.map_err(|e| format!("cannot read the password: {e}"))?;
+  read
+}
+
+/// One line from stdin, terminator removed and nothing else touched.
+fn read_stdin_line() -> Result<String, String> {
+  let mut answer = String::new();
+  std::io::stdin()
+    .read_line(&mut answer)
+    .map_err(|e| format!("cannot read the password: {e}"))?;
   Ok(answer.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// One line from a redirected stdin, terminator removed.
+///
+/// `None` means there was no line at all: the pipe was empty or closed, or a
+/// launch with no console and no pipeline (the tray started from Explorer) has
+/// no usable handle. The caller falls back to the stored credential instead of
+/// treating that as an answer - which is what separates "nothing was piped"
+/// from "the first line was left empty".
+pub fn piped_line() -> Option<String> {
+  let mut answer = String::new();
+  match std::io::stdin().read_line(&mut answer) {
+    Ok(0) | Err(_) => None,
+    Ok(_) => Some(answer.trim_end_matches(['\r', '\n']).to_string()),
+  }
 }
 
 /// Echo turned off for as long as this value lives, plus a Ctrl+C hook that
@@ -77,13 +114,19 @@ mod console {
     SetConsoleCtrlHandler, SetConsoleMode,
   };
 
-  /// The mode in force before echo was switched off; `0` means "echo was never
-  /// disabled", which is also a value `GetConsoleMode` never reports.
+  /// The mode in force before the questions started; `0` means "nothing was
+  /// changed", which is also a value `GetConsoleMode` never reports.
   static SAVED: AtomicU32 = AtomicU32::new(0);
   static INSTALLED: AtomicBool = AtomicBool::new(false);
 
   /// Turn echo off and report the previous mode, or `None` when stdin is not a
   /// console (a pipe or a file never echoes anyway).
+  ///
+  /// Only `ENABLE_ECHO_INPUT` is cleared: line editing stays with the console, so
+  /// the read below is an ordinary `read_line`, backspace works, and the console
+  /// emits the line break of the Enter the user pressed. `ENABLE_PROCESSED_INPUT`
+  /// stays on as well, so Ctrl+C arrives as a control event for [`install`]'s
+  /// handler instead of as a character.
   pub fn quiet() -> Option<CONSOLE_MODE> {
     // SAFETY: plain console calls on the process's own stdin handle.
     unsafe {
@@ -101,7 +144,7 @@ mod console {
     }
   }
 
-  /// Put the saved mode back, if echo is still off.
+  /// Put the saved mode back, if it is still changed.
   pub fn restore() {
     let mode = SAVED.swap(0, Ordering::SeqCst);
     if mode != 0 {

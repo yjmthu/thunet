@@ -66,28 +66,23 @@ fn attach_parent_console() {
 
     // Join the launching terminal. When there is no parent console, a console
     // this process owns itself (`CREATE_NEW_CONSOLE`, `start`) is the other
-    // possibility: the console devices open exactly when one exists, so they
-    // are both the test and the fix - a GUI process starts without usable
-    // standard handles, and `thunet login` has to read from one.
-    let joined = AttachConsole(ATTACH_PARENT_PROCESS) != 0;
-
-    // `thunet login` asks questions, so stdin has to be the console too: a
-    // prompt that reads from an invalid handle looks like an ignored Enter.
-    if inherited(in_before) {
-      SetStdHandle(STD_INPUT_HANDLE, in_before);
-    } else if let Ok(file) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
-      SetStdHandle(
-        STD_INPUT_HANDLE,
-        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-      );
-      std::mem::forget(file);
-    } else if !joined {
-      // No console at all: nothing to print to and nothing to ask on. This is
-      // the tray started from Explorer.
-      return;
-    }
+    // possibility: `CONOUT$` below opens exactly when one exists, so it is both
+    // the test and the fix - a GUI process starts without usable standard
+    // handles, and a subcommand has to print somewhere. With no console at all
+    // (the tray started from Explorer) it cannot be opened and nothing is
+    // shown, which is the point.
+    let _ = AttachConsole(ATTACH_PARENT_PROCESS);
 
     // Put back whatever the launcher provided (console, pipe or file).
+    //
+    // stdin is only ever put *back*: attaching points it at the console, which
+    // would hide the pipe `thunet login` reads its three lines from. Nothing
+    // reads the console itself, so a launch without an inherited stdin (a bare
+    // shell, the tray) keeps the console handle and the login command sees a
+    // terminal and reads nothing - exactly what it should do there.
+    if inherited(in_before) {
+      SetStdHandle(STD_INPUT_HANDLE, in_before);
+    }
     if inherited(out_before) {
       SetStdHandle(STD_OUTPUT_HANDLE, out_before);
     }
@@ -178,12 +173,6 @@ struct Cli {
   /// Request timeout in seconds.
   #[arg(long, global = true, default_value_t = 5)]
   timeout: u64,
-  /// TUNET account (overrides the saved one).
-  #[arg(short, long, global = true)]
-  username: Option<String>,
-  /// Password (otherwise read from the saved credential, or prompted).
-  #[arg(short, long, global = true)]
-  password: Option<String>,
   /// Local IP to authenticate; empty lets the portal infer it.
   #[arg(long, global = true, default_value = "")]
   ip: String,
@@ -216,6 +205,98 @@ struct Cli {
   cmd: Option<Cmd>,
 }
 
+/// What `thunet login --help` shows: the three lines and one recipe per shell.
+///
+/// It stays short on purpose - `-v` carries the reasoning - and both Windows
+/// entry points are named because the PowerShell recipe needs `cmd.exe /c`: a
+/// GUI-subsystem program cannot pick the shell it was started from, and a user
+/// who pastes the wrong thing should see the failure at once.
+#[cfg(windows)]
+const LOGIN_HELP: &str = r#"The account and the password are read from stdin, never from an argument: three
+lines - account, password, remember. An empty account keeps the stored one, an
+empty password keeps the password the service holds, and only n/no/0/false skips
+storing (which removes a stored one). Without a pipe the command connects with
+the pair the service already holds.
+
+  PowerShell:  $a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput; $r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }; "$a`n$p`n$r" | cmd.exe /c thunet login
+  Interactive: cmd /c thunet login -i     (PowerShell does not wait for this program; cmd does)
+  Scripts:     printf 'alice\npw\ny\n' | thunet login
+
+This text in full: thunet login --verbose"#;
+
+#[cfg(not(windows))]
+const LOGIN_HELP: &str = r#"The account and the password are read from stdin, never from an argument: three
+lines - account, password, remember. An empty account keeps the stored one, an
+empty password keeps the password the service holds, and only n/no/0/false skips
+storing (which removes a stored one). Without a pipe the command connects with
+the pair the service already holds.
+
+  bash/zsh:    read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}; printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
+  Interactive: thunet login -i
+  Scripts:     printf 'alice\npw\ny\n' | thunet login
+
+This text in full: thunet login --verbose"#;
+
+/// What `thunet login -v` prints: everything `--help` leaves out.
+///
+/// The same text on every platform, because it is about the protocol and about
+/// the two Windows shells rather than about the shell the reader happens to use.
+const LOGIN_LONG: &str = r#"thunet login takes the account and the password on stdin, three lines, and asks
+nothing unless you pass -i: the executable is a GUI-subsystem program, so it owns
+no console of its own, and the console it attaches to is one the shell is reading
+at the same time - an Enter would be taken by the shell's own line editor and the
+answers split between the two. stdin is the one channel both sides can share, and
+-i is your explicit promise that the shell is waiting and shares its console with
+this command.
+
+  line 1  account    empty keeps the account the service already holds
+  line 2  password   empty keeps the password the service already holds
+  line 3  remember   stored unless this line says n, no, 0 or false
+
+With -i the same three answers are asked instead of read: the account (the stored
+one is offered as the default, so Enter keeps it), the password (not echoed, and
+Enter keeps the one the service holds) and remember ([Y/n], where Enter means
+yes). The flag is your promise that the shell is waiting, and nothing here
+second-guesses it: on Windows that promise means `cmd /c thunet login -i`, because
+an interactive cmd and PowerShell both return to their prompt as soon as they
+have started a windowed program and would eat the answers. In a mintty Git Bash
+the native stdin is a pipe, so there the questions are answered from the pipe and
+the password is echoed by the terminal - use bash inside Windows Terminal,
+`cmd /c`, or the pipe form (`printf 'alice\npw\ny\n' | thunet login`). On Linux
+and macOS any terminal works, because the shell waits for the program.
+
+Skipping does not merely leave the disk alone: the answer n, no, 0 or false
+deletes a password stored earlier, the same clear the window does when you untick
+"Remember password". The default is "store" because saving is what most people
+want, and while the machine is online the core proves a pair before it writes it
+- a refused password falls back to the credential it already had. Offline there
+is nothing to prove it against, so the pair is stored first and used when the
+network returns.
+
+Without a pipe and without -i (a terminal, a bare launch) nothing is read at all;
+the command only asks the service to connect with the pair it already holds.
+
+PowerShell is piped through cmd.exe on purpose: PowerShell waits for a
+console-subsystem program but not for a windowed one, so it returns to its prompt
+before this command has printed anything and the report would arrive out of order
+or not at all. cmd.exe waits for both, so the output stays in order:
+
+  $a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
+  $r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
+  "$a`n$p`n$r" | cmd.exe /c thunet login
+
+The cmd.exe form, four lines, for a shell where that is what you have. It cannot
+mask the password, and `& | < > ^ %` inside a value are interpreted by echo, so
+use PowerShell for a password that contains one:
+
+  set "a=" & set /p "a=account: "
+  set "p=" & set /p "p=password: "
+  set "r=y" & set /p "r=remember? [Y/n]: "
+  (echo(%a%& echo(%p%& echo(%r%) | thunet login
+
+The password never reaches argv and never enters the shell history: it is only
+ever read from that pipe, so no process listing shows it either."#;
+
 #[derive(Subcommand)]
 enum Cmd {
   /// Offline protocol self-test (see `cargo test`).
@@ -226,10 +307,20 @@ enum Cmd {
   Status,
   /// Ask the running service to authenticate now.
   ///
-  /// Started from a terminal it asks for the account, the password (not echoed)
-  /// and whether to keep the password; `--username`/`--password` skip the
-  /// questions and use that pair for this session only.
-  Login,
+  /// Without `-i` nothing is asked: the account and the password come from stdin,
+  /// three lines, or from the pair the service already holds. With `-i` the three
+  /// questions are asked instead, reading whatever stdin is - the flag is the
+  /// promise that a shell is waiting to answer them. The help below carries one
+  /// pasteable recipe per shell.
+  #[command(after_help = LOGIN_HELP)]
+  Login {
+    /// Print the long explanation and exit.
+    #[arg(short, long)]
+    verbose: bool,
+    /// Ask for the account, the password and whether to remember, on this console.
+    #[arg(short, long)]
+    interactive: bool,
+  },
   /// Ask the running service to de-authenticate.
   Logout,
   /// Run the background service (no window, no tray).
@@ -322,6 +413,32 @@ fn main() {
   }
 }
 
+/// Point the process at the state directory the command line asks for.
+///
+/// The help text and `run` both read the directory from the environment, so the
+/// two hidden globals are applied here once. `--machine` is the one way to say
+/// "this process is not portable", whatever the environment says: an installer
+/// inherits the environment of its caller, and a leftover `THUNET_STATE_DIR`
+/// would silently retarget its commands at a portable endpoint that nothing is
+/// listening on. `--state-dir` is what the Windows service is registered with,
+/// because the token it runs under has no profile of its own.
+fn point_at_state_dir(cli: &Cli) -> Result<(), String> {
+  if cli.machine {
+    if cli.state_dir.is_some() {
+      return Err("`--machine` and `--state-dir` contradict each other".into());
+    }
+    // SAFETY: this runs on the main thread before anything reads the
+    // environment (no other thread exists yet), and `config::dir` is only
+    // reached afterwards.
+    unsafe { std::env::remove_var("THUNET_STATE_DIR") };
+  }
+  if let Some(dir) = &cli.state_dir {
+    // SAFETY: same reason - still the single-threaded startup path.
+    unsafe { std::env::set_var("THUNET_STATE_DIR", dir) };
+  }
+  Ok(())
+}
+
 fn run(cli: Cli) -> Result<(), String> {
   // `--machine` is the one way to say "this process is not portable", whatever
   // the environment says: an installer inherits the environment of its caller,
@@ -329,23 +446,7 @@ fn run(cli: Cli) -> Result<(), String> {
   // portable endpoint that nothing is listening on. Clearing the variable here
   // is enough - `portable()`, `open_result` and the single-instance names all
   // derive from it, so every downstream decision follows.
-  if cli.machine {
-    if cli.state_dir.is_some() {
-      return Err("`--machine` and `--state-dir` contradict each other".into());
-    }
-    // SAFETY: this runs on the main thread before anything reads the
-    // environment (no other thread exists yet), and `config::dir` is only
-    // reached below.
-    unsafe { std::env::remove_var("THUNET_STATE_DIR") };
-  }
-  // The Windows service runs as SYSTEM, whose own `%APPDATA%` is the system
-  // profile; `sc create` therefore passes the installing user's directory.
-  if let Some(dir) = &cli.state_dir {
-    // SAFETY: this runs on the main thread before anything reads the
-    // environment (no other thread exists yet, and `config::dir` is only
-    // reached below).
-    unsafe { std::env::set_var("THUNET_STATE_DIR", dir) };
-  }
+  point_at_state_dir(&cli)?;
   // Effective settings: config file first, explicit CLI flags win.
   let mut cfg = config::Config::load();
   if let Some(h) = cli.host.clone() {
@@ -353,12 +454,6 @@ fn run(cli: Cli) -> Result<(), String> {
   }
   if cli.http {
     cfg.https = false;
-  }
-  if let Some(u) = cli.username.clone() {
-    cfg.username = u;
-  }
-  if let Some(p) = cli.password.clone() {
-    cfg.password = p;
   }
   if !cli.ac_id.is_empty() {
     cfg.ac_id = cli.ac_id.clone();
@@ -448,36 +543,97 @@ fn run(cli: Cli) -> Result<(), String> {
         _ => Ok(()),
       }
     }
-    Cmd::Login => {
-      let link = with_core()?;
-      // Interactive unless the pair came in on the command line: typing the
-      // password is the only way it stays out of the shell history and out of
-      // every process listing.
-      let interactive = cli.username.is_none() && cli.password.is_none() && prompt::available();
-      if interactive || cli.username.is_some() || cli.password.is_some() {
-        let (username, password, remember) = if interactive {
-          ask_credentials(&cfg)?
-        } else {
-          (cfg.username.clone(), cfg.password.clone(), false)
-        };
-        link.send(CoreCmd::SetCredentials {
-          username,
+    Cmd::Login {
+      verbose,
+      interactive,
+    } => {
+      // Before anything touches the service: the long form is documentation, so
+      // it has to work on a machine where no core is running at all.
+      if verbose {
+        say(LOGIN_LONG);
+        return Ok(());
+      }
+      // `-i` asks on whatever stdin is: the shell that started this command is
+      // the user's promise that it is waiting, and nothing here second-guesses
+      // it. The questions come first, so cancelling - or a typo in the account -
+      // leaves both the service and the sealed credential as they were.
+      let asked = if interactive {
+        let (account, password, remember) = ask_credentials(&cfg)?;
+        Some(Piped {
+          account,
           password,
           remember,
-          // False: a password answered with Enter is empty, and the core then
-          // keeps the one it already holds (see `Cmd::SetCredentials`).
-          keep_password: false,
-        });
-        // The answer says whether the pair was actually stored, which is the
-        // difference the user asked about; staying silent would let a typo in
-        // the account name pass as "saved".
-        match wait_for(&link, Duration::from_secs(10), |ev| {
-          matches!(ev, CoreEv::Credentials(_) | CoreEv::Error(Some(_)))
-        })? {
-          CoreEv::Credentials(state) => println!("{}", credential_line(&state, remember)),
-          CoreEv::Error(Some(e)) => return Err(e.to_string()),
-          _ => return Err("the service did not confirm the credentials".into()),
+        })
+      } else {
+        None
+      };
+      let link = with_core()?;
+      // Both facts come from the core itself. `status` would cost a portal
+      // round trip, and asking the core to hold a pair just to learn which one
+      // it holds would rewrite the stored credential.
+      let info = core_snapshot(&link)?;
+      let held = info.credential.username.trim().to_string();
+      // The account this run would use: the answers, else line 1 of the pipe,
+      // else the one the core holds, else the one the sealed blob carries (the
+      // config loader reads `credential.bin` too, so this also covers a core
+      // that started before the pair was stored).
+      let answers = asked.or_else(piped_pair);
+      let account = match answers.as_ref().map(|p| p.account.as_str()) {
+        Some(account) if !account.is_empty() => account.to_string(),
+        _ if !held.is_empty() => held.clone(),
+        _ => cfg.username.trim().to_string(),
+      };
+      if account.is_empty() {
+        return Err(
+          "no account: nothing was piped and the service holds no credential. Put the account, \
+           the password and `y` or `no` on the first three lines of stdin and pipe them into \
+           `thunet login`, or run `thunet login -i` to be asked; `thunet login --verbose` shows \
+           the details"
+            .into(),
+        );
+      }
+      // Never silent: where the account came from, what the service is doing,
+      // and then what the answers do to the stored credential.
+      match (&answers, interactive) {
+        (Some(_), true) => say(&format!("account: {account} (asked)")),
+        (Some(p), false) => say(&format!(
+          "account: {account} (stdin, remember {})",
+          if p.remember { "yes" } else { "no" }
+        )),
+        (None, _) => say(&format!("account: {account} (stored)")),
+      }
+      say(&session_line(info.state, &held));
+      match &answers {
+        Some(p) => {
+          link.send(CoreCmd::SetCredentials {
+            username: account.clone(),
+            password: p.password.clone(),
+            remember: p.remember,
+            // An empty password line means "keep the one the core already
+            // holds", which the core only does for the account it was proven
+            // for - exactly the account line 1 named, or the held one when it
+            // was left empty.
+            keep_password: p.password.is_empty(),
+          });
+          // The answer says whether the pair was actually stored, which is the
+          // difference the user asked about; staying silent would let a typo in
+          // the account name pass as "saved".
+          match wait_for(&link, Duration::from_secs(10), |ev| {
+            matches!(ev, CoreEv::Credentials(_) | CoreEv::Error(Some(_)))
+          })? {
+            CoreEv::Credentials(state) => say(&credential_line(&state, p.remember)),
+            CoreEv::Error(Some(e)) => return Err(e.to_string()),
+            _ => return Err("the service did not confirm the credentials".into()),
+          }
         }
+        // A bare `login` uses the pair the core holds and leaves the remember
+        // setting - and therefore the sealed copy - exactly as it is. When that
+        // is already the case there is nothing to send at all.
+        None if already_online_with(info.state, &account, &held) => {
+          say("nothing to change");
+          return Ok(());
+        }
+        None => {}
       }
       link.send(CoreCmd::Connect);
       settled(&link, Duration::from_secs(40))
@@ -514,10 +670,13 @@ fn run(cli: Cli) -> Result<(), String> {
       if machine {
         diag::set_file(config::machine_dir().join("core.log"));
       }
+      // A service never receives command-line overrides, but a portable core
+      // does: `thunet --host … core` has to talk to the host it was given, so
+      // the settings merged at the top of `run()` are what it uses.
       let cfg = if machine {
         config::Config::load_machine()
       } else {
-        config::Config::load()
+        cfg
       };
       match ipc::serve(cfg, machine)? {
         ipc::Serve::Started => Ok(()),
@@ -746,12 +905,76 @@ where
   }
 }
 
-/// Ask for the account, the password and whether to keep it.
+/// The core's own state, for a command that must not cost a portal request.
 ///
-/// The stored account is offered as the default so that Enter accepts it; an
-/// empty password answer means "keep the one the core already holds", which is
-/// what makes it possible to change only the *remember* choice without typing
-/// the secret again.
+/// `with_core` already consumed the replay marker it asks for, so this is one
+/// extra local round trip and no network traffic.
+fn core_snapshot(link: &ipc::Link) -> Result<proto::CoreInfo, String> {
+  link.send(CoreCmd::CoreInfo);
+  match wait_for(link, Duration::from_secs(10), |ev| {
+    matches!(ev, CoreEv::Core(_) | CoreEv::Error(Some(_)))
+  })? {
+    CoreEv::Core(info) => Ok(info),
+    CoreEv::Error(Some(e)) => Err(e.to_string()),
+    _ => Err("the service did not report its own state".into()),
+  }
+}
+
+/// The three lines `thunet login` reads, once they were actually piped.
+struct Piped {
+  account: String,
+  password: String,
+  remember: bool,
+}
+
+/// Read account, password and remember from stdin, or `None` for "nothing was
+/// piped".
+///
+/// A terminal is not a pipe: nothing was written there for this command, and
+/// asking is `-i`'s job. A read that fails (a launch with no stdin handle at
+/// all) is the same case.
+fn piped_pair() -> Option<Piped> {
+  // Nobody typed an answer into a terminal.
+  if prompt::available() {
+    return None;
+  }
+  // The first line decides whether there is an answer at all: no line at all is
+  // an empty pipe (or a closed handle), while an empty *line* is an answer -
+  // "keep the stored account". A missing second and third line keep the
+  // password the core holds and store it, which is what pressing Enter would do.
+  let account = prompt::piped_line()?.trim().to_string();
+  // Only the terminator was stripped: a password may end in spaces.
+  let password = prompt::piped_line().unwrap_or_default();
+  let remember = wants_remember(&prompt::piped_line().unwrap_or_default());
+  Some(Piped {
+    account,
+    password,
+    remember,
+  })
+}
+
+/// Whether the third line of the pipe asks for the password to be stored.
+///
+/// The default is "store": the password is kept for the next start unless the
+/// answer is explicitly negative, so `n`, `no`, `0` and `false` mean "this
+/// session only" and everything else - `y`, `yes`, an empty line, a missing
+/// line, a typo - means "save it". The user's rule is "save by default", and a
+/// wrong password does not end up on disk in the case that matters: while online
+/// the core proves the pair before it writes and falls back to the credential it
+/// already had when the portal refuses it.
+fn wants_remember(answer: &str) -> bool {
+  !matches!(
+    answer.trim().to_ascii_lowercase().as_str(),
+    "n" | "no" | "0" | "false"
+  )
+}
+
+/// Ask the account, the password and the remember question.
+///
+/// Reads whatever stdin is - the console when `-i` was promised one. The stored
+/// account is offered as the default so that Enter keeps it, an empty password
+/// answer means "keep the one the service already holds", and Enter at the last
+/// question stores the password (only `n`/`no`/`0`/`false` does not).
 fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), String> {
   prompt::arm_cancel();
   let default = cfg.username.trim();
@@ -760,19 +983,49 @@ fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), Strin
   } else {
     format!("THUnet account [{default}]: ")
   };
-  let answer = prompt::line(&question)?;
-  let username = if answer.is_empty() {
-    default.to_string()
-  } else {
-    answer
+  let username = match prompt::line(&question)? {
+    answer if answer.is_empty() => default.to_string(),
+    answer => answer,
   };
   if username.is_empty() {
     return Err("no account given".into());
   }
   let password = prompt::secret("Password (Enter keeps the stored one): ")?;
-  let answer = prompt::line("Remember the password for the next start? [y/N] ")?;
-  let remember = matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes");
+  let remember = wants_remember(&prompt::line(
+    "Remember the password for the next start? [Y/n] ",
+  )?);
   Ok((username, password, remember))
+}
+
+/// Print one line to stdout, ignoring a closed stdout.
+///
+/// `println!` panics when the reader is already gone, and PowerShell does close
+/// the pipe as soon as it has started a windowed program: missing output must
+/// not leave a crash record behind.
+fn say(line: &str) {
+  let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// Whether a bare `login` has nothing left to do: the service is already online
+/// with the very account it would use, so neither a `SetCredentials` nor a
+/// `Connect` is sent and the stored pair stays as it is.
+fn already_online_with(state: session::State, account: &str, held: &str) -> bool {
+  state == session::State::Online && account == held
+}
+
+/// One line about the service: whether a session is up, and the account the
+/// core holds when it has one.
+fn session_line(state: session::State, held: &str) -> String {
+  let verb = match state {
+    session::State::Online => "online",
+    session::State::Authenticating => "authenticating",
+    session::State::Offline => "offline",
+  };
+  match (held.is_empty(), state) {
+    (false, session::State::Offline) => format!("session: {verb} (credential: {held})"),
+    (false, _) => format!("session: {verb} as {held}"),
+    (true, _) => format!("session: {verb}"),
+  }
 }
 
 /// One line about the pair the core now holds: which account, and whether it
@@ -788,7 +1041,7 @@ fn credential_line(state: &proto::CredentialState, remember: bool) -> String {
   match (remember, state.remembered, state.has_password) {
     (true, true, _) => format!("credentials: {account}, saved for the next start"),
     (true, false, _) => {
-      format!("credentials: {account}, NOT saved (a complete --username/--password pair is needed)")
+      format!("credentials: {account}, NOT saved (an account and a password are both needed)")
     }
     (false, true, _) => {
       format!("credentials: {account}, this session only (the stored copy is untouched)")
@@ -860,6 +1113,117 @@ mod tests {
          `cargo run -- completions {shell} > assets/completions/{file}`"
       );
     }
+  }
+
+  /// The three-line stdin protocol: the password is stored unless the third
+  /// line says otherwise, and only an explicit `n`/`no`/`0`/`false` does.
+  #[test]
+  fn the_third_line_skips_storing_only_when_it_says_so() {
+    for answer in [
+      "", " ", "y", "Y", "yes", "YES", "maybe", "yess", "true", "1",
+    ] {
+      assert!(
+        wants_remember(answer),
+        "{answer:?} should store the password"
+      );
+    }
+    for answer in ["n", "N", "no", " NO ", "0", "false", "FALSE"] {
+      assert!(
+        !wants_remember(answer),
+        "{answer:?} should keep the password for this session only"
+      );
+    }
+  }
+
+  /// `--help` is the short form and `-v` the long one, so the short form has to
+  /// point at the long one and name both other entry points.
+  #[test]
+  fn the_short_help_points_at_the_long_one() {
+    assert!(
+      LOGIN_HELP.contains("thunet login --verbose"),
+      "{LOGIN_HELP}"
+    );
+    assert!(LOGIN_HELP.contains("login -i"), "{LOGIN_HELP}");
+    assert!(LOGIN_HELP.contains("remember? [Y/n]"), "{LOGIN_HELP}");
+    assert!(LOGIN_HELP.contains("n/no/0/false"), "{LOGIN_HELP}");
+    #[cfg(windows)]
+    {
+      assert!(
+        LOGIN_HELP.contains("cmd.exe /c thunet login"),
+        "{LOGIN_HELP}"
+      );
+      assert!(LOGIN_HELP.contains("-MaskInput"), "{LOGIN_HELP}");
+      assert!(
+        LOGIN_HELP.contains("cmd /c thunet login -i"),
+        "{LOGIN_HELP}"
+      );
+    }
+    #[cfg(not(windows))]
+    {
+      assert!(LOGIN_HELP.contains("bash/zsh:"), "{LOGIN_HELP}");
+      assert!(LOGIN_HELP.contains("printf '%s\\n%s\\n%s\\n'"));
+    }
+  }
+
+  /// The long form is the one that has to stay complete: the four-line cmd.exe
+  /// recipe, the third-line rule and the reason the default is "store".
+  #[test]
+  fn the_long_help_carries_the_recipe_and_the_rules() {
+    for needle in [
+      "set \"a=\" & set /p \"a=account: \"",
+      "set \"p=\" & set /p \"p=password: \"",
+      "set \"r=y\" & set /p \"r=remember? [Y/n]: \"",
+      "(echo(%a%& echo(%p%& echo(%r%) | thunet login",
+      "cmd.exe /c thunet login",
+      "n, no, 0 or false",
+      "deletes a password stored earlier",
+      "proves a pair before it writes it",
+      "argv",
+      "cmd /c thunet login -i",
+      "mintty",
+    ] {
+      assert!(LOGIN_LONG.contains(needle), "missing {needle:?}");
+    }
+  }
+
+  #[test]
+  fn a_bare_login_leaves_an_online_session_alone() {
+    assert!(already_online_with(
+      session::State::Online,
+      "alice",
+      "alice"
+    ));
+    assert!(!already_online_with(session::State::Online, "bob", "alice"));
+    assert!(!already_online_with(
+      session::State::Offline,
+      "alice",
+      "alice"
+    ));
+    assert!(!already_online_with(
+      session::State::Authenticating,
+      "alice",
+      "alice"
+    ));
+  }
+
+  #[test]
+  fn the_session_line_names_the_account_the_core_holds() {
+    assert_eq!(
+      session_line(session::State::Online, "bob"),
+      "session: online as bob"
+    );
+    assert_eq!(
+      session_line(session::State::Offline, "alice"),
+      "session: offline (credential: alice)"
+    );
+    assert_eq!(
+      session_line(session::State::Offline, ""),
+      "session: offline"
+    );
+    assert_eq!(
+      session_line(session::State::Authenticating, "alice"),
+      "session: authenticating as alice"
+    );
   }
 
   #[test]

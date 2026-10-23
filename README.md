@@ -184,7 +184,7 @@ thunet core                  # background service: owns the network session
 thunet service <action>      # install/uninstall/enable/disable/start/stop/restart/status
 thunet quit                  # ask the running window to exit and wait until it is gone
 thunet status                # JSON: service state + portal session/traffic
-thunet login                 # ask for the account and password, then authenticate
+thunet login                 # authenticate: three lines on stdin, or -i to be asked
 thunet logout                # ask the service to de-authenticate
 thunet ac-id                 # portal ac_id the service is using
 thunet config                # config path + effective settings
@@ -209,7 +209,56 @@ The window is only a *frontend*. The network session lives in `thunet core`, whi
 
 `status`, `login`, `logout` and `ac-id` are frontends too: they ask the running service over that same socket instead of contacting the portal themselves, so there is exactly one owner of the session. With no service running they stop with an error naming the command that starts it — they never fall back to a second, unmanaged connection.
 
-`thunet login` started from a terminal asks three questions: the account (the stored one is offered as the default, so Enter keeps it), the password, which is not echoed, and whether to remember the password for the next start. Leaving the password empty keeps the one the core already holds, which is how you change only the *remember* choice. Ctrl+C cancels the questions at any point — the terminal echo is restored and nothing is sent to the service. It prints one line about the result — `saved for the next start`, `this session only`, or `NOT saved` when the pair was incomplete — before the login itself. Without a terminal (stdin redirected, or started with no console at all) the questions are skipped and the command just asks the core to connect with the credentials it already holds. `-u/--username` and `-p/--password` skip the questions for scripts, at the cost of the password being visible in the shell history and in every process listing.
+`thunet login` gets the account and the password one of two ways: three lines on stdin (nothing is asked), or `-i`, which asks on the console. Without either it just connects with the pair the service already holds. The pair is never taken from an argument, and the report is the same in all three cases — it starts with where the account came from: `account: alice (stored)`, `account: alice (stdin, remember yes)` or `account: alice (asked)`.
+
+The three lines are, with what an empty one means:
+
+1. the account — empty keeps the account the service already holds;
+2. the password — empty keeps the password the service already holds;
+3. remembering — stored by default. Only an explicit `n`, `no`, `0` or `false` skips it, and skipping also deletes a password stored earlier: the same clear the window does when you untick *Remember password*.
+
+The default on line 3 is "store" on purpose: saving the password is what most people want, and while the machine is online the core proves a pair before it writes it, falling back to the credential it already had when the portal refuses it. Offline there is nothing to prove it against, so the pair is stored first and used when the network returns.
+
+Without `-i` nothing is asked on any platform: the executable is a GUI-subsystem binary, so it owns no console of its own, and the console it attaches to is one the shell is reading at the same time — an Enter would be taken by the shell's own line editor and the answers split between the two. That is why the default path is a pipe, and why `-i` is your explicit promise that a shell is waiting to answer.
+
+`-i` asks the same three things instead of reading them: the account (the stored one is offered as the default, so Enter keeps it), the password (not echoed; Enter keeps the one the service holds) and remembering — `[Y/n]`, where Enter means yes and only `n`, `no`, `0` or `false` means no, which also deletes a password stored earlier. Ctrl+C cancels at any question, leaves the terminal as it was and exits with status 130. Whatever stdin is, that is where the answers come from: with a pipe they are the three lines, and with nothing usable there the question fails at once rather than waiting. Nothing checks the promise for you.
+
+**Windows:** that promise means `cmd /c thunet login -i` — an interactive `cmd.exe` and PowerShell both return to their prompt as soon as they have started a GUI-subsystem program, and would eat the answers. **Linux and macOS:** any terminal works, because the shell waits; there is no `-i`-specific setup. Git Bash on Windows is mintty, a terminal emulator rather than a console: a native program started there sees a pipe on stdin, so the questions are answered from that pipe and the password is echoed by the terminal as it is typed — use bash inside Windows Terminal (a real console), `cmd /c`, or the pipe form.
+
+Three copy-paste recipes for the pipe form. PowerShell first, piped through `cmd.exe /c`: PowerShell waits for a console-subsystem program but not for a windowed one, so it returns to its prompt before this command has printed anything and the report would arrive out of order; `cmd.exe` waits for both, which keeps the output in order.
+
+```powershell
+$a=Read-Host 'account'; $p=Read-Host 'password' -MaskInput
+$r=Read-Host 'remember? [Y/n]'; if (-not $r) { $r='y' }
+"$a`n$p`n$r" | cmd.exe /c thunet login
+```
+
+```bat
+set "a=" & set /p "a=account: "
+set "p=" & set /p "p=password: "
+set "r=y" & set /p "r=remember? [Y/n]: "
+(echo(%a%& echo(%p%& echo(%r%) | thunet login
+```
+
+`cmd.exe` cannot mask what is typed, and `& | < > ^ %` inside a value are interpreted by it, so use PowerShell for a password that contains one. On Linux and macOS the same three lines come from `read`:
+
+```bash
+read -rp 'account: ' a; read -rsp 'password: ' p; echo; read -rp 'remember? [Y/n] ' r; r=${r:-y}
+printf '%s\n%s\n%s\n' "$a" "$p" "$r" | thunet login
+```
+
+The password never reaches `argv` and never enters the shell history; it is only read from stdin, so no process listing shows it either. `thunet login --help` is the short form of all this and `thunet login -v` the long one, with the reasoning behind the recipes.
+
+The command is never silent. It first says which account it will use and where that came from — `account: alice (stored)` for a bare run, `account: alice (stdin, remember yes)` or `(stdin, remember no)` when a pair was piped, `account: alice (asked)` when `-i` asked — then the service's state, which names the account the service holds when it has one (`session: online as bob`, `session: authenticating as alice`, `session: offline (credential: alice)`, or a bare `session: offline`), and then what it did:
+
+```
+account: alice (stdin, remember yes)
+session: offline (credential: bob)
+credentials: alice, saved for the next start
+online
+```
+
+A pair that was piped or asked for always produces the `credentials:` line (`saved for the next start`, `this session only`, or `NOT saved` when the pair was incomplete) before the result of the login itself. A bare `login` on a service that is already online with the same account prints `nothing to change` instead: no credential change is sent and no login is attempted. With no account anywhere — a fresh machine and nothing piped — it stops with an error that says to pipe the three lines (or use `-i`) and points at `thunet login --help`.
 
 `thunet status` prints one object with both halves:
 
@@ -232,11 +281,11 @@ The `core` half describes the running service (`uptime_secs`, the network verdic
 
 Starting `thunet` while it is already running does **not** start a second copy: the existing window is brought back instead.
 
-Global overrides: `--host <host>`, `--http`, `--timeout <secs>`, `-u/--username`, `-p/--password`, `--ip <addr>`, `--ac-id <id>`.
+Global overrides: `--host <host>`, `--http`, `--timeout <secs>`, `--ip <addr>`, `--ac-id <id>`.
 
-Precedence is **command line > config file > credential store**. `-u` / `-p` are handed to the service for `login` (in memory only, never written to disk), while `--host` / `--http` / `--timeout` shape what `thunet core` talks to: `thunet -u 1234567890 -p secret login`.
+Precedence is **command line > config file > credential store**. `--host` / `--http` / `--timeout` / `--ip` / `--ac-id` apply to the one-off commands and to a portable core (`thunet --host … core`), which is what makes a test against a fake host possible; the machine service and the window read their settings from the config file only, and the account and the password never come from the command line at all: `thunet login` reads them from stdin.
 
-On a shared machine, do not put the password in `argv`: `/proc/<pid>/cmdline` is readable by other users on Linux (unless `hidepid=2`). Use the window, or a stored credential plus `thunet login`.
+The password has no `argv` form at all: it is only ever read from stdin, so it never appears in the shell history or in a process listing (`/proc/<pid>/cmdline` on Linux is readable by other users, unless `hidepid=2`).
 
 ## 6. Where your data lives
 
@@ -586,7 +635,7 @@ If the threat model includes administrators or disk theft, the only real step up
 
 Two more practices for shared machines:
 
-- **Do not put the password in `argv`.** `thunet -p secret login` is visible to other users in `/proc/<pid>/cmdline` (Linux, unless `hidepid=2`) and in process listings. Use the window, or `thunet login` with the stored credential.
+- **The password has no `argv` form.** It is only ever read from stdin (three lines into `thunet login`), so it never appears in the shell history or in a process listing — `/proc/<pid>/cmdline` on Linux is readable by other users unless `hidepid=2`. Use the window, `thunet login`, or the pipe form above.
 - The control channel is local (named pipe / Unix socket), and the password crosses it in plaintext, but it is not reachable from the network and other users cannot read the stream of a connection they do not own. The security boundary is the peer check plus the credential file's ACL.
 
 ### 13.6 Upgrade and removal

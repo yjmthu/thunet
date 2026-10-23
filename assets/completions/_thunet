@@ -17,10 +17,6 @@ _thunet() {
     _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -45,10 +41,6 @@ _thunet() {
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -64,10 +56,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -83,10 +71,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -102,29 +86,25 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
+'-v[Print the long explanation and exit]' \
+'--verbose[Print the long explanation and exit]' \
+'-i[Ask for the account, the password and whether to remember, on this console]' \
+'--interactive[Ask for the account, the password and whether to remember, on this console]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (logout)
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -140,10 +120,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -160,10 +136,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -187,10 +159,6 @@ status\:"Print what the platform'\''s service manager says"))' \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -214,10 +182,6 @@ status\:"Print what the platform'\''s service manager says"))' \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -233,10 +197,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -252,10 +212,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--timeout=[Give up (and report) after this many milliseconds]:TIMEOUT:_default' \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -272,10 +228,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -291,10 +243,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
@@ -310,10 +258,6 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
-'-u+[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'--username=[TUNET account (overrides the saved one)]:USERNAME:_default' \
-'-p+[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
-'--password=[Password (otherwise read from the saved credential, or prompted)]:PASSWORD:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
 '--ac-id=[ac_id override; empty means auto-detect]:AC_ID:_default' \
 '--state-dir=[Where \`config.json\` and \`credential.bin\` live. The Windows service is registered with the installing user'\''s directory, because the token it runs under has no profile of its own]:STATE_DIR:_files' \
