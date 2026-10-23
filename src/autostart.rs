@@ -1887,7 +1887,7 @@ mod imp {
        PrivateTmp=true\n\
        ProtectHome=true\n\
        ProtectSystem=strict\n\
-       RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n\
+       RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK\n\
        CapabilityBoundingSet=\n\
        LimitCORE=0\n\
        \n\

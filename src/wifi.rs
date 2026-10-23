@@ -374,13 +374,17 @@ mod imp {
 #[cfg(windows)]
 pub use imp::probe_ssid;
 
-/// Linux: ask NetworkManager, then read the association with `iw`.
+/// Linux: read the association with `iw`, then ask NetworkManager.
 ///
-/// Both are local and privileged-free. `nmcli` covers a desktop install and
-/// costs one short-lived process; `iw` covers a machine without NetworkManager
-/// (a server with `systemd-networkd`, a minimal container). A machine with no
-/// wireless interface at all answers `Ok(None)`, which is what keeps a wired
-/// host quiet instead of logging an unexplained "no ssid" on every probe.
+/// Both are local and privileged-free. `iw` goes through netlink and does not
+/// touch D-Bus, which the machine service's `DynamicUser=` cannot always reach
+/// (there `nmcli` fails with "The connection is closed"); it also covers a
+/// machine without NetworkManager (a server with `systemd-networkd`, a minimal
+/// container). `nmcli` stays as the fallback for a machine without `iw`, and
+/// it lists every Wi-Fi device rather than only the one carrying the default
+/// route. A machine with no wireless interface at all answers `Ok(None)`, which
+/// is what keeps a wired host quiet instead of logging an unexplained "no
+/// ssid" on every probe.
 #[cfg(target_os = "linux")]
 mod linux {
   use std::process::Command;
@@ -445,6 +449,21 @@ mod linux {
     sys.join("wireless").exists() || sys.join("phy80211").exists()
   }
 
+  /// The wireless interfaces present on the machine, sorted so that a host with
+  /// more than one answers the same name on every probe.
+  fn wireless_interfaces() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+      return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+      .filter_map(|entry| entry.ok())
+      .filter_map(|entry| entry.file_name().into_string().ok())
+      .filter(|name| is_wireless(name))
+      .collect();
+    names.sort();
+    names
+  }
+
   fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program)
       .args(args)
@@ -467,6 +486,31 @@ mod linux {
   }
 
   pub fn probe_ssid() -> Result<Option<String>, String> {
+    let interfaces = wireless_interfaces();
+    if interfaces.is_empty() {
+      // A wired machine: there is no name to read and nothing to report.
+      return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    for iface in &interfaces {
+      match run("iw", &["dev", iface, "link"]) {
+        Ok(text) => {
+          if let Some(ssid) = ssid_from_iw(&text) {
+            return Ok(Some(ssid));
+          }
+        }
+        Err(err) => errors.push(err),
+      }
+    }
+    if errors.is_empty() {
+      // `iw` answered for every interface and none is associated.
+      return Ok(None);
+    }
+
+    // `iw` is missing or unusable: NetworkManager knows the same names. This
+    // path is only reached when the netlink read failed, because `nmcli` needs
+    // the system bus, which a dynamic service user cannot always use.
     match run(
       "nmcli",
       &[
@@ -481,21 +525,7 @@ mod linux {
       ],
     ) {
       Ok(text) => Ok(ssid_from_nmcli(&text)),
-      Err(nm) => {
-        // No NetworkManager (or no `nmcli` on PATH): read the association
-        // straight from the driver instead.
-        let Some(iface) = crate::srun::link_iface() else {
-          // No route either, so there is nothing to name and nothing to report.
-          return Ok(None);
-        };
-        if !is_wireless(&iface) {
-          return Ok(None);
-        }
-        match run("iw", &["dev", &iface, "link"]) {
-          Ok(text) => Ok(ssid_from_iw(&text)),
-          Err(iw) => Err(format!("{nm}; {iw}")),
-        }
-      }
+      Err(nm) => Err(format!("{}; {nm}", errors.join("; "))),
     }
   }
 }
