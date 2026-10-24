@@ -164,9 +164,16 @@
            upgrade and uninstall, which is the installer's own SCM client (no
            `sc.exe` or `net.exe`, hence no console window, and `Wait="yes"`
            holds the sequence until the service reports STOPPED), and it covers
-           a core this command did not reach. -->
+           a core this command did not reach.
+
+           `AND NOT UPGRADINGPRODUCTCODE` keeps the *removed* package from
+           running it again during a major upgrade: its own sequence would find
+           every window closed and the core stopped, and the quit step is
+           write-only, so that second pass can only race the restore that comes
+           later. A real uninstall still runs it, because that transaction has
+           no `UPGRADINGPRODUCTCODE`. -->
       <Custom Action="QuitAllWindows" Before="InstallValidate"
-              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+              Condition="(Installed OR WIX_UPGRADE_DETECTED) AND NOT UPGRADINGPRODUCTCODE" />
       <!-- Before RemoveFiles: the helper still has to exist. -->
       <Custom Action="RemoveCoreService" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
