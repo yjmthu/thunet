@@ -85,8 +85,11 @@ pub struct QuitAck {
 
 /// Write the record an upgrade reads to put the windows back.
 ///
-/// An empty list removes the previous record, so a stale one cannot bring back
-/// windows an installer never closed.
+/// An empty list writes nothing and removes nothing: an upgrade runs the quit
+/// step twice (the new package's sequence, then the removed package's), and the
+/// second run must not erase what the first one recorded. [`restore_windows`]
+/// is the only consumer, and it deletes the record it reads; the ten-minute
+/// freshness check drops whatever an aborted install left behind.
 pub fn write_quit_record(acks: &[QuitAck]) -> Result<(), String> {
   imp::write_quit_record(acks)
 }
@@ -601,12 +604,16 @@ mod imp {
   pub fn write_quit_record(acks: &[super::QuitAck]) -> Result<(), String> {
     use std::collections::BTreeMap;
 
-    let dir = crate::config::machine_dir();
-    let path = dir.join("quit-record");
+    // Nothing answered: write nothing, and deliberately delete nothing. An
+    // upgrade runs the quit step twice - the new package's sequence, then the
+    // removed package's - and the second run finds the machine quiet; erasing
+    // the record here would leave the restore step with no windows to put back.
     if acks.is_empty() {
-      let _ = std::fs::remove_file(&path);
       return Ok(());
     }
+
+    let dir = crate::config::machine_dir();
+    let path = dir.join("quit-record");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let at = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -901,8 +908,10 @@ mod imp {
     // stops it - which the same transaction does right after the quit.
     const RECORD: &str = "/run/thunet-quit-record";
     let path = std::path::Path::new(RECORD);
+    // Write-only, like the Windows half: a quit that closed no window must not
+    // erase a record an earlier step of the same transaction wrote, and
+    // `restore_windows` is what deletes the record it reads.
     if acks.is_empty() {
-      let _ = std::fs::remove_file(path);
       return Ok(());
     }
     let at = std::time::SystemTime::now()

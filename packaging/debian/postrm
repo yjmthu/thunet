@@ -33,6 +33,14 @@ case "${1:-}" in
     # the link only, so the sealed credential and the key would outlive the
     # product; the private path needs naming explicitly.
     rm -rf /var/lib/thunet /var/lib/private/thunet
+    # The quit step's two records - and the transient socket of the machine-wide
+    # signal - live in /run, not in the state directory: `RuntimeDirectory=thunet`
+    # is deleted by systemd when the unit stops, which `prerm` does right after
+    # writing them. `service-restore` normally deletes both by reading them; a
+    # real uninstall never runs that step, so whatever is left over goes here.
+    # `/run` is tmpfs, so this is only about not leaving them behind until the
+    # next reboot.
+    rm -f /run/thunet-quit-record /run/thunet-core-was-running /run/thunet-quit.sock
     remove_tray_entries
     # Only a real uninstall drops the registration. This used to run for every
     # invocation, including `upgrade`: dpkg calls the *old* package's

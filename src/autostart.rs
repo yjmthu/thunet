@@ -309,13 +309,13 @@ fn write_running_marker(was_running: bool) -> Result<(), String> {
 /// [`write_running_marker`] on an explicit path and clock, so it is testable.
 fn write_running_marker_at(path: &Path, was_running: bool, now: u128) -> Result<(), String> {
   if !was_running {
-    // Remove, do not leave behind: a marker from an earlier attempt must not
-    // start a core this install found stopped.
-    return match std::fs::remove_file(path) {
-      Ok(()) => Ok(()),
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(format!("{}: {e}", path.display())),
-    };
+    // Write-only on purpose: an upgrade runs the quit step twice - the new
+    // package's sequence, then the removed package's - and the second run finds
+    // the core already stopped. Deleting here would erase the first run's
+    // answer to "was it running", and the core would never come back.
+    // `take_running_marker` deletes what it reads, and `marker_is_fresh` drops
+    // anything an aborted install left behind, so this side never cleans up.
+    return Ok(());
   }
   std::fs::write(path, now.to_string()).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -395,21 +395,23 @@ mod remembered_core {
   }
 
   #[test]
-  fn a_stop_that_finds_nothing_leaves_no_marker() {
+  fn a_second_stop_keeps_the_answer_the_first_one_gave() {
     let path = scratch("stopped");
     write_running_marker_at(&path, true, NOW).expect("write");
-    // A later stop that found the core stopped must not keep the old answer.
-    write_running_marker_at(&path, false, NOW + 1_000).expect("remove");
-    assert!(!path.exists());
-    assert!(!take_running_marker_at(&path, NOW + 1_000));
+    // An upgrade runs the quit step twice; the second run finds the core
+    // already stopped and must leave the first run's answer in place.
+    write_running_marker_at(&path, false, NOW + 1_000).expect("keep");
+    assert!(path.exists(), "a stop that found nothing reports nothing");
+    assert!(take_running_marker_at(&path, NOW + 1_000));
   }
 
   #[test]
   fn a_marker_nobody_wrote_is_simply_absent() {
     let path = scratch("absent");
     assert!(!take_running_marker_at(&path, NOW));
-    // Removing a marker that is not there is not an error either.
-    write_running_marker_at(&path, false, NOW).expect("remove missing");
+    // Reporting that nothing was running is not an error either.
+    write_running_marker_at(&path, false, NOW).expect("nothing to write");
+    assert!(!path.exists());
   }
 }
 
