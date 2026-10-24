@@ -323,12 +323,10 @@ mod imp {
   /// SYSTEM and administrators may set it; interactive users may only wait.
   const MACHINE_QUIT_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;IU)";
   /// The answer channel. A `Global\` event carries no payload, so the state each
-  /// window reports travels on a machine-wide pipe instead. Pipes can be created
-  /// by any user, so the sender insists on the first instance and only raises
-  /// the event after the pipe exists.
-  const MACHINE_QUIT_PIPE: &str = r"\\.\pipe\thunet-machine-quit";
-  /// SYSTEM and administrators may do anything; interactive users may write.
-  const MACHINE_QUIT_PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GW;;;IU)";
+  /// window reports travels on a machine-wide pipe instead. Its transport, its
+  /// DACL and the peer identity come from [`crate::ipc`], so this half cannot
+  /// drift from what the core link already does.
+  const MACHINE_QUIT_PIPE: &str = "thunet-machine-quit";
 
   pub struct MachineQuit {
     event: windows_sys::Win32::Foundation::HANDLE,
@@ -397,36 +395,14 @@ mod imp {
   }
 
   pub fn machine_quit() -> Result<MachineQuit, String> {
-    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Storage::FileSystem::{
-      FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
-    };
-    use windows_sys::Win32::System::Pipes::{
-      CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    };
+    use windows_sys::Win32::Foundation::LocalFree;
 
     // The answer channel first: a window that sees the event connects here, so
     // the pipe must exist before the event can be seen.
-    let (attributes, descriptor) = security(MACHINE_QUIT_PIPE_SDDL)?;
-    let pipe_name = wide(MACHINE_QUIT_PIPE);
-    let pipe = unsafe {
-      CreateNamedPipeW(
-        pipe_name.as_ptr(),
-        PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
-        PIPE_UNLIMITED_INSTANCES,
-        0,
-        256,
-        0,
-        &attributes,
-      )
-    };
-    // SAFETY: the descriptor was allocated by `security`.
-    unsafe { LocalFree(descriptor as _) };
-    if pipe == INVALID_HANDLE_VALUE {
-      let err = unsafe { GetLastError() };
-      return Err(format!("cannot create the quit pipe (error {err})"));
-    }
+    let listener = crate::ipc::endpoint::Endpoint::bind(
+      MACHINE_QUIT_PIPE,
+      crate::ipc::INTERACTIVE_SDDL,
+    )?;
 
     let (attributes, descriptor) = security(MACHINE_QUIT_SDDL)?;
     let event_name = wide(MACHINE_QUIT_NAME);
@@ -438,8 +414,6 @@ mod imp {
     // SAFETY: the descriptor was allocated by `security`.
     unsafe { LocalFree(descriptor as _) };
     if event.is_null() {
-      // SAFETY: the pipe came from CreateNamedPipeW and is closed once.
-      unsafe { CloseHandle(pipe) };
       let err = unsafe { GetLastError() };
       return Err(format!(
         "cannot create the machine quit event (error {err})"
@@ -451,10 +425,34 @@ mod imp {
     let thread = {
       let stop = stop.clone();
       let acks = acks.clone();
-      // Raw handles are not `Send`; a pointer-sized integer is.
-      let raw = pipe as isize;
       std::thread::spawn(move || {
-        read_answers(raw as windows_sys::Win32::Foundation::HANDLE, stop, acks)
+        while !stop.load(Ordering::SeqCst) {
+          let Some(mut conn) = listener.accept() else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+          };
+          // The kernel names the client, so the session cannot be spoofed; the
+          // one line only says which state to restore. A window that says
+          // nothing is put back in the tray.
+          let pid = conn.pid();
+          let minimized = conn
+            .read_line()
+            .is_none_or(|line| !line.trim().eq_ignore_ascii_case("visible"));
+          if let Some(pid) = pid
+            && let Some(session) = crate::ident::process_session(pid)
+            && session > 0
+            && let Ok(mut list) = acks.lock()
+          {
+            list.push(super::QuitAck {
+              uid: 0,
+              pid,
+              session,
+              minimized,
+            });
+          }
+          // Only now may the window go away: its answer is recorded.
+          conn.ack();
+        }
       })
     };
     // Only now may a window see the signal.
@@ -467,84 +465,7 @@ mod imp {
     })
   }
 
-  /// Read one answer per window off the pipe until the signal is withdrawn.
-  fn read_answers(
-    pipe: windows_sys::Win32::Foundation::HANDLE,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    acks: std::sync::Arc<std::sync::Mutex<Vec<super::QuitAck>>>,
-  ) {
-    use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
-    use windows_sys::Win32::System::Pipes::{
-      ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    };
-    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-
-    while !stop.load(Ordering::SeqCst) {
-      // `PIPE_NOWAIT`: returns `ERROR_PIPE_LISTENING` when no client is there,
-      // so the loop can observe the stop flag.
-      let connected = unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) } != 0;
-      let err = unsafe { GetLastError() };
-      if !connected && err != ERROR_PIPE_CONNECTED {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        continue;
-      }
-      let mut pid = 0u32;
-      let have_pid = unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } != 0;
-      let minimized = read_state(pipe);
-      let mut session = 0u32;
-      if have_pid && unsafe { ProcessIdToSessionId(pid, &mut session) } == 0 {
-        session = 0;
-      }
-      if have_pid
-        && session > 0
-        && let Ok(mut list) = acks.lock()
-      {
-        list.push(super::QuitAck {
-          uid: 0,
-          pid,
-          session,
-          minimized,
-        });
-      }
-      unsafe { DisconnectNamedPipe(pipe) };
-    }
-    // SAFETY: the pipe came from CreateNamedPipeW and is closed once, here.
-    unsafe { CloseHandle(pipe) };
-  }
-
-  /// The state line a window wrote, defaulting to the tray when it said
-  /// nothing or was too slow.
-  fn read_state(pipe: windows_sys::Win32::Foundation::HANDLE) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::ReadFile;
-
-    let mut buffer = [0u8; 32];
-    let mut read = 0u32;
-    for _ in 0..10 {
-      // `PIPE_NOWAIT` makes this nonblocking; the client may not have written
-      // yet, hence the retries.
-      let ok = unsafe {
-        ReadFile(
-          pipe,
-          buffer.as_mut_ptr(),
-          buffer.len() as u32,
-          &mut read,
-          std::ptr::null_mut(),
-        )
-      };
-      if ok != 0 && read > 0 {
-        break;
-      }
-      std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let text = String::from_utf8_lossy(&buffer[..read as usize]);
-    !text.trim().eq_ignore_ascii_case("visible")
-  }
-
   pub fn machine_quit_requested(minimized: bool) -> bool {
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, WriteFile};
-    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
-
     let name = wide(MACHINE_QUIT_NAME);
     // SAFETY: plain Win32 calls on a NUL-terminated name that outlives them.
     let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
@@ -559,44 +480,18 @@ mod imp {
       return false;
     }
 
-    // Leave the state on the answer pipe. A failure here still ends the window;
-    // the sender then restores it in the tray.
-    let pipe = wide(MACHINE_QUIT_PIPE);
-    let open = || unsafe {
-      CreateFileW(
-        pipe.as_ptr(),
-        GENERIC_WRITE,
-        0,
-        std::ptr::null(),
-        OPEN_EXISTING,
-        0,
-        std::ptr::null_mut(),
-      )
-    };
-    let mut file = open();
-    if file == INVALID_HANDLE_VALUE {
-      let _ = unsafe { WaitNamedPipeW(pipe.as_ptr(), 200) };
-      file = open();
-    }
-    if file != INVALID_HANDLE_VALUE {
-      let line: &[u8] = if minimized {
-        b"minimized\n"
+    // Leave the state on the answer channel and stay connected until the sender
+    // has it: a pipe drops both the buffered line and the client's identity if
+    // the client goes away before the server accepts the connection. A failure
+    // here still ends the window; the sender then restores it in the tray.
+    if let Ok(mut conn) = crate::ipc::endpoint::connect(MACHINE_QUIT_PIPE) {
+      let line = if minimized {
+        "minimized\n"
       } else {
-        b"visible\n"
+        "visible\n"
       };
-      let mut written = 0u32;
-      // SAFETY: the handle is a live pipe and the buffer outlives the call.
-      unsafe {
-        WriteFile(
-          file,
-          line.as_ptr(),
-          line.len() as u32,
-          &mut written,
-          std::ptr::null_mut(),
-        )
-      };
-      // SAFETY: the handle is closed exactly once.
-      unsafe { CloseHandle(file) };
+      let _ = conn.write_line(line);
+      let _ = conn.wait_ack();
     }
     true
   }
@@ -1029,9 +924,7 @@ mod imp {
   /// counted nor restarted.
   #[cfg(target_os = "linux")]
   pub(super) mod machine {
-    use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1086,8 +979,9 @@ mod imp {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot replace {}: {e}", path.display())),
       }
-      let listener =
-        UnixListener::bind(&path).map_err(|e| format!("cannot bind {}: {e}", path.display()))?;
+      // The transport is the one the core link uses; only the "is the signal up"
+      // question is per platform, and on Unix the socket file answers it.
+      let listener = crate::ipc::endpoint::Endpoint::bind(&path.to_string_lossy(), "")?;
       // Connect needs write permission on the socket; creation stays impossible
       // for users because `/run` itself is root-owned.
       let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
@@ -1100,33 +994,30 @@ mod imp {
           // The connection *is* the answer: the kernel names the peer, so the
           // sender records who asked without trusting anything the window
           // writes. Portable windows never connect at all.
-          let _ = listener.set_nonblocking(true);
           while !stop.load(Ordering::SeqCst) {
-            match listener.accept() {
-              Ok((stream, _)) => {
-                // The kernel names the peer, so the uid and pid cannot be
-                // spoofed; the one line says which state to restore. A window
-                // that says nothing is restored in the tray.
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                let mut line = String::new();
-                let minimized = match BufReader::new(&stream).read_line(&mut line) {
-                  Ok(n) if n > 0 => !line.trim().eq_ignore_ascii_case("visible"),
-                  _ => true,
-                };
-                if let Some((uid, pid)) = peer(&stream)
-                  && uid > 0
-                  && let Ok(mut list) = acks.lock()
-                {
-                  list.push(super::super::QuitAck {
-                    uid,
-                    pid,
-                    session: 0,
-                    minimized,
-                  });
-                }
-              }
-              Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            let Some(mut conn) = listener.accept() else {
+              std::thread::sleep(Duration::from_millis(20));
+              continue;
+            };
+            // The uid and pid come from `SO_PEERCRED`, so they cannot be
+            // spoofed; the one line says which state to restore. A window that
+            // says nothing is restored in the tray.
+            let pid = conn.pid().unwrap_or(0);
+            let minimized = conn
+              .read_line()
+              .is_none_or(|line| !line.trim().eq_ignore_ascii_case("visible"));
+            if let Some(uid) = conn.uid().filter(|uid| *uid > 0)
+              && let Ok(mut list) = acks.lock()
+            {
+              list.push(super::super::QuitAck {
+                uid,
+                pid,
+                session: 0,
+                minimized,
+              });
             }
+            // Only now may the window go away: its answer is recorded.
+            conn.ack();
           }
         })
       };
@@ -1138,47 +1029,26 @@ mod imp {
       })
     }
 
-    /// The uid and pid the kernel reports for a connection.
+    /// Ask whether the signal is up and report this window's state.
     ///
-    /// `SO_PEERCRED` is what makes the connection trustworthy: the sender never
-    /// reads a uid out of a payload, so a local user cannot claim to be another
-    /// one and have a window restored for them.
-    fn peer(stream: &UnixStream) -> Option<(u32, u32)> {
-      use std::os::unix::io::AsRawFd as _;
-
-      let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-      let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-      // SAFETY: the socket is live, and the buffer and length outlive the call.
-      let ok = unsafe {
-        libc::getsockopt(
-          stream.as_raw_fd(),
-          libc::SOL_SOCKET,
-          libc::SO_PEERCRED,
-          &mut cred as *mut _ as *mut libc::c_void,
-          &mut len,
-        )
-      };
-      (ok == 0).then(|| (cred.uid, cred.pid as u32))
-    }
-
-    /// Ask whether the signal is up and report this window's state. The uid and
-    /// pid come from the kernel, so they cannot be spoofed; the line only says
-    /// whether the window was hidden in the tray. `true` means the window ends.
+    /// A plain file, or a socket whose sender is gone, fails to connect: a
+    /// crash must never turn into a spurious quit later. The uid and pid come
+    /// from the kernel, so they cannot be spoofed; the line only says whether
+    /// the window was hidden in the tray. `true` means the window ends.
     pub(crate) fn request_at(path: &Path, minimized: bool) -> bool {
-      // A plain file, or a socket whose sender is gone, fails to connect: a
-      // crash must never turn into a spurious quit later.
-      let Ok(mut stream) = UnixStream::connect(path) else {
+      let Ok(mut conn) = crate::ipc::endpoint::connect(&path.to_string_lossy()) else {
         return false;
       };
-      let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
       let line = if minimized {
         "minimized\n"
       } else {
         "visible\n"
       };
       // A failed write still means the signal was there; the sender then
-      // restores the window in the tray instead of its original state.
-      let _ = stream.write_all(line.as_bytes());
+      // restores the window in the tray instead of its original state. The wait
+      // is what keeps the connection alive until the answer is recorded.
+      let _ = conn.write_line(line);
+      let _ = conn.wait_ack();
       true
     }
   }

@@ -643,14 +643,18 @@ fn bind(path: &str, _machine: bool) -> Result<Listener, BindError> {
 
 /// Named pipe with an explicit DACL: the core owns the pipe as SYSTEM, whose
 /// default ACL (SYSTEM + administrators) would hide it from the window.
+///
+/// SYSTEM and administrators get everything; interactive users may read and
+/// write, which is all a frontend needs. A portable core has no reason to
+/// expose itself to other accounts, so its pipe is owner-only. The machine
+/// half is shared with every other machine-wide channel this program publishes.
+#[cfg(windows)]
+pub(crate) const INTERACTIVE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+
 #[cfg(windows)]
 fn pipe_sddl(machine: bool) -> Result<String, String> {
-  // SYSTEM and administrators get everything; interactive users may read and
-  // write, which is all a frontend needs to drive the core. A portable core has
-  // no reason to expose itself to other accounts, so its pipe is owner-only.
-  const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
   if machine {
-    let mut sddl = PIPE_SDDL.to_string();
+    let mut sddl = INTERACTIVE_SDDL.to_string();
     // `accept()` creates a new instance for every connection. Creating an
     // instance requires FILE_CREATE_PIPE_INSTANCE on the existing pipe, so the
     // service account needs its own ACE; without it the first client connects
@@ -670,17 +674,17 @@ fn pipe_sddl(machine: bool) -> Result<String, String> {
   }
 }
 
+/// Listener options for `path` with an explicit DACL.
 #[cfg(windows)]
-fn pipe_options(path: &str, machine: bool) -> Result<PipeListenerOptions<'static>, String> {
+fn pipe_options_with(path: &str, sddl: &str) -> Result<PipeListenerOptions<'static>, String> {
   use std::borrow::Cow;
 
   use interprocess::os::windows::security_descriptor::SecurityDescriptor;
   use widestring::U16CString;
 
-  let sddl = pipe_sddl(machine)?;
   let full =
     U16CString::from_str(format!(r"\\.\pipe\{path}")).map_err(|e| format!("bad pipe name: {e}"))?;
-  let sddl = U16CString::from_str(&sddl).map_err(|e| format!("bad pipe DACL: {e}"))?;
+  let sddl = U16CString::from_str(sddl).map_err(|e| format!("bad pipe DACL: {e}"))?;
   let descriptor =
     SecurityDescriptor::deserialize(sddl.as_ucstr()).map_err(|e| format!("bad pipe DACL: {e}"))?;
 
@@ -688,6 +692,11 @@ fn pipe_options(path: &str, machine: bool) -> Result<PipeListenerOptions<'static
   options.path = Cow::Owned(full);
   options.security_descriptor = Some(descriptor);
   Ok(options)
+}
+
+#[cfg(windows)]
+fn pipe_options(path: &str, machine: bool) -> Result<PipeListenerOptions<'static>, String> {
+  pipe_options_with(path, &pipe_sddl(machine)?)
 }
 
 #[cfg(windows)]
@@ -727,6 +736,188 @@ fn connect(path: &str) -> Result<Stream, String> {
   let full = format!(r"\\.\pipe\{path}");
   let wide = U16CString::from_str(&full).map_err(|e| format!("bad pipe name: {e}"))?;
   PipeStream::<Bytes, Bytes>::connect_by_path(wide.as_ucstr()).map_err(|e| format!("{full}: {e}"))
+}
+
+// ----------------------------------------------------------------- endpoint
+
+/// A named endpoint this process owns, for a channel that is not the core's
+/// link - today the machine-wide quit and the answers its windows send back.
+///
+/// The transport, the peer identity and the polling accept are the same ones
+/// the core link uses, which is the point: the quit channel used to hand-roll a
+/// `PIPE_NOWAIT` loop and got two documented semantics wrong (a fresh
+/// instance's first `ConnectNamedPipe` means "available", not "connected";
+/// `ERROR_NO_DATA` means a client connected and left), so every window's answer
+/// was read and thrown away. Sharing this layer keeps the two from drifting
+/// apart again.
+///
+/// The protocol is one line in each direction: the peer writes its state, the
+/// owner records it and writes one byte back. The byte is an acknowledgement,
+/// not data: a Windows pipe loses both the buffered line and the client's
+/// identity if the client goes away before the server accepts it, so the peer
+/// stays connected until it sees this.
+pub(crate) mod endpoint {
+  #[cfg(unix)]
+  use interprocess::local_socket::prelude::*;
+  use std::io::{Read as _, Write as _};
+  use std::time::{Duration, Instant};
+
+  /// How long one exchange may take before the peer counts as silent.
+  const IO: Duration = Duration::from_millis(250);
+  /// Poll interval for the bounded reads below.
+  const POLL: Duration = Duration::from_millis(5);
+  /// The whole protocol is one short state word.
+  const MAX_LINE: usize = 64;
+
+  pub(crate) struct Endpoint(super::Listener);
+
+  /// One accepted (or initiated) connection on such an endpoint.
+  pub(crate) struct Conn(super::Stream);
+
+  impl Endpoint {
+    /// Bind `path`: a bare pipe name on Windows (the `\\.\pipe\` prefix is added
+    /// here), a filesystem path on Unix. `sddl` is Windows-only; on Unix the
+    /// socket file and the directory holding it decide who may connect.
+    pub(crate) fn bind(path: &str, sddl: &str) -> Result<Self, String> {
+      #[cfg(windows)]
+      {
+        let options = super::pipe_options_with(path, sddl)?;
+        let listener = options
+          .create_duplex::<super::Bytes>()
+          .map_err(|e| format!("cannot listen on {path}: {e}"))?;
+        // `accept` has to return `WouldBlock` so the caller can look at its stop
+        // flag, exactly as the core's hosted listener does.
+        listener
+          .set_nonblocking(true)
+          .map_err(|e| format!("cannot poll {path}: {e}"))?;
+        Ok(Self(listener))
+      }
+      #[cfg(unix)]
+      {
+        let _ = sddl;
+        let name = super::name(path).map_err(|e| format!("bad endpoint {path}: {e}"))?;
+        let listener = interprocess::local_socket::ListenerOptions::new()
+          .name(name)
+          .create_sync()
+          .map_err(|e| format!("cannot listen on {path}: {e}"))?;
+        listener
+          .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+          .map_err(|e| format!("cannot poll {path}: {e}"))?;
+        Ok(Self(listener))
+      }
+    }
+
+    /// One waiting connection, or `None` when nobody is there yet.
+    pub(crate) fn accept(&self) -> Option<Conn> {
+      self.0.accept().ok().map(Conn::new)
+    }
+  }
+
+  impl Conn {
+    /// Make an accepted polling stream blocking again.
+    ///
+    /// A Windows polling listener hands out polling streams, and a nonblocking
+    /// read on a pipe with nothing buffered returns zero bytes - which cannot
+    /// be told apart from a peer that left. See `unpoll_accepted`.
+    #[cfg(windows)]
+    fn new(stream: super::Stream) -> Self {
+      let _ = stream.set_nonblocking(false);
+      Self(stream)
+    }
+
+    /// The accepted streams a Unix listener hands out are already blocking.
+    #[cfg(unix)]
+    fn new(stream: super::Stream) -> Self {
+      Self(stream)
+    }
+
+    /// The client's process id, as the kernel reports it.
+    pub(crate) fn pid(&self) -> Option<u32> {
+      #[cfg(windows)]
+      {
+        self.0.client_process_id().ok()
+      }
+      #[cfg(unix)]
+      {
+        self
+          .0
+          .peer_creds()
+          .ok()
+          .and_then(|creds| creds.pid())
+          .map(|pid| pid as u32)
+      }
+    }
+
+    /// The client's uid, where the platform has one (Unix only).
+    ///
+    /// `SO_PEERCRED` is what makes the answer trustworthy on Unix: the uid comes
+    /// from the kernel, never from the payload.
+    #[cfg(unix)]
+    pub(crate) fn uid(&self) -> Option<u32> {
+      self.0.peer_creds().ok().and_then(|creds| creds.euid())
+    }
+
+    /// Read one newline-terminated line, giving up after [`IO`].
+    pub(crate) fn read_line(&mut self) -> Option<String> {
+      if self.0.set_nonblocking(true).is_err() {
+        return None;
+      }
+      let deadline = Instant::now() + IO;
+      let mut bytes = Vec::new();
+      let mut byte = [0u8; 1];
+      while Instant::now() < deadline && bytes.len() < MAX_LINE {
+        match self.0.read(&mut byte) {
+          // Nothing buffered yet. On a Windows pipe that is a zero-byte read,
+          // not an end of input; the deadline above is what ends the wait.
+          Ok(0) => std::thread::sleep(POLL),
+          Ok(_) => {
+            if byte[0] == b'\n' {
+              break;
+            }
+            bytes.push(byte[0]);
+          }
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
+          Err(_) => break,
+        }
+      }
+      let _ = self.0.set_nonblocking(false);
+      (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Send one line of state.
+    pub(crate) fn write_line(&mut self, line: &str) -> Result<(), String> {
+      self.0.write_all(line.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// Report that the line just read has been recorded.
+    pub(crate) fn ack(&mut self) {
+      let _ = self.0.write_all(b"\n");
+      let _ = self.0.flush();
+    }
+
+    /// Wait for the owner's acknowledgement, giving up after [`IO`].
+    pub(crate) fn wait_ack(&mut self) -> bool {
+      if self.0.set_nonblocking(true).is_err() {
+        return false;
+      }
+      let deadline = Instant::now() + IO;
+      let mut byte = [0u8; 1];
+      while Instant::now() < deadline {
+        match self.0.read(&mut byte) {
+          Ok(n) if n > 0 => return true,
+          Ok(_) => std::thread::sleep(POLL),
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(POLL),
+          Err(_) => return false,
+        }
+      }
+      false
+    }
+  }
+
+  /// Connect to an endpoint this program published.
+  pub(crate) fn connect(path: &str) -> Result<Conn, String> {
+    Ok(Conn::new(super::connect(path)?))
+  }
 }
 
 fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: String) {
