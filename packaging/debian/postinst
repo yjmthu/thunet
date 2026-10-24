@@ -27,4 +27,30 @@ if [ -d /run/systemd/system ]; then
   fi
 fi
 
+# Put back the windows `prerm` ended. They always come back in the tray, like a
+# silent install: whether the package was installed interactively makes no
+# difference. `quit-record` is written by the elevated quit command and names
+# one uid per window; a record older than ten minutes belongs to an installation
+# that never completed and is dropped instead.
+record=/run/thunet-quit-record
+if [ "${1:-}" = configure ]; then
+  if [ -n "${2:-}" ] && [ -r "$record" ]; then
+    now=$(date +%s%3N 2>/dev/null || echo 0)
+    at=$(awk '$1 == "at" { print $2; exit }' "$record")
+    if [ -n "$at" ] && [ "$now" -gt 0 ] && [ $((now - at)) -le 600000 ]; then
+      for uid in $(awk '$1 == "uid" { print $2 }' "$record" | sort -u); do
+        user=$(getent passwd "$uid" | cut -d: -f1)
+        [ -n "$user" ] || continue
+        # The user manager knows the graphical session's DISPLAY/WAYLAND_DISPLAY;
+        # a session without a manager (nobody logged in) is simply skipped.
+        systemd-run --user --machine="$user@.host" --collect --quiet \
+          /usr/bin/thunet --minimized >/dev/null 2>&1 || true
+      done
+    fi
+  fi
+  # A record from an earlier uninstall or a failed transaction must not be
+  # waiting for the next one.
+  rm -f "$record"
+fi
+
 exit 0

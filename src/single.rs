@@ -67,6 +67,25 @@ pub fn machine_quit_requested() -> bool {
 
 pub use imp::MachineQuit;
 
+/// One machine window that answered the quit signal.
+///
+/// The answer is what lets an upgrade put the windows back afterwards: only a
+/// machine-mode window answers, and it names the user that has to be
+/// relaunched. Portable windows never see the signal and never answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuitAck {
+  pub uid: u32,
+  pub pid: u32,
+}
+
+/// Write the record an upgrade reads to put the windows back.
+///
+/// An empty list removes the previous record, so a stale one cannot bring back
+/// windows an installer never closed.
+pub fn write_quit_record(acks: &[QuitAck]) -> Result<(), String> {
+  imp::write_quit_record(acks)
+}
+
 /// Best-effort cleanup before `std::process::exit`, which skips [`Guard::drop`].
 ///
 /// Windows releases the mutex when the process ends; only the Unix lock file
@@ -310,6 +329,21 @@ mod imp {
     unsafe { CloseHandle(handle) };
     signaled
   }
+
+  /// The record is the Linux half of the upgrade story for now: Windows needs a
+  /// per-session relaunch from the MSI, which is written together with that
+  /// installer step.
+  pub fn write_quit_record(_acks: &[super::QuitAck]) -> Result<(), String> {
+    Ok(())
+  }
+
+  impl MachineQuit {
+    /// Windows has no in-band reply yet: the event carries no payload, so the
+    /// MSI half will collect the sessions itself.
+    pub fn acks(&self) -> Vec<super::QuitAck> {
+      Vec::new()
+    }
+  }
 }
 
 #[cfg(unix)]
@@ -418,19 +452,75 @@ mod imp {
     let _ = std::fs::remove_file(lock_path());
   }
 
+  // ------------------------------------------------------------ quit record
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn record_text(acks: &[super::QuitAck], at: u128) -> String {
+    let mut text = format!("at {at}\n");
+    let mut users = std::collections::BTreeSet::new();
+    for ack in acks {
+      // One per user is enough: a machine setup has one window per session, and
+      // the relaunch is per user manager.
+      if users.insert(ack.uid) {
+        text.push_str(&format!("uid {}\n", ack.uid));
+      }
+    }
+    text
+  }
+
+  #[cfg(target_os = "linux")]
+  pub fn write_quit_record(acks: &[super::QuitAck]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // `/run`, not the machine state directory: the record lives for one install
+    // transaction, and the service's `RuntimeDirectory` is removed when systemd
+    // stops it - which the same transaction does right after the quit.
+    const RECORD: &str = "/run/thunet-quit-record";
+    let path = std::path::Path::new(RECORD);
+    if acks.is_empty() {
+      let _ = std::fs::remove_file(path);
+      return Ok(());
+    }
+    let at = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+    let mut file = std::fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .mode(0o600)
+      .open(path)
+      .map_err(|e| format!("{RECORD}: {e}"))?;
+    file
+      .write_all(record_text(acks, at).as_bytes())
+      .map_err(|e| format!("{RECORD}: {e}"))
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  pub fn write_quit_record(_acks: &[super::QuitAck]) -> Result<(), String> {
+    Ok(())
+  }
+
   /// The machine-wide quit channel on Linux: a socket only root can create.
   ///
   /// A named event has no direct Unix equivalent; a filesystem socket in `/run`
   /// is the closest thing with the same properties. It exists only while the
   /// sender holds it, any user can connect to ask "is it up?", and nobody but
   /// root can create, replace or remove it, because `/run` belongs to root.
+  ///
+  /// The answer travels back on the same connection: a machine-mode window
+  /// writes `{"uid":…,"pid":…}` before it ends, which is what an upgrade reads
+  /// later to put it back. A portable window never connects, so it is neither
+  /// counted nor restarted.
   #[cfg(target_os = "linux")]
   pub(super) mod machine {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// Fixed name: the signal is per machine, not per user or state directory.
@@ -440,6 +530,18 @@ mod imp {
       stop: Arc<AtomicBool>,
       thread: Option<std::thread::JoinHandle<()>>,
       path: PathBuf,
+      /// Answers collected from the windows that saw the signal.
+      acks: Arc<Mutex<Vec<super::super::QuitAck>>>,
+    }
+
+    impl MachineQuit {
+      /// The windows that answered so far, one entry per answer.
+      pub fn acks(&self) -> Vec<super::super::QuitAck> {
+        match self.acks.lock() {
+          Ok(list) => list.clone(),
+          Err(poisoned) => poisoned.into_inner().clone(),
+        }
+      }
     }
 
     impl Drop for MachineQuit {
@@ -457,7 +559,7 @@ mod imp {
     }
 
     pub fn machine_quit_requested() -> bool {
-      requested_at(Path::new(SOCKET))
+      request_at(Path::new(SOCKET))
     }
 
     /// Bind the signal at `path`. Split out so a test can use a temporary
@@ -476,15 +578,25 @@ mod imp {
       // for users because `/run` itself is root-owned.
       let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
       let stop = Arc::new(AtomicBool::new(false));
+      let acks = Arc::new(Mutex::new(Vec::new()));
       let thread = {
         let stop = stop.clone();
+        let acks = acks.clone();
         std::thread::spawn(move || {
-          // Every window probes by connecting and sends nothing, so the
-          // connections are accepted and dropped to keep the backlog empty.
+          // The connection *is* the answer: the kernel names the peer, so the
+          // sender records who asked without trusting anything the window
+          // writes. Portable windows never connect at all.
           let _ = listener.set_nonblocking(true);
           while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
-              Ok(_) => {}
+              Ok((stream, _)) => {
+                if let Some((uid, pid)) = peer(&stream)
+                  && uid > 0
+                  && let Ok(mut list) = acks.lock()
+                {
+                  list.push(super::super::QuitAck { uid, pid });
+                }
+              }
               Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
           }
@@ -494,12 +606,39 @@ mod imp {
         stop,
         thread: Some(thread),
         path,
+        acks,
       })
     }
 
-    pub(crate) fn requested_at(path: &Path) -> bool {
-      // A plain file, or a socket whose sender is gone, answers with an error:
-      // a crash must never turn into a spurious quit later.
+    /// The uid and pid the kernel reports for a connection.
+    ///
+    /// `SO_PEERCRED` is what makes the connection trustworthy: the sender never
+    /// reads a uid out of a payload, so a local user cannot claim to be another
+    /// one and have a window restored for them.
+    fn peer(stream: &UnixStream) -> Option<(u32, u32)> {
+      use std::os::unix::io::AsRawFd as _;
+
+      let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+      let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+      // SAFETY: the socket is live, and the buffer and length outlive the call.
+      let ok = unsafe {
+        libc::getsockopt(
+          stream.as_raw_fd(),
+          libc::SOL_SOCKET,
+          libc::SO_PEERCRED,
+          &mut cred as *mut _ as *mut libc::c_void,
+          &mut len,
+        )
+      };
+      (ok == 0).then(|| (cred.uid, cred.pid as u32))
+    }
+
+    /// Ask whether the signal is up. The connection itself is this window's
+    /// answer: the sender reads the uid and pid from the kernel, so nothing has
+    /// to be written and nothing can be spoofed. `true` means the window ends.
+    pub(crate) fn request_at(path: &Path) -> bool {
+      // A plain file, or a socket whose sender is gone, fails to connect: a
+      // crash must never turn into a spurious quit later.
       UnixStream::connect(path).is_ok()
     }
   }
@@ -511,6 +650,13 @@ mod imp {
   /// windows outside the caller's own session to signal.
   #[cfg(not(target_os = "linux"))]
   pub struct MachineQuit;
+
+  #[cfg(not(target_os = "linux"))]
+  impl MachineQuit {
+    pub fn acks(&self) -> Vec<super::QuitAck> {
+      Vec::new()
+    }
+  }
 
   #[cfg(not(target_os = "linux"))]
   pub fn machine_quit() -> Result<MachineQuit, String> {
@@ -542,33 +688,59 @@ mod tests {
     dir.join("quit.sock")
   }
 
-  /// The machine-wide signal exists exactly while the sender holds it, and a
-  /// window sees it by connecting.
+  /// The signal exists exactly while the sender holds it; a window's answer
+  /// travels back on the same connection and is kept by the sender.
   #[test]
-  fn the_machine_signal_is_a_live_socket() {
+  fn the_machine_signal_collects_the_windows_that_answer() {
     let path = socket_path("live");
-    assert!(!imp::machine::requested_at(&path), "nothing is up yet");
+    assert!(!imp::machine::request_at(&path), "nothing is up yet");
     let guard = imp::machine::machine_quit_at(path.clone()).expect("bind");
-    assert!(imp::machine::requested_at(&path), "the signal is up");
+    assert!(imp::machine::request_at(&path), "the signal is up");
+    // The accept thread reads the answer asynchronously.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while guard.acks().is_empty() && std::time::Instant::now() < deadline {
+      std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let acks = guard.acks();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].uid, me);
+    assert_eq!(acks[0].pid, std::process::id());
     drop(guard);
-    assert!(!imp::machine::requested_at(&path), "dropping withdraws it");
+    assert!(!imp::machine::request_at(&path), "dropping withdraws it");
     assert!(!path.exists(), "and removes the socket file");
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
   }
 
-  /// A marker left by a crashed sender is dead, not a request, and the next
+  /// A socket left by a crashed sender is dead, not a request, and the next
   /// sender replaces it instead of failing.
   #[test]
   fn a_stale_socket_is_not_a_request() {
     let path = socket_path("stale");
     std::fs::write(&path, b"").expect("stale file");
     assert!(
-      !imp::machine::requested_at(&path),
+      !imp::machine::request_at(&path),
       "a plain file says nothing"
     );
     let guard = imp::machine::machine_quit_at(path.clone()).expect("replace");
-    assert!(imp::machine::requested_at(&path));
+    assert!(imp::machine::request_at(&path));
     drop(guard);
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+  }
+
+  /// The record is line-based, one line per user, so `postinst` can read it
+  /// with `awk` – and two sessions of one user come back once.
+  #[test]
+  fn the_record_names_each_user_once() {
+    let text = imp::record_text(
+      &[
+        QuitAck { uid: 1000, pid: 1 },
+        QuitAck { uid: 1000, pid: 2 },
+        QuitAck { uid: 1001, pid: 3 },
+      ],
+      123,
+    );
+    assert_eq!(text, "at 123\nuid 1000\nuid 1001\n");
   }
 }

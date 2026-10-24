@@ -487,9 +487,10 @@ fn run(cli: Cli) -> Result<(), String> {
   // and stay up just long enough for every window to see it. Nothing else -
   // no config, no core, no window.
   if cli.signal_only {
-    let signal = single::machine_quit()?;
-    std::thread::sleep(Duration::from_millis(1000));
-    drop(signal);
+    // The elevated half of `quit --all-sessions`: raise the machine-wide signal,
+    // give every window time to answer, write the record an upgrade reads, and
+    // exit. Nothing else - no config, no core, no window.
+    finish_machine_quit(single::machine_quit()?);
     return Ok(());
   }
   // Effective settings: config file first, explicit CLI flags win.
@@ -833,10 +834,7 @@ fn run(cli: Cli) -> Result<(), String> {
         match single::machine_quit() {
           Ok(signal) => {
             let waited = single::quit_and_wait(budget);
-            // A window in another session only looks when its event loop
-            // wakes, so the signal stays up for a moment after the wait.
-            std::thread::sleep(Duration::from_millis(1000));
-            drop(signal);
+            finish_machine_quit(signal);
             return waited;
           }
           Err(e) if crate::elevate::is_elevated() => return Err(e),
@@ -851,6 +849,22 @@ fn run(cli: Cli) -> Result<(), String> {
       single::quit_and_wait(budget)
     }
   }
+}
+
+/// Keep the machine-wide signal up long enough for every window to see it and
+/// answer, then write the record an upgrade uses to put those windows back.
+///
+/// Only an elevated process may write the record: it names other users, and an
+/// installer is the only thing that reads it.
+fn finish_machine_quit(signal: single::MachineQuit) {
+  std::thread::sleep(Duration::from_millis(1000));
+  if crate::elevate::is_elevated() {
+    let acks = signal.acks();
+    if let Err(e) = single::write_quit_record(&acks) {
+      eprintln!("{e}");
+    }
+  }
+  drop(signal);
 }
 
 /// Connect to the running core, or explain how to start it.
