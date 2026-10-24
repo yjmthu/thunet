@@ -3763,6 +3763,7 @@ dependencies = [
  "eframe",
  "getrandom 0.3.4",
  "gtk",
+ "image",
  "interprocess",
  "libc",
  "md-5",

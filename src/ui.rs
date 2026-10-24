@@ -196,42 +196,86 @@ fn heartbeat_fraction(elapsed: Duration, period: Duration) -> f32 {
   (elapsed.as_secs_f32() / period.as_secs_f32()).clamp(0.0, 1.0)
 }
 
-/// The ring beside the state label: it restarts on every status answer and
-/// turns amber after the core has missed a whole cycle.
-fn heartbeat_ring(ui: &mut egui::Ui, state: State, at: Option<Instant>, t: &Texts) {
-  const SIDE: f32 = 14.0;
-  const STROKE: f32 = 2.0;
+/// The turtle that walks the status track.
+///
+/// It stands on a fixed-length line and its position is how far the current
+/// poll period has run, so the line itself never changes length. It waits at
+/// the right end, and the line turns amber, once the core has missed a whole
+/// cycle.
+fn status_track(
+  ui: &mut egui::Ui,
+  state: State,
+  at: Option<Instant>,
+  turtle: Option<&egui::TextureHandle>,
+  t: &Texts,
+) {
+  const TURTLE: f32 = 18.0;
+  const TRACK: f32 = 2.0;
+  /// The line sits where an underline would: the row's bottom edge is the line
+  /// box's descent, so the track goes just above it, then up again by its own
+  /// thickness so the gap reads the same from both sides. The turtle stands on
+  /// the line, which is what makes the pair read as one block.
+  const UNDERLINE: f32 = 1.5;
+  /// Room the header keeps on the right for its gear or back button.
+  const BUTTON: f32 = 34.0;
+
   let period = if state == State::Online {
     POLL_ONLINE
   } else {
     POLL_OFFLINE
   };
-  let (rect, resp) = ui.allocate_exact_size(egui::vec2(SIDE, SIDE), egui::Sense::hover());
+  let width = (ui.available_width() - BUTTON).max(40.0);
+  let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, TURTLE), egui::Sense::hover());
   let painter = ui.painter();
-  let center = rect.center();
-  let radius = SIDE / 2.0 - STROKE / 2.0;
-  let track = ui.visuals().widgets.noninteractive.bg_stroke.color;
-  painter.circle_stroke(center, radius, egui::Stroke::new(STROKE, track));
+  let mid = rect.bottom() - UNDERLINE - TRACK;
 
   let elapsed = at.map_or(Duration::ZERO, |instant| instant.elapsed());
-  let fraction = heartbeat_fraction(elapsed, period);
-  let color = match at {
-    None => ui.visuals().weak_text_color(),
-    Some(_) if elapsed > period.mul_f32(1.8) => level_color(Level::Warn, ui.visuals()),
-    Some(_) => state_color(state),
+  let late = at.is_some_and(|_| elapsed > period.mul_f32(1.8));
+  let color = if late {
+    level_color(Level::Warn, ui.visuals())
+  } else {
+    ui.visuals().weak_text_color().gamma_multiply(0.35)
   };
-  if fraction > 0.0 {
-    let steps = (64.0 * fraction).ceil() as usize;
-    let start = -std::f32::consts::FRAC_PI_2;
-    let points: Vec<egui::Pos2> = (0..=steps)
-      .map(|i| {
-        let angle = start + std::f32::consts::TAU * fraction * i as f32 / steps as f32;
-        center + egui::vec2(radius * angle.cos(), radius * angle.sin())
-      })
-      .collect();
-    painter.add(egui::Shape::line(points, egui::Stroke::new(STROKE, color)));
+  painter.rect_filled(
+    egui::Rect::from_min_size(
+      egui::pos2(rect.left(), mid - TRACK / 2.0),
+      egui::vec2(rect.width(), TRACK),
+    ),
+    egui::CornerRadius::ZERO,
+    color,
+  );
+
+  if let Some(turtle) = turtle {
+    let x = rect.left() + turtle_x(heartbeat_fraction(elapsed, period), rect.width(), TURTLE);
+    painter.image(
+      turtle.id(),
+      egui::Rect::from_min_size(egui::pos2(x, mid - TURTLE), egui::vec2(TURTLE, TURTLE)),
+      // Mirrored: the sprite is drawn facing left, and the turtle has to walk
+      // towards the right end of the track.
+      egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0)),
+      egui::Color32::WHITE,
+    );
   }
   let _ = resp.on_hover_text(t.heartbeat_hint);
+}
+
+/// Where the turtle's left edge sits on a track of `width`, so it never walks
+/// off either end.
+fn turtle_x(progress: f32, width: f32, sprite: f32) -> f32 {
+  progress.clamp(0.0, 1.0) * (width - sprite).max(0.0)
+}
+
+/// The turtle sprite, decoded once and uploaded on first use.
+fn load_turtle(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+  let image = image::load_from_memory(include_bytes!("../assets/turtle.png"))
+    .ok()?
+    .to_rgba8();
+  let size = [image.width() as usize, image.height() as usize];
+  Some(ctx.load_texture(
+    "thunet-turtle",
+    egui::ColorImage::from_rgba_unmultiplied(size, &image.into_raw()),
+    egui::TextureOptions::LINEAR,
+  ))
 }
 
 /// `config.json`'s `theme` setting ("auto" | "light" | "dark"), as egui wants
@@ -353,9 +397,11 @@ pub struct App {
   next_uplink: Instant,
   state: State,
   info: Info,
-  /// When the last status answer arrived. The ring beside the state label
-  /// advances over one poll period and restarts here.
+  /// When the last status answer arrived. The turtle beside the state label
+  /// walks one poll period from here.
   last_heartbeat: Option<Instant>,
+  /// The turtle sprite, uploaded on first use and kept alive by the handle.
+  turtle: Option<egui::TextureHandle>,
   /// The device badge was clicked and its list is showing.
   devices_open: bool,
   logs: Vec<Line>,
@@ -600,6 +646,7 @@ impl App {
       state: State::Offline,
       info: Info::default(),
       last_heartbeat: None,
+      turtle: None,
       devices_open: false,
       logs,
       last_error: None,
@@ -1611,8 +1658,8 @@ impl App {
                 .size(18.0),
             );
             ui.label(egui::RichText::new(label).size(18.0).strong());
-            ui.add_space(2.0);
-            heartbeat_ring(ui, self.state, self.last_heartbeat, t);
+            ui.add_space(6.0);
+            status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
           } else {
             // The same gear as the button that opened this page, so the two
             // read as the same place.
@@ -3702,9 +3749,9 @@ mod tests {
     assert_eq!(info_from(&v).ip4, "198.51.100.7");
   }
 
-  /// The heartbeat ring is full after one poll period and never wraps.
+  /// The walk is a full period long and never wraps.
   #[test]
-  fn heartbeat_ring_tracks_one_poll_period() {
+  fn heartbeat_tracks_one_poll_period() {
     let period = Duration::from_secs(15);
     assert_eq!(heartbeat_fraction(Duration::ZERO, period), 0.0);
     assert!((heartbeat_fraction(Duration::from_secs_f32(7.5), period) - 0.5).abs() < 0.01);
@@ -3714,6 +3761,16 @@ mod tests {
       heartbeat_fraction(Duration::from_secs(1), Duration::ZERO),
       0.0
     );
+  }
+
+  /// The turtle walks the whole track and stops at both ends of it.
+  #[test]
+  fn the_turtle_stays_on_its_track() {
+    assert_eq!(turtle_x(0.0, 100.0, 18.0), 0.0);
+    assert!((turtle_x(0.5, 100.0, 18.0) - 41.0).abs() < 1e-3);
+    assert_eq!(turtle_x(1.0, 100.0, 18.0), 82.0);
+    assert_eq!(turtle_x(3.0, 100.0, 18.0), 82.0, "no walking past the end");
+    assert_eq!(turtle_x(-1.0, 100.0, 18.0), 0.0);
   }
 
   /// The account badge counts what the portal lists and marks this machine.
@@ -4015,6 +4072,9 @@ impl App {
 
 impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    if self.turtle.is_none() {
+      self.turtle = load_turtle(ctx);
+    }
     // The stored theme is pushed here rather than in `App::new`, which runs
     // before there is a context to apply it to. `applied_theme` remembers what
     // was sent, so this is a no-op on the frames in between. It holds the
@@ -4327,7 +4387,15 @@ impl eframe::App for App {
       .set_enabled(self.state == State::Online && self.portal_verbs());
 
     // When hidden, wake up often enough to pick up a second launch quickly.
-    let tick = if self.shown { 500 } else { 200 };
+    // The turtle walks a short track, so the status page needs a finer tick
+    // than the rest of the window.
+    let tick = if !self.shown {
+      200
+    } else if self.page == Page::Status {
+      60
+    } else {
+      500
+    };
     ctx.request_repaint_after(Duration::from_millis(tick));
   }
 

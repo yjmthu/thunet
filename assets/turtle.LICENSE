@@ -1,0 +1,9 @@
+Turtle icon for the status row.
+
+Source: Fluent Emoji (Microsoft), `assets/Turtle/3D/turtle_3d.png`
+<https://github.com/microsoft/fluentui-emoji>
+
+License: MIT
+Copyright (c) Microsoft Corporation.
+
+The file is used unmodified and is embedded in the binary by `src/ui.rs`.

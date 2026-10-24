@@ -44,6 +44,9 @@ interprocess = "2.4.6"
 # in this crate.
 rpassword = "7.5"
 ctrlc = "3.5"
+# Decodes `assets/turtle.png` (already in the tree through eframe, so enabling it
+# here adds no new crates; the `png` feature is all the icon needs).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 lto = true
