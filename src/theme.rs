@@ -69,12 +69,12 @@ pub fn watch(ctx: eframe::egui::Context) {
   /// A portal that is not answering must not hold up the first frame.
   const TIMEOUT_MS: i32 = 1_000;
 
-  let publish = |value: Option<u32>| {
-    let scheme = match value {
-      Some(1) => DARK,
-      Some(2) => LIGHT,
-      _ => UNKNOWN,
-    };
+  // `color-scheme` is 1 (prefer dark), 2 (prefer light) or 0 (no preference).
+  // GNOME writes `default` for its light style, so 0 counts as light here: only
+  // an explicit prefer-dark means dark. `UNKNOWN` is reserved for a portal that
+  // did not answer at all, which keeps egui's own fallback.
+  let publish = |value: u32| {
+    let scheme = if value == 1 { DARK } else { LIGHT };
     SCHEME.store(scheme, Ordering::Relaxed);
   };
 
@@ -100,8 +100,10 @@ pub fn watch(ctx: eframe::egui::Context) {
         return;
       };
       if namespace == NAMESPACE && key == KEY {
-        publish(value.get::<u32>());
-        ctx.request_repaint();
+        if let Some(value) = value.get::<u32>() {
+          publish(value);
+          ctx.request_repaint();
+        }
       }
     },
   );
@@ -118,12 +120,13 @@ pub fn watch(ctx: eframe::egui::Context) {
     TIMEOUT_MS,
     gio::Cancellable::NONE,
   );
-  publish(
-    reply
-      .ok()
-      .and_then(|r| r.get::<(glib::Variant,)>())
-      .and_then(|(v,)| v.get::<u32>()),
-  );
+  if let Some(value) = reply
+    .ok()
+    .and_then(|r| r.get::<(glib::Variant,)>())
+    .and_then(|(v,)| v.get::<u32>())
+  {
+    publish(value);
+  }
 }
 
 #[cfg(not(target_os = "linux"))]
