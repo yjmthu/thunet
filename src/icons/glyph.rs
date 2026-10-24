@@ -97,6 +97,98 @@ fn segment_alpha(p: (f32, f32), a: (f32, f32), b: (f32, f32), half: f32) -> f32 
   1.0 - ramp(d, half - 0.012, half + 0.012)
 }
 
+/// Open eye: shows that private values are on screen.
+pub fn eye_open_image() -> egui::ColorImage {
+  eye_image(true)
+}
+
+/// Closed eye: shows that private values are masked.
+pub fn eye_closed_image() -> egui::ColorImage {
+  eye_image(false)
+}
+
+/// The privacy eye, drawn the way the other header glyphs are.
+///
+/// The open eye is a lens, i.e. the intersection of two discs, so the two lids
+/// meet without a corner; the pupil is a filled disc inside it. The closed eye
+/// is a lid curving downwards with three lashes, which stays readable at 15 px
+/// where an open eye with a slash does not.
+fn eye_image(open: bool) -> egui::ColorImage {
+  const S: usize = 64;
+  const HALF: f32 = 0.045;
+  // Lens geometry, in units of the icon's own size. A round eye: the first
+  // shape was 2.5:1 and read as a line with a bump at 15 px, this one is about
+  // 1.3:1.
+  const R: f32 = 0.42;
+  const D: f32 = 0.10;
+
+  let mut strokes: Vec<((f32, f32), (f32, f32))> = Vec::new();
+  let mut discs: Vec<((f32, f32), f32)> = Vec::new();
+
+  if open {
+    let edge = (R * R - D * D).sqrt();
+    let steps = 24;
+    let mut upper = Vec::with_capacity(steps + 1);
+    let mut lower = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+      let x = -edge + 2.0 * edge * i as f32 / steps as f32;
+      let bulge = (R * R - x * x).max(0.0).sqrt();
+      upper.push((0.5 + x, 0.5 + D - bulge));
+      lower.push((0.5 + x, 0.5 - D + bulge));
+    }
+    let mut outline: Vec<(f32, f32)> = upper;
+    outline.extend(lower.into_iter().rev());
+    for pair in outline.windows(2) {
+      strokes.push((pair[0], pair[1]));
+    }
+    if let (Some(first), Some(last)) = (outline.first(), outline.last()) {
+      strokes.push((*last, *first));
+    }
+    discs.push(((0.5, 0.5), 0.15));
+  } else {
+    // A lid whose middle is its lowest point, with lashes fanning out below it.
+    let steps = 24;
+    let mut arc = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+      let x = -0.38 + 0.76 * i as f32 / steps as f32;
+      let y = 0.60 - 0.20 * (x / 0.38).powi(2);
+      arc.push((0.5 + x, y));
+    }
+    for pair in arc.windows(2) {
+      strokes.push((pair[0], pair[1]));
+    }
+    for (x, y, dx, dy) in [
+      (-0.22, 0.533, -0.08, 0.09),
+      (0.0, 0.60, 0.0, 0.10),
+      (0.22, 0.533, 0.08, 0.09),
+    ] {
+      strokes.push(((0.5 + x, y), (0.5 + x + dx, y + dy)));
+    }
+  }
+
+  let s = S as f32;
+  let mut rgba = vec![0u8; S * S * 4];
+  for y in 0..S {
+    for x in 0..S {
+      let p = ((x as f32 + 0.5) / s, (y as f32 + 0.5) / s);
+      let mut alpha = strokes
+        .iter()
+        .map(|&(from, to)| segment_alpha(p, from, to, HALF))
+        .fold(0.0, f32::max);
+      for &(centre, radius) in &discs {
+        let d = ((p.0 - centre.0).powi(2) + (p.1 - centre.1).powi(2)).sqrt();
+        alpha = alpha.max(1.0 - ramp(d, radius - 0.012, radius + 0.012));
+      }
+      let i = (y * S + x) * 4;
+      rgba[i] = 255;
+      rgba[i + 1] = 255;
+      rgba[i + 2] = 255;
+      rgba[i + 3] = (alpha * 255.0).round() as u8;
+    }
+  }
+  egui::ColorImage::from_rgba_unmultiplied([S, S], &rgba)
+}
+
 /// Upload an icon once and hand the same handle out afterwards.
 ///
 /// `load_texture` allocates a new GPU texture on every call, and the window is
@@ -176,4 +268,26 @@ pub fn close_button(ui: &mut egui::Ui) -> egui::Response {
     );
   }
   resp
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn coverage(image: &egui::ColorImage) -> usize {
+    image.pixels.iter().filter(|p| p.a() > 0).count()
+  }
+
+  /// Both eye states have to draw something, and they have to differ: the
+  /// button is the only cue for what privacy mode is doing.
+  #[test]
+  fn the_privacy_eye_has_two_states() {
+    let open = eye_open_image();
+    let closed = eye_closed_image();
+    assert!(coverage(&open) > 100, "the open eye is drawn");
+    assert!(coverage(&closed) > 100, "the closed eye is drawn");
+    let centre = |img: &egui::ColorImage| img.pixels[32 * 64 + 32].a();
+    assert_eq!(centre(&open), 255, "the open eye has a pupil");
+    assert_eq!(centre(&closed), 0, "the closed eye is only a lid");
+  }
 }

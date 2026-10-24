@@ -45,6 +45,11 @@ pub struct Config {
   pub log_level: String,
   /// Window theme: "auto" (follow the system) | "light" | "dark".
   pub theme: String,
+  /// Whether the account and the addresses are masked on screen. Off by
+  /// default: the app is for the machine it runs on, and a configuration
+  /// written before this field existed has never been masked.
+  #[serde(default)]
+  pub privacy: bool,
 }
 
 impl Default for Config {
@@ -64,6 +69,7 @@ impl Default for Config {
       lang: "auto".into(),
       log_level: "info".into(),
       theme: "auto".into(),
+      privacy: false,
     }
   }
 }
@@ -324,6 +330,7 @@ mod tests {
     let cfg: Config = serde_json::from_str(old).expect("an old config still loads");
     assert!(!cfg.auto_connect, "the stored value is kept");
     assert!(cfg.keep_online, "absent means the previous behaviour");
+    assert!(!cfg.privacy, "absent means nothing is masked");
   }
 
   /// The endpoint and the single-instance guard are keyed by this tag, so it

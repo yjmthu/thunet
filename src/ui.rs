@@ -26,7 +26,8 @@ use crate::core::{POLL_OFFLINE, POLL_ONLINE};
 use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
-  gear_image, heading_icon, icon_button, icon_texture, make_icon, paint_device_icon,
+  eye_closed_image, eye_open_image, gear_image, heading_icon, icon_button, icon_texture, make_icon,
+  paint_device_icon,
 };
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
@@ -88,6 +89,35 @@ fn norm_ip(s: &str) -> String {
     String::new()
   } else {
     t.to_string()
+  }
+}
+
+/// What a private value looks like when privacy is on.
+///
+/// Addresses keep the length of their family, because the row label already says
+/// which family it is; an account gets a fixed run, so its length is not on
+/// screen.
+const MASK: &str = "•••••";
+const MASK_IP4: &str = "•••••••••";
+const MASK_IP6: &str = "••••••••••••••••";
+
+fn mask_for(value: &str) -> &'static str {
+  if value.contains(':') {
+    MASK_IP6
+  } else if value.contains('.') {
+    MASK_IP4
+  } else {
+    MASK
+  }
+}
+
+/// The account and the addresses are private; the row label, the session
+/// traffic and the device types are not.
+fn private_value(value: &str, hidden: bool) -> &str {
+  if hidden && !value.is_empty() && value != "—" {
+    mask_for(value)
+  } else {
+    value
   }
 }
 
@@ -216,8 +246,9 @@ fn status_track(
   /// thickness so the gap reads the same from both sides. The turtle stands on
   /// the line, which is what makes the pair read as one block.
   const UNDERLINE: f32 = 1.5;
-  /// Room the header keeps on the right for its gear or back button.
-  const BUTTON: f32 = 34.0;
+  /// Room the header keeps on the right for its buttons: the settings or back
+  /// button, and on the status page the privacy eye beside it.
+  const BUTTON: f32 = 72.0;
 
   let period = if state == State::Online {
     POLL_ONLINE
@@ -466,6 +497,9 @@ pub struct App {
   gear: Option<egui::TextureHandle>,
   /// The arrow in the settings page's *Back* button, likewise.
   back_arrow: Option<egui::TextureHandle>,
+  /// The privacy eye in the status header, one texture per state.
+  eye_open: Option<egui::TextureHandle>,
+  eye_closed: Option<egui::TextureHandle>,
   connect_item: MenuItem,
   disconnect_item: MenuItem,
   show_item: MenuItem,
@@ -677,6 +711,8 @@ impl App {
       tray_rgb: Some(color_for(State::Offline)),
       gear: None,
       back_arrow: None,
+      eye_open: None,
+      eye_closed: None,
       connect_item,
       disconnect_item,
       show_item,
@@ -1689,6 +1725,38 @@ impl App {
                 Page::Settings => Page::Status,
               };
             }
+            // Right to left, so this lands to the *left* of the gear. The eye
+            // is the status page's shortcut to privacy mode, which otherwise
+            // only lives in the settings page.
+            if self.page == Page::Status {
+              let hidden = self.cfg.privacy;
+              let (name, image, tip) = if hidden {
+                (
+                  "thunet_eye_closed",
+                  eye_closed_image as fn() -> egui::ColorImage,
+                  t.privacy_show,
+                )
+              } else {
+                (
+                  "thunet_eye_open",
+                  eye_open_image as fn() -> egui::ColorImage,
+                  t.privacy_hide,
+                )
+              };
+              let slot = if hidden {
+                &mut self.eye_closed
+              } else {
+                &mut self.eye_open
+              };
+              let eye = icon_texture(slot, ui.ctx(), name, image);
+              if ui.add(icon_button(eye.id())).on_hover_text(tip).clicked() {
+                self.cfg.privacy = !self.cfg.privacy;
+                if let Err(e) = self.cfg.save() {
+                  self.cfg.privacy = !self.cfg.privacy;
+                  self.toast_err(e);
+                }
+              }
+            }
           });
         });
 
@@ -1705,6 +1773,7 @@ impl App {
           } else {
             self.info.name.clone()
           };
+          let account = private_value(&account, self.cfg.privacy);
           egui::Grid::new("info")
             .num_columns(2)
             .spacing([12.0, 6.0])
@@ -1719,13 +1788,13 @@ impl App {
               ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
               ui.end_row();
               ui.label(t.ipv4);
-              if address_cell(ui, &self.info.ip4, t) {
+              if address_cell(ui, private_value(&self.info.ip4, self.cfg.privacy), t) {
                 ui.ctx().copy_text(self.info.ip4.clone());
                 self.toast_ok(t.copied.to_string());
               }
               ui.end_row();
               ui.label(t.ipv6);
-              if address_cell(ui, &self.info.ip6, t) {
+              if address_cell(ui, private_value(&self.info.ip6, self.cfg.privacy), t) {
                 ui.ctx().copy_text(self.info.ip6.clone());
                 self.toast_ok(t.copied.to_string());
               }
@@ -2002,15 +2071,31 @@ impl App {
             });
           });
           ui.add_space(2.0);
-          if ui.button(t.desktop_shortcut).clicked() {
-            match crate::shortcut::create_desktop_shortcut() {
-              Ok(()) => self.toast_ok(t.done.to_string()),
-              Err(e) => {
-                self.push_log(Line::error(&e));
+          ui.horizontal(|ui| {
+            // Privacy is window-only state: it changes what is drawn, never
+            // what is stored or sent, so it is saved here and nowhere else.
+            let label = if self.cfg.privacy {
+              t.privacy_show
+            } else {
+              t.privacy_hide
+            };
+            if ui.button(label).clicked() {
+              self.cfg.privacy = !self.cfg.privacy;
+              if let Err(e) = self.cfg.save() {
+                self.cfg.privacy = !self.cfg.privacy;
                 self.toast_err(e);
               }
             }
-          }
+            if ui.button(t.desktop_shortcut).clicked() {
+              match crate::shortcut::create_desktop_shortcut() {
+                Ok(()) => self.toast_ok(t.done.to_string()),
+                Err(e) => {
+                  self.push_log(Line::error(&e));
+                  self.toast_err(e);
+                }
+              }
+            }
+          });
 
           ui.add_space(2.0);
           // The rule under the shortcut button is unconditional: it is the line
@@ -2048,10 +2133,16 @@ impl App {
           ui.horizontal(|ui| {
             let label_w = field_label_width(ui, t);
             field_label(ui, t.account, label_w);
-            ui.add_enabled(
-              credentials_live,
-              egui::TextEdit::singleline(&mut self.user_edit).desired_width(FIELD_WIDTH),
-            );
+            let id = ui.make_persistent_id("thunet-account-field");
+            let mut edit = egui::TextEdit::singleline(&mut self.user_edit)
+              .id(id)
+              .desired_width(FIELD_WIDTH);
+            // Privacy mode keeps the account off the screen, but a masked edit
+            // box could not be typed into: it unmasks while it has the focus.
+            if self.cfg.privacy && !ui.ctx().memory(|m| m.has_focus(id)) {
+              edit = edit.password(true);
+            }
+            ui.add_enabled(credentials_live, edit);
             if stored.username {
               unsaved_marker(ui, t);
             }
@@ -2369,7 +2460,7 @@ impl App {
     let n = self.info.devices_total;
     let mut open = true;
     let modal = egui::Modal::new(egui::Id::unique("thunet_devices_popup")).show(ctx, |ui| {
-      devices_list(ui, devices, n, t, &mut open);
+      devices_list(ui, devices, n, t, &mut open, self.cfg.privacy);
     });
     // The dimmed backdrop and Escape are the framework's own dismissal, so the
     // close button is one more way out rather than the only one.
@@ -2403,6 +2494,7 @@ fn devices_list(
   n: usize,
   t: &Texts,
   open: &mut bool,
+  privacy: bool,
 ) -> DevicesLayout {
   let title = format!("{}{n}", t.devices_title);
   let body = egui::TextStyle::Body.resolve(ui.style());
@@ -2417,7 +2509,7 @@ fn devices_list(
   let mut addr_w = 0.0_f32;
   let mut kind_w = 0.0_f32;
   for d in devices {
-    let addr = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+    let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
     let kind = &d.class;
     addr_w = addr_w.max(measure(addr, &mono));
     kind_w = kind_w.max(measure(kind, &body).min(DEVICES_KIND_MAX));
@@ -2480,7 +2572,7 @@ fn devices_list(
               ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::hover());
             paint_device_icon(ui.painter(), icon, device_kind(&d.os, &d.class), ink, bg);
             fixed_cell(ui, (&d.id, "addr"), addr_w, row_h, |ui| {
-              let addr = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+              let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
               // `truncate` elides at the column's width and, by default, shows
               // the whole address on hover when it had to.
               ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
@@ -3775,6 +3867,21 @@ mod tests {
     assert_eq!(turtle_x(-1.0, 100.0, 18.0), 0.0);
   }
 
+  /// Privacy mode replaces the account and the addresses with dots; addresses
+  /// keep their family's length, and an empty value or the "no session" dash
+  /// stay as they are.
+  #[test]
+  fn private_values_are_masked() {
+    assert_eq!(private_value("192.0.2.10", true), MASK_IP4);
+    assert_eq!(private_value("2001:db8::1", true), MASK_IP6);
+    assert_eq!(private_value("1234567890", true), MASK);
+    assert_eq!(private_value("1234567890", false), "1234567890");
+    assert_eq!(private_value("", true), "");
+    assert_eq!(private_value("—", true), "—");
+    assert_eq!(MASK_IP4.chars().count(), 9);
+    assert!(MASK_IP6.chars().count() > MASK_IP4.chars().count());
+  }
+
   /// The account badge counts what the portal lists and marks this machine.
   /// Documentation addresses (RFC 5737 / RFC 3849) and made-up session ids.
   #[test]
@@ -3863,7 +3970,14 @@ mod tests {
     let mut out = ctx.run_ui(input, |ui| {
       egui::CentralPanel::default().show(ui, |ui| {
         let mut open = true;
-        layout = Some(devices_list(ui, &devices, devices.len(), t, &mut open));
+        layout = Some(devices_list(
+          ui,
+          &devices,
+          devices.len(),
+          t,
+          &mut open,
+          false,
+        ));
       });
     });
     out.textures_delta.clear();
@@ -4374,7 +4488,11 @@ impl eframe::App for App {
     #[cfg(windows)]
     {
       let tip = match self.state {
-        State::Online => format!("{} · {label} · {}", app_name(), dash(&self.info.ip4)),
+        State::Online => format!(
+          "{} · {label} · {}",
+          app_name(),
+          dash(private_value(&self.info.ip4, self.cfg.privacy))
+        ),
         _ => format!("{} · {label}", app_name()),
       };
       if let Some(tray) = &self.tray {

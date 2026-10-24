@@ -12,5 +12,6 @@ mod glyph;
 pub use app::{app_fill, app_icon, color_for, make_icon};
 pub use device::{DeviceKind, device_kind, paint_device_icon};
 pub use glyph::{
-  back_arrow_image, close_button, gear_image, heading_icon, icon_button, icon_texture,
+  back_arrow_image, close_button, eye_closed_image, eye_open_image, gear_image, heading_icon,
+  icon_button, icon_texture,
 };

@@ -225,6 +225,10 @@ pub struct Texts {
   pub show_window: &'static str,
   pub hide_window: &'static str,
   pub desktop_shortcut: &'static str,
+  /// The privacy toggle. A button, so its label is the action it performs
+  /// rather than the state it is in.
+  pub privacy_hide: &'static str,
+  pub privacy_show: &'static str,
   pub done: &'static str,
   pub quit: &'static str,
 }
@@ -373,6 +377,8 @@ static ZH: Texts = Texts {
   show_window: "显示窗口",
   hide_window: "隐藏窗口",
   desktop_shortcut: "创建桌面快捷方式",
+  privacy_hide: "隐藏隐私信息",
+  privacy_show: "显示隐私信息",
   done: "完成",
   quit: "退出",
 };
@@ -492,6 +498,8 @@ static EN: Texts = Texts {
   show_window: "Show window",
   hide_window: "Hide window",
   desktop_shortcut: "Create desktop shortcut",
+  privacy_hide: "Hide private info",
+  privacy_show: "Show private info",
   done: "Done",
   quit: "Quit",
 };
