@@ -46,6 +46,27 @@ pub fn quit_and_wait(timeout: std::time::Duration) -> Result<(), String> {
   imp::quit_and_wait(timeout)
 }
 
+/// Raise the machine-wide "every window ends" signal.
+///
+/// The per-user doorbells above cannot cross a session, and the core that used
+/// to relay a broadcast may not be running at all - exactly the state an
+/// uninstall often finds the machine in. This signal is machine-scoped and
+/// needs no core; windows in machine mode poll it and end themselves, while a
+/// portable window ignores it. Dropping the guard withdraws it.
+pub fn machine_quit() -> Result<MachineQuit, String> {
+  imp::machine_quit()
+}
+
+/// Has a machine-wide quit been asked for right now?
+///
+/// Machine-mode windows poll this every frame; portable ones never do, because
+/// an uninstall leaves them alone.
+pub fn machine_quit_requested() -> bool {
+  imp::machine_quit_requested()
+}
+
+pub use imp::MachineQuit;
+
 /// Best-effort cleanup before `std::process::exit`, which skips [`Guard::drop`].
 ///
 /// Windows releases the mutex when the process ends; only the Unix lock file
@@ -204,6 +225,91 @@ mod imp {
       unsafe { CloseHandle(handle as _) };
     }
   }
+
+  /// The machine-wide quit event.
+  ///
+  /// `Local\` names end at the session boundary, so the per-user doorbells
+  /// cannot reach a window in another session. This name lives in `Global\`,
+  /// and it exists only while the process that raised it holds the handle — no
+  /// stale marker can end a later window. Only an elevated process may create
+  /// it; anyone may open it with `SYNCHRONIZE` just to look.
+  const MACHINE_QUIT_NAME: &str = r"Global\thunet-machine-quit";
+  /// SYSTEM and administrators may set it; interactive users may only wait.
+  const MACHINE_QUIT_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;IU)";
+
+  pub struct MachineQuit {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+  }
+
+  impl Drop for MachineQuit {
+    fn drop(&mut self) {
+      // SAFETY: the handle came from CreateEventW and is closed exactly once.
+      unsafe { CloseHandle(self.handle) };
+    }
+  }
+
+  pub fn machine_quit() -> Result<MachineQuit, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+      ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let sddl = wide(MACHINE_QUIT_SDDL);
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: both pointers are valid for the call; the descriptor is released
+    // below.
+    let ok = unsafe {
+      ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl.as_ptr(),
+        SDDL_REVISION_1,
+        &mut descriptor,
+        std::ptr::null_mut(),
+      )
+    };
+    if ok == 0 || descriptor.is_null() {
+      // SAFETY: plain call with no arguments.
+      let err = unsafe { GetLastError() };
+      return Err(format!("cannot parse the quit DACL (error {err})"));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+      nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+      lpSecurityDescriptor: descriptor,
+      bInheritHandle: 0,
+    };
+    let name = wide(MACHINE_QUIT_NAME);
+    // Manual reset: every waiting window has to see the request, not just the
+    // first one. The name lives in the Global namespace, which needs
+    // SeCreateGlobalPrivilege - i.e. the administrator rights an uninstall has.
+    // SAFETY: the name and the attributes outlive the call.
+    let handle = unsafe { CreateEventW(&attributes, 1, 0, name.as_ptr()) };
+    // SAFETY: the descriptor was allocated by the conversion above.
+    unsafe { LocalFree(descriptor as _) };
+    if handle.is_null() {
+      // SAFETY: plain call with no arguments.
+      let err = unsafe { GetLastError() };
+      return Err(format!(
+        "cannot create the machine quit event (error {err})"
+      ));
+    }
+    // SAFETY: the handle is live.
+    unsafe { SetEvent(handle) };
+    Ok(MachineQuit { handle })
+  }
+
+  pub fn machine_quit_requested() -> bool {
+    let name = wide(MACHINE_QUIT_NAME);
+    // SAFETY: plain Win32 calls on a NUL-terminated name that outlives them.
+    let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+      return false;
+    }
+    // SAFETY: the handle came from OpenEventW.
+    let signaled = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
+    // SAFETY: the handle is closed exactly once.
+    unsafe { CloseHandle(handle) };
+    signaled
+  }
 }
 
 #[cfg(unix)]
@@ -311,6 +417,110 @@ mod imp {
   pub fn release() {
     let _ = std::fs::remove_file(lock_path());
   }
+
+  /// The machine-wide quit channel on Linux: a socket only root can create.
+  ///
+  /// A named event has no direct Unix equivalent; a filesystem socket in `/run`
+  /// is the closest thing with the same properties. It exists only while the
+  /// sender holds it, any user can connect to ask "is it up?", and nobody but
+  /// root can create, replace or remove it, because `/run` belongs to root.
+  #[cfg(target_os = "linux")]
+  pub(super) mod machine {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Fixed name: the signal is per machine, not per user or state directory.
+    const SOCKET: &str = "/run/thunet-quit.sock";
+
+    pub struct MachineQuit {
+      stop: Arc<AtomicBool>,
+      thread: Option<std::thread::JoinHandle<()>>,
+      path: PathBuf,
+    }
+
+    impl Drop for MachineQuit {
+      fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+          let _ = thread.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
+      }
+    }
+
+    pub fn machine_quit() -> Result<MachineQuit, String> {
+      machine_quit_at(PathBuf::from(SOCKET))
+    }
+
+    pub fn machine_quit_requested() -> bool {
+      requested_at(Path::new(SOCKET))
+    }
+
+    /// Bind the signal at `path`. Split out so a test can use a temporary
+    /// directory instead of `/run`.
+    pub(crate) fn machine_quit_at(path: PathBuf) -> Result<MachineQuit, String> {
+      // A crashed sender leaves the socket file behind. It is not listening, so
+      // removing it is safe; only root reaches this code at all.
+      match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot replace {}: {e}", path.display())),
+      }
+      let listener =
+        UnixListener::bind(&path).map_err(|e| format!("cannot bind {}: {e}", path.display()))?;
+      // Connect needs write permission on the socket; creation stays impossible
+      // for users because `/run` itself is root-owned.
+      let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+      let stop = Arc::new(AtomicBool::new(false));
+      let thread = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+          // Every window probes by connecting and sends nothing, so the
+          // connections are accepted and dropped to keep the backlog empty.
+          let _ = listener.set_nonblocking(true);
+          while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+              Ok(_) => {}
+              Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+          }
+        })
+      };
+      Ok(MachineQuit {
+        stop,
+        thread: Some(thread),
+        path,
+      })
+    }
+
+    pub(crate) fn requested_at(path: &Path) -> bool {
+      // A plain file, or a socket whose sender is gone, answers with an error:
+      // a crash must never turn into a spurious quit later.
+      UnixStream::connect(path).is_ok()
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  pub use machine::{MachineQuit, machine_quit, machine_quit_requested};
+
+  /// No machine-wide service on this Unix: a portable-only platform has no
+  /// windows outside the caller's own session to signal.
+  #[cfg(not(target_os = "linux"))]
+  pub struct MachineQuit;
+
+  #[cfg(not(target_os = "linux"))]
+  pub fn machine_quit() -> Result<MachineQuit, String> {
+    Err("this platform has no machine-wide service".into())
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  pub fn machine_quit_requested() -> bool {
+    false
+  }
 }
 
 impl Drop for Guard {
@@ -319,5 +529,46 @@ impl Drop for Guard {
     let _ = std::fs::remove_file(&self.path);
     #[cfg(windows)]
     imp::release();
+  }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+  use super::*;
+
+  fn socket_path(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("thunet-single-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir.join("quit.sock")
+  }
+
+  /// The machine-wide signal exists exactly while the sender holds it, and a
+  /// window sees it by connecting.
+  #[test]
+  fn the_machine_signal_is_a_live_socket() {
+    let path = socket_path("live");
+    assert!(!imp::machine::requested_at(&path), "nothing is up yet");
+    let guard = imp::machine::machine_quit_at(path.clone()).expect("bind");
+    assert!(imp::machine::requested_at(&path), "the signal is up");
+    drop(guard);
+    assert!(!imp::machine::requested_at(&path), "dropping withdraws it");
+    assert!(!path.exists(), "and removes the socket file");
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+  }
+
+  /// A marker left by a crashed sender is dead, not a request, and the next
+  /// sender replaces it instead of failing.
+  #[test]
+  fn a_stale_socket_is_not_a_request() {
+    let path = socket_path("stale");
+    std::fs::write(&path, b"").expect("stale file");
+    assert!(
+      !imp::machine::requested_at(&path),
+      "a plain file says nothing"
+    );
+    let guard = imp::machine::machine_quit_at(path.clone()).expect("replace");
+    assert!(imp::machine::requested_at(&path));
+    drop(guard);
+    let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
   }
 }

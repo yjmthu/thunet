@@ -107,24 +107,24 @@
 
     <!-- Ask every running window to quit, and wait for them. Closing a window
          is not enough (a tray hides itself on WM_CLOSE) and killing it skips
-         its shutdown, so this rings the app's quit doorbell instead.
+         its shutdown, so the command raises the app's own machine-wide quit
+         signal instead.
 
-         One action for the whole machine, not one per session: the core fans
-         `Cmd::QuitAll` out to every attached window, which is the only way to
-         reach a tray in *another* session or *another user's* account — a
-         session-scoped event cannot. Leaving such a window alive is the one
-         outcome that must not happen here: it would keep the old executable
-         mapped (so this step would have aborted a moment later anyway) and,
-         worse, it would drive the new core with the old build's protocol.
+         One signal for the whole machine, not one per session: it is a
+         `Global\` event that every machine-mode window polls, which is the only
+         way to reach a tray in *another* session or *another user's* account —
+         a session-scoped event cannot. It needs no running core; a window that
+         ignores it (a portable setup deliberately does) keeps the old
+         executable mapped and surfaces at InstallValidate, so `Return="check"`
+         here only catches a failure to raise the signal. Raising it needs
+         administrator rights, and this action can run unelevated, so the
+         command asks for elevation itself (UAC); that prompt is expected.
 
          `WixQuietExec` keeps the child's console hidden: a plain immediate
          custom action ran `taskkill` — a console program in the user's session
-         — and flashed a black window on every install. `Return="check"`
-         because the command succeeds when nothing is running, so the only
-         failure left is "a window refused to quit", and aborting is honest
-         there: the next step would try to replace a file that is still
-         mapped. (The all-sessions flag needs no fallback for older builds: no
-         build without it has ever been installed.) -->
+         — and flashed a black window on every install. (The all-sessions flag
+         needs no fallback for older builds: no build without it has ever been
+         installed.) -->
     <!-- The machine flag because an immediate custom action inherits the
          environment of whatever started msiexec: with a leftover
          `THUNET_STATE_DIR` the command would look for a portable endpoint that

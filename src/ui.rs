@@ -1688,9 +1688,6 @@ impl App {
         }
         // Answers to the CLI's one-off questions; the window has no use for them.
         Ev::Status(_) | Ev::AcId(_) => {}
-        // An installer is about to replace the executable: end here instead of
-        // hiding, so the image is gone before the file is (see `quit`).
-        Ev::Quit => self.quit(),
       }
     }
   }
@@ -4409,6 +4406,13 @@ impl eframe::App for App {
     // An installer (or `thunet quit`) asks for a real exit, not the tray's
     // hide-on-close: it needs the image gone before it replaces the file.
     if crate::single::quit_requested() {
+      self.quit();
+    }
+
+    // The machine-wide request reaches windows in other sessions, and unlike
+    // the per-user doorbell above it does not need a core to relay it. Portable
+    // windows are left alone by an uninstall, so they never look.
+    if !crate::ipc::portable() && crate::single::machine_quit_requested() {
       self.quit();
     }
 

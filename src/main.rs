@@ -202,6 +202,13 @@ struct Cli {
   /// Internal: file where the elevated helper records a failure.
   #[arg(long, global = true, hide = true)]
   admin_error: Option<std::path::PathBuf>,
+  /// Internal: raise the machine-wide quit signal and exit.
+  ///
+  /// This is the elevated half of `quit --all-sessions`: it needs administrator
+  /// rights, does no waiting and starts no window, and the caller keeps the
+  /// real budget for the windows in its own session.
+  #[arg(long, global = true, hide = true)]
+  signal_only: bool,
 
   #[command(subcommand)]
   cmd: Option<Cmd>,
@@ -398,13 +405,15 @@ enum Cmd {
     /// Give up (and report) after this many milliseconds.
     #[arg(long, default_value_t = 20_000)]
     timeout: u64,
-    /// Ask the core to end every attached window, not just this session's.
+    /// End every window on the machine, not just this session's.
     ///
     /// The per-session doorbell cannot cross a session, so windows in other
-    /// sessions or other users' accounts survive an upgrade that leaves their
-    /// executable replaced — an old window driving a new core is what the
-    /// protocol check has to refuse. The core already fans its events out to
-    /// every attached frontend, so one request ends them all.
+    /// sessions or other users' accounts would otherwise survive an upgrade
+    /// that leaves their executable replaced. A machine-wide signal reaches
+    /// them and needs no core, so it works even when the service is stopped;
+    /// raising it needs administrator rights, which this command asks for
+    /// through the same helper as the other privileged verbs. A portable setup
+    /// treats the flag as a plain quit.
     #[arg(long)]
     all_sessions: bool,
   },
@@ -474,6 +483,15 @@ fn run(cli: Cli) -> Result<(), String> {
   // is enough - `portable()`, `open_result` and the single-instance names all
   // derive from it, so every downstream decision follows.
   point_at_state_dir(&cli)?;
+  // The elevated half of `quit --all-sessions`: raise the machine-wide signal
+  // and stay up just long enough for every window to see it. Nothing else -
+  // no config, no core, no window.
+  if cli.signal_only {
+    let signal = single::machine_quit()?;
+    std::thread::sleep(Duration::from_millis(1000));
+    drop(signal);
+    return Ok(());
+  }
   // Effective settings: config file first, explicit CLI flags win.
   let mut cfg = config::Config::load();
   if let Some(h) = cli.host.clone() {
@@ -803,99 +821,35 @@ fn run(cli: Cli) -> Result<(), String> {
       timeout,
       all_sessions,
     } => {
-      let timeout = Duration::from_millis(timeout);
-      if all_sessions {
-        quit_all(timeout)?;
+      let budget = Duration::from_millis(timeout);
+      if all_sessions && !ipc::portable() {
+        // The machine-wide signal is the whole mechanism: it needs no core, and
+        // an uninstall often runs with the service already stopped. Raising it
+        // needs administrator rights, so an attempt that fails without them is
+        // retried through the same elevation helper every other privileged
+        // verb uses; the elevated copy raises the signal, holds it for a
+        // moment, and exits. This session's window is closed by the doorbell
+        // afterwards, whichever half ran the signal.
+        match single::machine_quit() {
+          Ok(signal) => {
+            let waited = single::quit_and_wait(budget);
+            // A window in another session only looks when its event loop
+            // wakes, so the signal stays up for a moment after the wait.
+            std::thread::sleep(Duration::from_millis(1000));
+            drop(signal);
+            return waited;
+          }
+          Err(e) if crate::elevate::is_elevated() => return Err(e),
+          Err(_) => {
+            crate::elevate::run_as_admin(&["--machine", "--signal-only"])?;
+            return single::quit_and_wait(budget);
+          }
+        }
       }
-      // This session's own window, and the wait an installer needs before it
-      // may replace the file. A window that was attached to the core is
-      // already gone, so this normally returns at once.
-      single::quit_and_wait(timeout)
+      // Portable: one window per state directory, so "all sessions" is this
+      // setup and nothing machine-wide (or administrator-only) is involved.
+      single::quit_and_wait(budget)
     }
-  }
-}
-
-/// Ask the core to end every attached window, and wait until they are gone.
-///
-/// Only the core can reach windows in other sessions: the per-session doorbell
-/// (`Local\` event, runtime marker) is per session by construction. The wait is
-/// a fact rather than a guess — `Cmd::CoreInfo` reports how many frontends are
-/// still attached, and this connection is one of them.
-fn quit_all(timeout: Duration) -> Result<(), String> {
-  /// How long one question gets. The core answers from its own loop, so a
-  /// single answer can take a beat; a slow answer means "ask again", never
-  /// "nothing is attached", which is why this is not the overall budget.
-  const QUERY: Duration = Duration::from_millis(500);
-  /// Polling interval while waiting for that answer. The answer arrives over a
-  /// socket, so this only has to stay below "instant"; 25 ms is still 40
-  /// wake-ups per second against replies that take hundreds of milliseconds,
-  /// so the interval is never what the user waits for.
-  const POLL: Duration = Duration::from_millis(25);
-
-  let link = match ipc::open_result() {
-    Ok(link) => link,
-    // No core: nobody can be told, and the per-session doorbell the caller
-    // rings afterwards is everything that is left.
-    Err(_) => return Ok(()),
-  };
-  link.send(CoreCmd::QuitAll);
-  let deadline = Instant::now() + timeout;
-  // Whether any answer actually said "more than just me is attached". The two
-  // ways this command can fail are not the same thing: a window that refuses
-  // to quit is a fact, while a core that never answered is only the absence of
-  // one - and the caller (an installer) must not be told a guess.
-  let mut saw_attached = false;
-  loop {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-      return Err(if saw_attached {
-        format!("windows are still attached after {}", brief(timeout))
-      } else {
-        format!(
-          "no answer from the background service within {}",
-          brief(timeout)
-        )
-      });
-    }
-    link.send(CoreCmd::CoreInfo);
-    let ask_until = Instant::now() + remaining.min(QUERY);
-    // Wait for the answer to *this* question only. The log replay, the
-    // broadcast's own `Quit` and anything else on the wire is not news for a
-    // command that exists to end windows, so nothing is echoed here (an
-    // installer would only have to throw it away).
-    let answer = loop {
-      match link.try_recv() {
-        Some(CoreEv::Core(info)) => break Ok(Some(info)),
-        Some(CoreEv::Error(Some(e))) => return Err(e.to_string()),
-        Some(_) => continue,
-        // The core went away (stopped, or being replaced): nothing is attached
-        // to it any more.
-        None if !link.alive() => break Ok(None),
-        // No answer within the question's own budget: the budget for the whole
-        // command may still be there, so try again.
-        None if Instant::now() >= ask_until => break Err(()),
-        None => std::thread::sleep(POLL),
-      }
-    };
-    match answer {
-      // This command counts as a frontend, so one attached means "all done".
-      Ok(Some(info)) if info.frontends > 1 => {
-        saw_attached = true;
-        continue;
-      }
-      Ok(_) => return Ok(()),
-      Err(()) => continue,
-    }
-  }
-}
-
-/// "800 ms" / "15 s" — a timeout the user reads, rather than `Duration`'s
-/// debug form (`400ms`) or a `0 s` that hides a sub-second budget.
-fn brief(d: Duration) -> String {
-  if d.as_secs() >= 1 {
-    format!("{} s", d.as_secs())
-  } else {
-    format!("{} ms", d.as_millis())
   }
 }
 

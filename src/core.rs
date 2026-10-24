@@ -818,18 +818,6 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             std::process::exit(0);
           }
         }
-        Cmd::QuitAll => {
-          // One request, every attached window - across sessions and users,
-          // which is why it goes through the fan-out instead of the
-          // per-session doorbell. The core itself keeps running: the installer
-          // stops the service on its own schedule.
-          tx.send(Ev::Log(Line::info(format!(
-            "asked {} attached window(s) to quit",
-            tx.frontends()
-          ))))
-          .ok();
-          tx.send(Ev::Quit).ok();
-        }
       }
     }
 

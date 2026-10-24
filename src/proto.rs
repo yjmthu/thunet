@@ -85,16 +85,6 @@ pub enum Cmd {
   /// Ask a portable core to exit. A machine core refuses: stopping the service
   /// is the service manager's job, not a frontend's.
   Shutdown,
-  /// Ask every attached window to quit (the installer's entry point).
-  ///
-  /// An upgrade replaces the executable under windows that are still running,
-  /// and an old window talking to a new core is exactly the pairing the
-  /// protocol check has to refuse, so the installer has to end all of them -
-  /// including the ones in other sessions and other users' accounts, which no
-  /// per-session doorbell can reach. The core fans this out through its own
-  /// fan-out, so one request ends every attached frontend; a session with no
-  /// core attached keeps the per-session doorbell as its fallback.
-  QuitAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,13 +252,6 @@ pub enum Ev {
   Credentials(CredentialState),
   /// Answer to [`Cmd::AcId`].
   AcId(String),
-  /// End this window now, because an installer asked through [`Cmd::QuitAll`].
-  ///
-  /// Distinct from closing it: a tray has to hide on close, so this goes
-  /// through the same orderly exit an uninstall uses. Never replayed to a
-  /// late frontend - a window that starts after the installation must not
-  /// read yesterday's news and quit again.
-  Quit,
 }
 
 /// One line on the wire.
