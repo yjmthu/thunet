@@ -121,6 +121,68 @@ fn private_value(value: &str, hidden: bool) -> &str {
   }
 }
 
+/// A character an account name can be made of. Masking stops at the edges of
+/// this class, so the account `bob` does not turn the `bob` in `bobby` into
+/// dots.
+fn account_char(c: char) -> bool {
+  c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '@')
+}
+
+/// The operating system's account name.
+///
+/// It arrives in the log through paths (`config: /home/alice/...`, a state
+/// directory) and through messages about the process itself, so privacy mode
+/// hides it along with the portal account. Read once: a process cannot change
+/// the account it runs as.
+fn os_account() -> &'static str {
+  static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+  NAME
+    .get_or_init(|| {
+      ["USER", "LOGNAME", "USERNAME"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok())
+        .unwrap_or_default()
+    })
+    .as_str()
+}
+
+/// Replace every whole-token occurrence of `needle` in `text` with [`MASK`].
+fn mask_token(text: &str, needle: &str) -> String {
+  if needle.is_empty() || !text.contains(needle) {
+    return text.to_string();
+  }
+  let mut out = String::with_capacity(text.len());
+  let mut rest = text;
+  while let Some(at) = rest.find(needle) {
+    let (head, tail) = rest.split_at(at);
+    let after = &tail[needle.len()..];
+    out.push_str(head);
+    let before_ok = head.chars().next_back().is_none_or(|c| !account_char(c));
+    let after_ok = after.chars().next().is_none_or(|c| !account_char(c));
+    out.push_str(if before_ok && after_ok { MASK } else { needle });
+    rest = after;
+  }
+  out.push_str(rest);
+  out
+}
+
+/// Mask the account inside a rendered log line.
+///
+/// The line itself is kept: the portal echoes the account in some answers
+/// (`logged out: {...}`) and the logout warning names both the reported and
+/// the saved one, so hiding the affected lines would cost the context that
+/// makes them useful. Only the names turn into dots.
+fn masked_log(text: String, accounts: &[&str], hidden: bool) -> String {
+  if !hidden {
+    return text;
+  }
+  accounts
+    .iter()
+    .map(|name| name.trim())
+    .filter(|name| !name.is_empty())
+    .fold(text, |acc, name| mask_token(&acc, name))
+}
+
 fn info_from(v: &Value) -> Info {
   let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
   let ip4 = {
@@ -959,6 +1021,26 @@ impl App {
       let drop = self.logs.len() - MAX_LINES;
       self.logs.drain(..drop);
     }
+  }
+
+  /// Every account name this window knows: the one it configured, the one the
+  /// core holds, and the one the portal reports. Any of them can be the name a
+  /// log line quotes, so all of them are masked.
+  fn accounts(&self) -> Vec<&str> {
+    let held = self.core_cred.as_ref().map_or("", |c| c.username.as_str());
+    let mut names: Vec<&str> = Vec::new();
+    for name in [
+      self.cfg.username.as_str(),
+      held,
+      self.info.name.as_str(),
+      os_account(),
+    ] {
+      let name = name.trim();
+      if !name.is_empty() && !names.contains(&name) {
+        names.push(name);
+      }
+    }
+    names
   }
 
   fn apply_lang_setting(&mut self, setting: &str) {
@@ -2228,12 +2310,16 @@ impl App {
           .iter()
           .filter(|l| l.level >= self.min_level)
           .collect();
+        // Masking happens here rather than when the line is stored, so the
+        // toggle also reaches lines that were already in the pane.
+        let accounts = self.accounts();
+        let hidden = self.cfg.privacy;
         if self.page == Page::Status && !visible.is_empty() {
           ui.add_space(8.0);
           ui.separator();
           let everything = visible
             .iter()
-            .map(|l| l.render())
+            .map(|l| masked_log(l.render(), &accounts, hidden))
             .collect::<Vec<_>>()
             .join("\n");
           // The context menu cannot call back into `self`, so record the
@@ -2256,13 +2342,14 @@ impl App {
                       let visuals = ui.visuals();
                       level_color(line.level, visuals)
                     };
-                    let resp = ui.add(log_entry(ui, line.render(), color));
+                    let text = masked_log(line.render(), &accounts, hidden);
+                    let resp = ui.add(log_entry(ui, text.clone(), color));
                     // A right click on a selection is turned into a copy before
                     // egui sees it (`LogCopyClick`), so this menu only shows up
                     // when nothing is selected.
                     resp.context_menu(|ui| {
                       if ui.button(t.copy_line).clicked() {
-                        copy_request = Some(line.render());
+                        copy_request = Some(text.clone());
                         ui.close();
                       }
                       if ui.button(t.copy_all).clicked() {
@@ -3880,6 +3967,59 @@ mod tests {
     assert_eq!(private_value("—", true), "—");
     assert_eq!(MASK_IP4.chars().count(), 9);
     assert!(MASK_IP6.chars().count() > MASK_IP4.chars().count());
+  }
+
+  /// Privacy turns the account inside a log line into dots, but only where it
+  /// stands as a token of its own: the sentence around it stays readable, and a
+  /// name that happens to be a prefix of another word is left alone.
+  #[test]
+  fn logs_mask_the_account_only_as_a_whole_token() {
+    let accounts = ["1234567890", "alice"];
+
+    // The portal echoes the account in some answers; the line keeps its shape.
+    let echo = Line::info(r#"logged out: {"error":"ok","user_name":"1234567890"}"#);
+    let plain = masked_log(echo.render(), &accounts, false);
+    assert_eq!(
+      plain,
+      echo.render(),
+      "nothing is hidden while the toggle is off"
+    );
+    let hidden = masked_log(echo.render(), &accounts, true);
+    assert!(!hidden.contains("1234567890"), "{hidden}");
+    assert!(hidden.contains(MASK), "{hidden}");
+    assert!(hidden.contains("user_name\":\""), "{hidden}");
+
+    // The mismatch warning names both accounts, and both have to go.
+    let warning = Line::warn("logout: the portal reports alice, but 1234567890 is saved");
+    let shown = masked_log(warning.render(), &accounts, true);
+    assert!(!shown.contains("alice"), "{shown}");
+    assert!(!shown.contains("1234567890"), "{shown}");
+    assert!(
+      shown.contains("[WARN] logout: the portal reports"),
+      "{shown}"
+    );
+
+    // A prefix inside a longer word is not the account.
+    let bobby = Line::warn("bobby is a different name");
+    assert_eq!(masked_log(bobby.render(), &["bob"], true), bobby.render());
+
+    // Empty names would otherwise match everywhere.
+    let quiet = Line::info("login ok");
+    assert_eq!(masked_log(quiet.render(), &["", " "], true), quiet.render());
+  }
+
+  /// The operating system's account is private too: it arrives in paths rather
+  /// than as a sentence of its own.
+  #[test]
+  fn logs_mask_the_system_account_in_paths() {
+    let name = os_account();
+    if name.is_empty() {
+      return; // a stripped environment has nothing to hide
+    }
+    let line = Line::info(format!("config: /home/{name}/.config/thunet/config.json"));
+    let shown = masked_log(line.render(), &[name], true);
+    assert!(!shown.contains(name), "{shown}");
+    assert!(shown.contains("/.config/thunet/config.json"), "{shown}");
   }
 
   /// The account badge counts what the portal lists and marks this machine.
