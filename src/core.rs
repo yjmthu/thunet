@@ -389,6 +389,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           // Check the current state first so an existing session is not re-authenticated.
           if session.is_online_now() {
             if let Ok(v) = session.refresh() {
+              // This answer is a poll as much as the scheduled one: measure the
+              // next poll from here, or it lands right behind this one.
+              last_status = Instant::now();
               tx.send(Ev::Info(v)).ok();
             }
             tx.send(Ev::State(session.state)).ok();
@@ -437,6 +440,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             want_online = false;
             if !session.is_online_now() {
               if let Ok(v) = session.refresh() {
+                // Same as above: a fresh answer restarts the poll schedule.
+                last_status = Instant::now();
                 tx.send(Ev::Info(v)).ok();
               }
               tx.send(Ev::State(session.state)).ok();
@@ -472,6 +477,11 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         Cmd::Refresh { quiet } => match session.refresh() {
           Ok(v) => {
             refresh_failures = 0;
+            // The scheduled poll measures from the last answer, and this is
+            // one: without this the next poll kept its old phase, so a manual
+            // refresh was followed by another answer seconds later and the
+            // progress line restarted twice in a row.
+            last_status = Instant::now();
             tx.send(Ev::Info(v)).ok();
             tx.send(Ev::State(session.state)).ok();
             // A refresh proves the portal answers, not that the stored
