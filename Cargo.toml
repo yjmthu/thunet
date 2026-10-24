@@ -75,6 +75,12 @@ windows-sys = { version = "0.61.2", features = [
   # `CoCreateInstance`/`CoInitializeEx`: the Network List Manager names the
   # current network when `netsh` refuses to (Location services off).
   "Win32_System_Com",
+  # `GetSystemPowerStatus`: a battery is the fallback that tells a laptop from a
+  # desktop when the firmware does not report a chassis type.
+  "Win32_System_Power",
+  # `GetSystemFirmwareTable`: the raw SMBIOS table, whose System Enclosure
+  # structure carries the same chassis type as the Linux sysfs file.
+  "Win32_System_SystemInformation",
   # `SHELLEXECUTEINFOW` (used by the UAC elevation path) embeds an `HKEY`
   # field, so windows-sys gates it behind the Registry module.
   "Win32_System_Registry",

@@ -363,7 +363,16 @@ impl Client {
     logout: bool,
   ) -> Result<Value, NetError> {
     let token = self.challenge(username, ip)?;
-    let params = build_params(username, password, &token, ip, ac_id, logout);
+    let params = build_params(
+      username,
+      password,
+      &token,
+      ip,
+      ac_id,
+      logout,
+      Some(portal_os_name()),
+      portal_device_class(),
+    );
     let refs: Vec<(&str, &str)> = params
       .iter()
       .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -459,6 +468,242 @@ fn enc(s: &str) -> String {
   out
 }
 
+/// What the portal expects in its own `os_name` field, derived from the system
+/// this build runs on rather than from a setting: the value describes the
+/// machine, so a user-editable copy could only ever be wrong.
+pub fn portal_os_name() -> &'static str {
+  match std::env::consts::OS {
+    "linux" => "Linux",
+    "windows" => "Windows",
+    "macos" => "MacOS",
+    "android" => "AndroidOS",
+    "ios" => "iOS",
+    "freebsd" => "FreeBSD",
+    other => other,
+  }
+}
+
+/// What the portal records as `class_name` for this session.
+///
+/// The field is the machine's **chassis type**, so it is named the way the
+/// firmware names it ("Mini PC", "Laptop", "Tablet"). `None` means the platform
+/// does not expose one (macOS has no SMBIOS enclosure data at all) or the
+/// firmware answered "other" / "unknown" with nothing to fall back on: saying
+/// nothing is better than inventing "Desktop", because the portal derives its
+/// own class from the system we declare.
+pub fn portal_device_class() -> Option<&'static str> {
+  device_class()
+}
+
+/// SMBIOS chassis type to the name the firmware uses for it.
+///
+/// `battery` is evidence, not a default: a machine with a battery is portable
+/// even when the firmware stays silent. Without that evidence the answer is
+/// `None` - a desktop is never assumed from a missing answer.
+fn class_from_chassis(chassis: Option<u32>, battery: bool) -> Option<&'static str> {
+  match chassis {
+    Some(3) => Some("Desktop"),
+    Some(4) => Some("Low Profile Desktop"),
+    Some(5) => Some("Pizza Box"),
+    Some(6) => Some("Mini Tower"),
+    Some(7) => Some("Tower"),
+    Some(8) => Some("Portable"),
+    Some(9) => Some("Laptop"),
+    Some(10) => Some("Notebook"),
+    Some(11) => Some("Hand Held"),
+    Some(12) => Some("Docking Station"),
+    Some(13) => Some("All in One"),
+    Some(14) => Some("Sub Notebook"),
+    Some(15) => Some("Space-saving"),
+    Some(16) => Some("Lunch Box"),
+    Some(17) => Some("Main Server Chassis"),
+    Some(23) => Some("Rack Mount Chassis"),
+    Some(24) => Some("Sealed-case PC"),
+    Some(30) => Some("Tablet"),
+    Some(31) => Some("Convertible"),
+    Some(32) => Some("Detachable"),
+    Some(35) => Some("Mini PC"),
+    Some(36) => Some("Stick PC"),
+    _ if battery => Some("Laptop"),
+    _ => None,
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn device_class() -> Option<&'static str> {
+  let chassis = std::fs::read_to_string("/sys/class/dmi/id/chassis_type")
+    .ok()
+    .and_then(|raw| raw.trim().parse().ok());
+  let battery = std::fs::read_dir("/sys/class/power_supply")
+    .map(|entries| {
+      entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with("BAT")
+          || std::fs::read_to_string(entry.path().join("type"))
+            .is_ok_and(|kind| kind.trim() == "Battery")
+      })
+    })
+    .unwrap_or(false);
+  class_from_chassis(chassis, battery)
+}
+
+#[cfg(target_os = "windows")]
+fn device_class() -> Option<&'static str> {
+  use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+  // `GetSystemFirmwareTable` gives the raw SMBIOS table, the same source the
+  // Linux sysfs file comes from; the battery is the fallback for firmware that
+  // reports nothing usable. 128 means "no system battery".
+  let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+  let battery = unsafe { GetSystemPowerStatus(&mut status) } != 0 && status.BatteryFlag != 128;
+  class_from_chassis(smbios_chassis(), battery)
+}
+
+/// The System Enclosure (type 3) chassis byte from the firmware's SMBIOS table.
+#[cfg(target_os = "windows")]
+fn smbios_chassis() -> Option<u32> {
+  use windows_sys::Win32::System::SystemInformation::GetSystemFirmwareTable;
+  const RSMB: u32 = u32::from_be_bytes(*b"RSMB");
+
+  // A null buffer asks for the size only.
+  let size = unsafe { GetSystemFirmwareTable(RSMB, 0, std::ptr::null_mut(), 0) };
+  if size < 8 {
+    return None;
+  }
+  let mut buffer = vec![0u8; size as usize];
+  let got =
+    unsafe { GetSystemFirmwareTable(RSMB, 0, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+  if got == 0 || got > size {
+    return None;
+  }
+  buffer.truncate(got as usize);
+  // `RawSMBIOSData`: 4 bytes of version, then a DWORD length, then the table.
+  let length = u32::from_le_bytes(buffer.get(4..8)?.try_into().ok()?) as usize;
+  let end = 8usize.checked_add(length)?.min(buffer.len());
+  chassis_from_smbios(buffer.get(8..end)?)
+}
+
+/// Walk an SMBIOS structure table and return the chassis type of the System
+/// Enclosure structure (type 3), which is the same 1-36 enum as the Linux file.
+///
+/// `table` starts at the first structure, i.e. after the 8-byte header.
+#[cfg(any(target_os = "windows", test))]
+fn chassis_from_smbios(table: &[u8]) -> Option<u32> {
+  let mut i = 0;
+  while i + 4 <= table.len() {
+    let kind = table[i];
+    let len = table[i + 1] as usize;
+    if len < 4 || i + len > table.len() {
+      return None;
+    }
+    if kind == 3 && len > 5 {
+      // Byte 5: chassis type in bits 0-6, lock bit in bit 7.
+      return Some(u32::from(table[i + 5] & 0x7F));
+    }
+    // The formatted area is followed by the string set, which ends at a double
+    // NUL; the next structure starts right after it.
+    let mut j = i + len;
+    while j + 1 < table.len() && !(table[j] == 0 && table[j + 1] == 0) {
+      j += 1;
+    }
+    i = j + 2;
+  }
+  None
+}
+
+#[cfg(target_os = "macos")]
+fn device_class() -> Option<&'static str> {
+  // macOS has no SMBIOS enclosure data, but it does not need one: every Mac
+  // laptop has a battery, so no battery means a desktop body, and the model
+  // identifier says which desktop.
+  if mac_has_battery() {
+    return Some("Laptop");
+  }
+  Some(mac_class_from_model(&mac_model().unwrap_or_default()))
+}
+
+/// Model identifier of this Mac (`hw.model`, e.g. `Macmini9,1`).
+#[cfg(target_os = "macos")]
+fn mac_model() -> Option<String> {
+  unsafe extern "C" {
+    fn sysctlbyname(
+      name: *const core::ffi::c_char,
+      oldp: *mut core::ffi::c_void,
+      oldlenp: *mut usize,
+      newp: *mut core::ffi::c_void,
+      newlen: usize,
+    ) -> core::ffi::c_int;
+  }
+
+  let name = c"hw.model";
+  let mut size = 0usize;
+  // SAFETY: `sysctlbyname` with a null buffer only reports the length.
+  unsafe {
+    if sysctlbyname(
+      name.as_ptr(),
+      std::ptr::null_mut(),
+      &mut size,
+      std::ptr::null_mut(),
+      0,
+    ) != 0
+      || size == 0
+    {
+      return None;
+    }
+  }
+  let mut buffer = vec![0u8; size];
+  // SAFETY: the buffer is `size` bytes, which is what the first call asked for.
+  unsafe {
+    if sysctlbyname(
+      name.as_ptr(),
+      buffer.as_mut_ptr().cast(),
+      &mut size,
+      std::ptr::null_mut(),
+      0,
+    ) != 0
+    {
+      return None;
+    }
+  }
+  buffer.truncate(size.saturating_sub(1));
+  String::from_utf8(buffer).ok()
+}
+
+/// Whether this Mac has a battery at all.
+#[cfg(target_os = "macos")]
+fn mac_has_battery() -> bool {
+  std::process::Command::new("/usr/bin/pmset")
+    .args(["-g", "batt"])
+    .output()
+    .map(|out| String::from_utf8_lossy(&out.stdout).contains("InternalBattery"))
+    .unwrap_or(false)
+}
+
+/// What a Mac body is called, from `hw.model`, when it has no battery. The
+/// names follow the SMBIOS ones used for the other platforms.
+#[cfg(any(target_os = "macos", test))]
+fn mac_class_from_model(model: &str) -> &'static str {
+  let m = model.to_ascii_lowercase();
+  if m.contains("macbook") {
+    "Laptop"
+  } else if m.contains("macmini") {
+    "Mini PC"
+  } else if m.contains("imac") {
+    "All in One"
+  } else if m.contains("macpro") {
+    "Tower"
+  } else if m.contains("xserve") {
+    "Rack Mount Chassis"
+  } else {
+    // Mac Studio, or a virtual machine: a desktop body without a more specific
+    // name.
+    "Desktop"
+  }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn device_class() -> Option<&'static str> {
+  None
+}
+
 /// Build the full login/logout parameter set (order is irrelevant).
 pub fn build_params(
   username: &str,
@@ -467,6 +712,8 @@ pub fn build_params(
   ip: &str,
   ac_id: &str,
   logout: bool,
+  os: Option<&str>,
+  device: Option<&str>,
 ) -> Vec<(String, String)> {
   let hmd5 = password.map(crypto::md5_hex).unwrap_or_default();
 
@@ -509,6 +756,17 @@ pub fn build_params(
   ];
   if !logout {
     p.push(("password".into(), format!("{{MD5}}{hmd5}")));
+    // What the portal records as `os_name` and `class_name` for this session.
+    // Neither is part of `chksum`, so a portal that does not know a key simply
+    // ignores it. `name` carries a category ("Desktop"), never a machine name:
+    // the portal treats that field as the class, and a free-form label there
+    // replaced the category it derives from the system.
+    if let Some(os) = os.filter(|v| !v.is_empty()) {
+      p.push(("os".into(), os.into()));
+    }
+    if let Some(device) = device.filter(|v| !v.is_empty()) {
+      p.push(("name".into(), device.into()));
+    }
   }
   p.push(("chksum".into(), crypto::sha1_hex(&chk_src)));
   p
@@ -831,11 +1089,134 @@ mod tests {
 
   #[test]
   fn chksum_shape() {
-    let p = build_params("u", Some("p"), &"0".repeat(64), "1.2.3.4", "1", false);
+    let p = build_params(
+      "u",
+      Some("p"),
+      &"0".repeat(64),
+      "1.2.3.4",
+      "1",
+      false,
+      None,
+      None,
+    );
     let get = |k: &str| p.iter().find(|(n, _)| n == k).unwrap().1.clone();
     assert_eq!(get("password"), format!("{{MD5}}{}", crypto::md5_hex("p")));
     assert!(get("info").starts_with("{SRBX1}"));
     assert_eq!(get("chksum").len(), 40);
+  }
+
+  /// The system and the class are declared, never signed, and the class is a
+  /// category the portal already knows rather than this machine's name.
+  #[test]
+  fn the_system_and_the_class_are_declared_but_unsigned() {
+    let get =
+      |p: &[(String, String)], k: &str| p.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let plain = build_params(
+      "u",
+      Some("p"),
+      &"0".repeat(64),
+      "192.0.2.10",
+      "169",
+      false,
+      None,
+      None,
+    );
+    let named = build_params(
+      "u",
+      Some("p"),
+      &"0".repeat(64),
+      "192.0.2.10",
+      "169",
+      false,
+      Some("Linux"),
+      Some("Desktop"),
+    );
+    assert_eq!(get(&plain, "os"), None);
+    assert_eq!(get(&named, "os"), Some("Linux".into()));
+    assert_eq!(get(&named, "name"), Some("Desktop".into()));
+    assert_eq!(get(&plain, "chksum"), get(&named, "chksum"));
+
+    let out = build_params(
+      "u",
+      None,
+      &"0".repeat(64),
+      "192.0.2.10",
+      "169",
+      true,
+      Some("Linux"),
+      Some("Desktop"),
+    );
+    assert_eq!(get(&out, "os"), None, "a logout declares nothing");
+    assert_eq!(get(&out, "name"), None);
+  }
+
+  /// The class follows the firmware's own chassis name; a battery is evidence
+  /// that the machine is portable, and nothing is claimed without either.
+  #[test]
+  fn the_device_class_follows_the_chassis() {
+    assert_eq!(class_from_chassis(Some(3), false), Some("Desktop"));
+    assert_eq!(class_from_chassis(Some(35), false), Some("Mini PC"));
+    assert_eq!(class_from_chassis(Some(9), true), Some("Laptop"));
+    assert_eq!(class_from_chassis(Some(10), true), Some("Notebook"));
+    assert_eq!(class_from_chassis(Some(31), false), Some("Convertible"));
+    assert_eq!(class_from_chassis(None, true), Some("Laptop"));
+    assert_eq!(
+      class_from_chassis(None, false),
+      None,
+      "no evidence, no claim"
+    );
+    assert_eq!(
+      class_from_chassis(Some(1), false),
+      None,
+      "firmware says Other"
+    );
+    assert_eq!(class_from_chassis(Some(99), true), Some("Laptop"));
+  }
+
+  /// The SMBIOS walker finds the System Enclosure structure and reads its
+  /// chassis byte, and gives up rather than guessing when it is not there.
+  #[test]
+  fn the_chassis_byte_is_read_from_the_smbios_table() {
+    let mut table = vec![0u8, 4, 0, 0, 0, 0]; // a type 0 structure, no strings
+    // Type 3, 13 bytes long, chassis type 35 (Mini PC), lock bit clear.
+    table.extend([3, 13, 0, 0, 0, 35, 0, 0, 0, 0, 0, 0, 0]);
+    table.extend([0, 0]);
+    table.extend([127, 4, 0, 0, 0, 0]); // end of table
+    assert_eq!(chassis_from_smbios(&table), Some(35));
+
+    let mut locked = table.clone();
+    locked[11] = 0x80 | 9; // type 3's byte 5, with the lock bit set
+    assert_eq!(chassis_from_smbios(&locked), Some(9));
+
+    assert_eq!(chassis_from_smbios(&[0u8, 4, 0, 0, 0, 0]), None);
+    assert_eq!(chassis_from_smbios(&[]), None);
+  }
+
+  /// A Mac has no chassis type, but its body is still identifiable: a battery
+  /// means a laptop, and the model identifier names the desktop bodies.
+  #[test]
+  fn a_mac_body_is_named_from_its_model_and_battery() {
+    assert_eq!(mac_class_from_model("MacBookPro18,3"), "Laptop");
+    assert_eq!(mac_class_from_model("Macmini9,1"), "Mini PC");
+    assert_eq!(mac_class_from_model("iMac21,1"), "All in One");
+    assert_eq!(mac_class_from_model("MacPro7,1"), "Tower");
+    assert_eq!(mac_class_from_model("VirtualMac2,1"), "Desktop");
+  }
+
+  #[test]
+  fn the_system_name_is_the_portals_own_word() {
+    assert_eq!(
+      portal_os_name(),
+      match std::env::consts::OS {
+        "linux" => "Linux",
+        "windows" => "Windows",
+        "macos" => "MacOS",
+        "android" => "AndroidOS",
+        "ios" => "iOS",
+        "freebsd" => "FreeBSD",
+        other => other,
+      }
+    );
   }
 
   #[test]

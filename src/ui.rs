@@ -2418,7 +2418,7 @@ fn devices_list(
   let mut kind_w = 0.0_f32;
   for d in devices {
     let addr = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
-    let kind = if d.os.is_empty() { &d.class } else { &d.os };
+    let kind = &d.class;
     addr_w = addr_w.max(measure(addr, &mono));
     kind_w = kind_w.max(measure(kind, &body).min(DEVICES_KIND_MAX));
   }
@@ -2487,8 +2487,10 @@ fn devices_list(
             });
             if kind_w > 0.0 {
               fixed_cell(ui, (&d.id, "kind"), kind_w, row_h, |ui| {
-                let kind = if d.os.is_empty() { &d.class } else { &d.os };
-                ui.add(egui::Label::new(kind).truncate());
+                // The icon says which system the device runs; this column is
+                // the device type the portal reports (`class_name`), nothing
+                // else.
+                ui.add(egui::Label::new(&d.class).truncate());
               });
             }
             // The dot closes the row in a column of its own, so the marks line

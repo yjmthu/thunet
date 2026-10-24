@@ -11,6 +11,8 @@ pub enum DeviceKind {
   Android,
   Apple,
   Windows,
+  /// Linux and the other unix-likes: Tux.
+  Linux,
   /// Anything unidentified - and what the badge itself shows.
   Other,
 }
@@ -26,6 +28,8 @@ pub fn device_kind(os: &str, class: &str) -> DeviceKind {
     DeviceKind::Apple
   } else if s.contains("windows") {
     DeviceKind::Windows
+  } else if ["linux", "unix", "bsd"].iter().any(|hint| s.contains(hint)) {
+    DeviceKind::Linux
   } else {
     DeviceKind::Other
   }
@@ -37,6 +41,8 @@ const LOGO_GREEN: egui::Color32 = egui::Color32::from_rgb(0x7F, 0xBA, 0x00);
 const LOGO_BLUE: egui::Color32 = egui::Color32::from_rgb(0x00, 0xA4, 0xEF);
 const LOGO_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB9, 0x00);
 const ANDROID_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3D, 0xDC, 0x84);
+/// Tux's beak and feet.
+const PENGUIN_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xA6, 0x23);
 
 /// A filled polygon.
 ///
@@ -185,6 +191,40 @@ fn device_icon_shapes(
         }),
       ]
     }
+    // Tux: the body in the icon's own ink, the belly cut out in the page
+    // colour (so it reads on a light or a dark page), and beak and feet in
+    // Tux's orange, which is the part that says "penguin" at this size.
+    DeviceKind::Linux => {
+      let mut shapes = vec![
+        filled_path(ellipse_points(at(8.0, 8.6), 4.6 * s, 5.7 * s, 40), ink),
+        filled_path(ellipse_points(at(8.0, 10.8), 3.0 * s, 3.3 * s, 40), bg),
+      ];
+      for x in [6.5, 9.5] {
+        shapes.push(egui::Shape::Circle(egui::epaint::CircleShape {
+          center: at(x, 5.6),
+          radius: 1.15 * s,
+          fill: bg,
+          stroke: egui::Stroke::NONE.into(),
+        }));
+        shapes.push(egui::Shape::Circle(egui::epaint::CircleShape {
+          center: at(x, 5.7),
+          radius: 0.5 * s,
+          fill: ink,
+          stroke: egui::Stroke::NONE.into(),
+        }));
+      }
+      shapes.push(filled_path(
+        vec![at(7.2, 6.9), at(8.8, 6.9), at(8.0, 8.1)],
+        PENGUIN_ORANGE,
+      ));
+      for x in [5.9, 10.1] {
+        shapes.push(filled_path(
+          ellipse_points(at(x, 14.2), 1.9 * s, 0.9 * s, 20),
+          PENGUIN_ORANGE,
+        ));
+      }
+      shapes
+    }
     // A monitor: screen, stand, base.
     DeviceKind::Other => {
       let screen = egui::Rect::from_min_max(at(1.0, 2.3), at(15.0, 10.7));
@@ -239,7 +279,9 @@ mod tests {
     assert_eq!(device_kind("iOS", ""), DeviceKind::Apple);
     assert_eq!(device_kind("Mac OS X", ""), DeviceKind::Apple);
     assert_eq!(device_kind("Windows", ""), DeviceKind::Windows);
-    assert_eq!(device_kind("Linux", ""), DeviceKind::Other);
+    assert_eq!(device_kind("Linux", ""), DeviceKind::Linux);
+    assert_eq!(device_kind("Linux", "Mini PC"), DeviceKind::Linux);
+    assert_eq!(device_kind("FreeBSD", ""), DeviceKind::Linux);
     assert_eq!(
       device_kind("", "Smartphones/PDAs/Tablets"),
       DeviceKind::Other
