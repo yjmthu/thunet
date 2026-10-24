@@ -173,8 +173,15 @@
       <Custom Action="PurgeMachineState" After="RemoveCoreService"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <!-- After the files are in place, not during an uninstall: the same
-           condition the quit step above uses to run. -->
-      <Custom Action="RestoreAfterUpdate" After="InstallFinalize"
+           condition the quit step above uses to run.
+
+           `Before="InstallFinalize"` is the *scheduling* position, not when the
+           action runs: a commit action has to be sequenced inside the script
+           range (InstallInitialize … InstallFinalize), and the commit phase is
+           what executes it last. Sequencing it after InstallFinalize is rejected
+           at run time with error 2762 ("Unable to schedule operation") and fails
+           the whole install with 1603 after the files are already committed. -->
+      <Custom Action="RestoreAfterUpdate" Before="InstallFinalize"
               Condition="NOT REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchApp" After="InstallFinalize"
               Condition="UILevel &gt;= 4 AND NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE=&quot;ALL&quot;" />

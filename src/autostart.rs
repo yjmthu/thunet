@@ -665,8 +665,12 @@ mod imp {
       // An upgrade keeps `%ProgramData%\thunet`, so a previous install's DACL
       // on `key.bin` and `credential.bin` survives it and the new core can read
       // `config.json` but not the key. Re-apply the service-only ACL to the
-      // whole tree, not just to the directory.
-      harden_machine_dir(Some(SERVICE_ACCOUNT))?;
+      // whole tree, not just to the directory. A first install has no directory
+      // yet - the service creates it - and `icacls` on a missing path fails, so
+      // that case has nothing to secure and must not fail the restore.
+      if crate::config::machine_dir().is_dir() {
+        harden_machine_dir(Some(SERVICE_ACCOUNT))?;
+      }
     }
     if !take_running_marker() && !core_running() {
       return Ok(());
