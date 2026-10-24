@@ -568,9 +568,6 @@ pub struct App {
   hide_item: MenuItem,
   quit_item: MenuItem,
   started: bool,
-  /// Keyboard focus as of the previous frame, so the window coming to the
-  /// front can trigger exactly one refresh.
-  focused: bool,
   /// `--minimized`/`start_minimized`: the first painted frame must not be
   /// left on screen (eframe shows the root window after it unconditionally).
   hide_at_start: bool,
@@ -781,7 +778,6 @@ impl App {
       hide_item,
       quit_item,
       started: false,
-      focused: false,
       hide_at_start: start_hidden,
       centered: false,
       cloaked: start_hidden,
@@ -4419,17 +4415,6 @@ impl eframe::App for App {
     // The core may have been restarted (crash, upgrade, systemd unit or logon
     // task): reconnect instead of going deaf.
     self.ensure_link();
-
-    // The window coming to the front is the moment the page has to be current;
-    // waiting for the core's 10–15 s poll made a freshly opened window show
-    // numbers that were seconds old. The refresh is quiet: the user did not
-    // ask for it, so it neither logs nor toasts.
-    let focused = ctx.input(|i| i.focused);
-    if focused && !self.focused {
-      self.send(Cmd::Refresh { quiet: true });
-      self.next_core_query = Instant::now();
-    }
-    self.focused = focused;
 
     // Outcome of a Start/Stop that ran on the helper thread. The tag matters:
     // a successful Stop has usually already been completed by the link
