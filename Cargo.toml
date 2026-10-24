@@ -87,6 +87,11 @@ windows-sys = { version = "0.61.2", features = [
   # `ProcessIdToSessionId`: identify an interactive pipe client without opening
   # its process, which the unprivileged service account cannot do.
   "Win32_System_RemoteDesktop",
+  # `CreateProcessAsUser` for an upgrade's window restore, and the environment
+  # block it has to hand the child (SYSTEM's `%APPDATA%` is the wrong one).
+  "Win32_System_Environment",
+  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
   "Win32_System_Services",
   "Win32_System_Threading",
   "Win32_UI_Shell",

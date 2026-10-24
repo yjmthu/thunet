@@ -4403,20 +4403,22 @@ impl eframe::App for App {
       self.show_window(ctx);
     }
 
-    // An installer (or `thunet quit`) asks for a real exit, not the tray's
-    // hide-on-close: it needs the image gone before it replaces the file.
-    if crate::single::quit_requested() {
-      self.quit();
-    }
-
     // The machine-wide request reaches windows in other sessions, and unlike
-    // the per-user doorbell above it does not need a core to relay it. Portable
-    // windows are left alone by an uninstall, so they never look. The answer
-    // carries this window's state, so an upgrade puts it back the way it was.
+    // the per-user doorbell below it does not need a core to relay it. Portable
+    // windows are left alone by an uninstall, so they never look. It is checked
+    // first because an installer rings both: the answer — this window's state —
+    // has to leave before the doorbell ends the process. It says nothing when
+    // the sender is gone, which is why the doorbell below still runs.
     if !self.quitting
       && !crate::ipc::portable()
       && crate::single::machine_quit_requested(!self.shown)
     {
+      self.quit();
+    }
+
+    // An installer (or `thunet quit`) asks for a real exit, not the tray's
+    // hide-on-close: it needs the image gone before it replaces the file.
+    if !self.quitting && crate::single::quit_requested() {
       self.quit();
     }
 

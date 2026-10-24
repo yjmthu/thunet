@@ -52,8 +52,8 @@ _thunet() {
             thunet,service-purge)
                 cmd="thunet__subcmd__service__subcmd__purge"
                 ;;
-            thunet,service-resume)
-                cmd="thunet__subcmd__service__subcmd__resume"
+            thunet,service-restore)
+                cmd="thunet__subcmd__service__subcmd__restore"
                 ;;
             thunet,shortcut)
                 cmd="thunet__subcmd__shortcut"
@@ -97,8 +97,8 @@ _thunet() {
             thunet__subcmd__help,service-purge)
                 cmd="thunet__subcmd__help__subcmd__service__subcmd__purge"
                 ;;
-            thunet__subcmd__help,service-resume)
-                cmd="thunet__subcmd__help__subcmd__service__subcmd__resume"
+            thunet__subcmd__help,service-restore)
+                cmd="thunet__subcmd__help__subcmd__service__subcmd__restore"
                 ;;
             thunet__subcmd__help,shortcut)
                 cmd="thunet__subcmd__help__subcmd__shortcut"
@@ -113,7 +113,7 @@ _thunet() {
 
     case "${cmd}" in
         thunet)
-            opts="-h -V --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help --version selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help"
+            opts="-h -V --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help --version selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -303,7 +303,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__help)
-            opts="selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help"
+            opts="selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -484,7 +484,7 @@ _thunet() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        thunet__subcmd__help__subcmd__service__subcmd__resume)
+        thunet__subcmd__help__subcmd__service__subcmd__restore)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -792,7 +792,7 @@ _thunet() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        thunet__subcmd__service__subcmd__resume)
+        thunet__subcmd__service__subcmd__restore)
             opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

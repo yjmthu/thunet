@@ -7,53 +7,33 @@ set -e
 # `thunet service enable`, both of which ask for administrator rights - and
 # starting it now is a separate, explicit `thunet service start` or the status
 # page's *Start* button. `enable` would make a machine-wide core come back at
-# every boot, and `restart` would put one into the 15-second network probe on a
+# every boot, and a start would put one into the 15-second network probe on a
 # machine whose owner has not asked for it yet.
 #
-# Upgrade: `prerm` stopped the service before dpkg replaced the binary, so
-# something has to bring the new one back, and the previous state decides
-# whether it may. `is-enabled` is the same rule the Windows `service-resume`
-# uses: start type `auto` -> start it again; autostart off -> leave it off, so
-# an upgrade cannot resurrect a session the user turned off. `$2` is the
-# previously configured version, which dpkg leaves empty on a first install.
+# Upgrade: the machine-wide quit in `prerm` stopped the core and recorded
+# whether it was running, in /run/thunet-core-was-running. `service-restore`
+# reads that marker and starts the new binary only then, so the state the user
+# chose survives the install: a core that was up comes back, one that was stopped
+# stays stopped. The running state decides, never `is-enabled`, so a machine
+# whose owner turned autostart off but started the core by hand keeps working
+# across the upgrade. `$2` is the previously configured version, which dpkg
+# leaves empty on a first install.
 if [ -d /run/systemd/system ]; then
   # dpkg unpacked the unit a moment ago; let the running manager see it so
-  # `systemctl status thunet` works immediately.
+  # `systemctl status thunet` works immediately and `service-restore` below
+  # restarts this build.
   systemctl daemon-reload || true
-  if [ "${1:-}" = configure ] && [ -n "${2:-}" ]; then
-    if systemctl is-enabled --quiet thunet.service; then
-      systemctl start thunet.service || true
-    fi
-  fi
 fi
 
-# Put back the windows `prerm` ended, each in the state it was in: a window that
-# was open comes back on screen, one that was hidden stays in the tray.
-# `quit-record` is written by the elevated quit command and names one uid and
-# one state per window; a record older than ten minutes belongs to an
-# installation that never completed and is dropped instead.
-record=/run/thunet-quit-record
-if [ "${1:-}" = configure ]; then
-  if [ -n "${2:-}" ] && [ -r "$record" ]; then
-    now=$(date +%s%3N 2>/dev/null || echo 0)
-    at=$(awk '$1 == "at" { print $2; exit }' "$record")
-    if [ -n "$at" ] && [ "$now" -gt 0 ] && [ $((now - at)) -le 600000 ]; then
-      awk '$1 == "uid" { print $2, $3 }' "$record" | while read -r uid state; do
-        user=$(getent passwd "$uid" | cut -d: -f1)
-        [ -n "$user" ] || continue
-        # A record written before the state was tracked asks for the tray, which
-        # is the least intrusive default.
-        if [ "$state" = visible ]; then flag=--visible; else flag=--minimized; fi
-        # The user manager knows the graphical session's DISPLAY/WAYLAND_DISPLAY;
-        # a session without a manager (nobody logged in) is simply skipped.
-        systemd-run --user --machine="$user@.host" --collect --quiet \
-          /usr/bin/thunet "$flag" >/dev/null 2>&1 || true
-      done
-    fi
-  fi
-  # A record from an earlier uninstall or a failed transaction must not be
-  # waiting for the next one.
-  rm -f "$record"
+# Put the package back the way the install found it, in one command: the core
+# (if `prerm` found it running), then each window in the state it answered. The
+# command reads /run/thunet-quit-record and /run/thunet-core-was-running, both
+# written by the elevated quit in `prerm`, ignores anything older than ten
+# minutes, and starts each user's window through that user's systemd manager -
+# `postinst` itself has no way into a graphical session. `|| true`: a wedged
+# start must not fail an otherwise good install.
+if [ "${1:-}" = configure ] && [ -n "${2:-}" ]; then
+  /usr/bin/thunet --machine service-restore || true
 fi
 
 exit 0

@@ -14,7 +14,7 @@
 //! rights on both platforms; the tray entry is always per user and never needs
 //! elevation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How much of the app starts with the system.
 ///
@@ -198,13 +198,13 @@ impl Autostart {
     imp::prepare_service(self)
   }
 
-  /// Bring the core back after an upgrade, but only when it is configured to
-  /// start at boot.
+  /// Bring the core back after an upgrade, in the state the user left it in.
   ///
-  /// The installer stops the service before replacing the binary; this is what
-  /// starts the new build again. A service whose autostart is off (start type
-  /// `demand`) is left alone, so upgrading cannot resurrect a session the user
-  /// turned off.
+  /// The installer stops the core before replacing the binary, and records
+  /// whether it was running (the machine-wide quit does that); this is what
+  /// starts the new build again, and only then. A core that was running comes back, one
+  /// that was stopped stays stopped, and the start type / autostart setting is
+  /// not consulted.
   pub fn resume_after_update() -> Result<(), String> {
     imp::resume_after_update()
   }
@@ -259,6 +259,158 @@ pub fn purge_machine_state() -> Result<(), String> {
 /// the manager to start it instead of spawning a second, unmanaged copy.
 pub fn core_managed() -> bool {
   imp::core_registered()
+}
+
+/// Stop the core as the first half of a machine-wide quit.
+///
+/// An installer closes every window and then has to replace the executable the
+/// core is running, so the same command does both - and records whether the
+/// core was running, because the answer only exists before the stop. The
+/// matching half, `service-restore`, starts it again only when it was.
+pub fn stop_for_update() -> Result<(), String> {
+  imp::stop_for_update()
+}
+
+/// How long a core state remembered by the installer stays meaningful.
+///
+/// The stop and its resume are one transaction, so the same ten minutes the
+/// window record uses covers a slow install and still expires a marker whose
+/// install never reached its resume step.
+const MARKER_MAX_AGE_MS: u128 = 600_000;
+
+/// Whether a remembered core state belongs to an install still in progress.
+fn marker_is_fresh(at: Option<u128>, now: u128) -> bool {
+  at.is_some_and(|at| at > 0 && now.saturating_sub(at) <= MARKER_MAX_AGE_MS)
+}
+
+/// Where the machine-wide quit records whether the core was running.
+///
+/// `/run` on Linux, next to the quit record: the marker lives for one dpkg
+/// transaction, so a machine that never finishes the install forgets it at the
+/// next boot instead of starting a core nobody asked for. Windows keeps it in
+/// the machine directory, which an uninstall deletes together with the sealed
+/// credential.
+fn marker_path() -> PathBuf {
+  #[cfg(target_os = "linux")]
+  {
+    PathBuf::from("/run/thunet-core-was-running")
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    crate::config::machine_dir().join("core-was-running")
+  }
+}
+
+/// Record the state the core was in when the installer stopped it.
+fn write_running_marker(was_running: bool) -> Result<(), String> {
+  write_running_marker_at(&marker_path(), was_running, now_ms())
+}
+
+/// [`write_running_marker`] on an explicit path and clock, so it is testable.
+fn write_running_marker_at(path: &Path, was_running: bool, now: u128) -> Result<(), String> {
+  if !was_running {
+    // Remove, do not leave behind: a marker from an earlier attempt must not
+    // start a core this install found stopped.
+    return match std::fs::remove_file(path) {
+      Ok(()) => Ok(()),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      Err(e) => Err(format!("{}: {e}", path.display())),
+    };
+  }
+  std::fs::write(path, now.to_string()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Read the marker and delete it: it answers exactly one install.
+///
+/// A stale one belongs to an install that never reached its resume step, and
+/// starting a core because of it would be a surprise, so it counts as absent.
+fn take_running_marker() -> bool {
+  take_running_marker_at(&marker_path(), now_ms())
+}
+
+/// [`take_running_marker`] on an explicit path and clock, so it is testable.
+fn take_running_marker_at(path: &Path, now: u128) -> bool {
+  let at = std::fs::read_to_string(path)
+    .ok()
+    .and_then(|text| text.trim().parse::<u128>().ok());
+  let fresh = marker_is_fresh(at, now);
+  let _ = std::fs::remove_file(path);
+  fresh
+}
+
+fn now_ms() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |d| d.as_millis())
+}
+
+#[cfg(test)]
+mod remembered_core {
+  use super::{marker_is_fresh, take_running_marker_at, write_running_marker_at};
+
+  const NOW: u128 = 1_700_000_000_000;
+
+  /// A path no other test and no running install touches.
+  fn scratch(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("thunet-marker-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+  }
+
+  #[test]
+  fn a_marker_from_the_current_install_counts() {
+    assert!(marker_is_fresh(Some(NOW - 1_000), NOW));
+    assert!(marker_is_fresh(Some(NOW), NOW));
+  }
+
+  #[test]
+  fn a_marker_from_a_finished_install_does_not() {
+    assert!(!marker_is_fresh(Some(NOW - 600_001), NOW));
+    // Exactly ten minutes is still the same install.
+    assert!(marker_is_fresh(Some(NOW - 600_000), NOW));
+  }
+
+  #[test]
+  fn a_missing_or_unreadable_marker_does_not() {
+    assert!(!marker_is_fresh(None, NOW));
+    // `0` is what an empty or garbled file parses to.
+    assert!(!marker_is_fresh(Some(0), NOW));
+  }
+
+  #[test]
+  fn a_clock_that_went_backwards_keeps_the_marker() {
+    // Better to resume a core than to drop the state because NTP moved the
+    // clock: a marker dated in the future is still this install's.
+    assert!(marker_is_fresh(Some(NOW + 60_000), NOW));
+  }
+
+  #[test]
+  fn a_marker_is_written_and_taken_exactly_once() {
+    let path = scratch("once");
+    write_running_marker_at(&path, true, NOW).expect("write");
+    assert!(path.exists());
+    assert!(take_running_marker_at(&path, NOW + 1_000));
+    assert!(!path.exists(), "the marker is consumed");
+    assert!(!take_running_marker_at(&path, NOW + 1_000));
+  }
+
+  #[test]
+  fn a_stop_that_finds_nothing_leaves_no_marker() {
+    let path = scratch("stopped");
+    write_running_marker_at(&path, true, NOW).expect("write");
+    // A later stop that found the core stopped must not keep the old answer.
+    write_running_marker_at(&path, false, NOW + 1_000).expect("remove");
+    assert!(!path.exists());
+    assert!(!take_running_marker_at(&path, NOW + 1_000));
+  }
+
+  #[test]
+  fn a_marker_nobody_wrote_is_simply_absent() {
+    let path = scratch("absent");
+    assert!(!take_running_marker_at(&path, NOW));
+    // Removing a marker that is not there is not an error either.
+    write_running_marker_at(&path, false, NOW).expect("remove missing");
+  }
 }
 
 /// Task names from `schtasks /Query /FO CSV /NH`, filtered by prefix.
@@ -359,7 +511,7 @@ mod imp {
   };
   use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
-  use super::{Autostart, ServiceAction};
+  use super::{Autostart, ServiceAction, take_running_marker, write_running_marker};
 
   /// Service Control Manager key of the background core. The same name as the
   /// Linux unit (`thunet.service`), so the mental model is identical on both
@@ -417,7 +569,14 @@ mod imp {
   /// but the service is still registered (start type `demand`) — the tray must
   /// not fight the SCM over who owns the process.
   pub fn core_registered() -> bool {
-    service_open(SERVICE_QUERY_STATUS).is_some()
+    let Some(service) = service_open(SERVICE_QUERY_STATUS) else {
+      return false;
+    };
+    // SAFETY: the handle comes from OpenServiceW and is not used afterwards.
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    true
   }
 
   /// Whether the SCM starts it at boot. This, not registration, is what the
@@ -431,6 +590,20 @@ mod imp {
       CloseServiceHandle(service);
     }
     start == Some(SERVICE_AUTO_START)
+  }
+
+  /// Whether the SCM holds a live core right now. Registration says nothing
+  /// about this: a `demand` service whose core the user started by hand is a
+  /// normal state, and the one an upgrade has to come back to.
+  fn core_running() -> bool {
+    let Some(service) = service_open(SERVICE_QUERY_STATUS) else {
+      return false;
+    };
+    let state = query_state(service);
+    unsafe {
+      CloseServiceHandle(service);
+    }
+    state == Some(SERVICE_RUNNING)
   }
 
   pub fn enable_tray(a: &Autostart) -> Result<(), String> {
@@ -478,6 +651,12 @@ mod imp {
 
   /// Start the core again after the installer replaced the binary, after
   /// making sure the registration points at the build that was just installed.
+  ///
+  /// Same rule as the Linux half: the state comes from the marker the quit step
+  /// wrote, or - when that step could not stop a core it found running - from
+  /// the core still being alive, which is the image that was just replaced. A
+  /// core that was stopped is left alone, so an upgrade never resurrects a
+  /// session the user turned off, whether or not it starts at boot.
   pub fn resume_after_update() -> Result<(), String> {
     if crate::elevate::is_elevated()
       && let Some(me) = Autostart::new(false)
@@ -489,17 +668,16 @@ mod imp {
       // whole tree, not just to the directory.
       harden_machine_dir(Some(SERVICE_ACCOUNT))?;
     }
-    if !core_starts_at_boot() {
+    if !take_running_marker() && !core_running() {
       return Ok(());
     }
-    if let Some(service) = service_open(SERVICE_QUERY_STATUS) {
-      let state = query_state(service);
-      unsafe {
-        CloseServiceHandle(service);
-      }
-      if state == Some(SERVICE_RUNNING) {
-        return Ok(());
-      }
+    if !core_registered() {
+      // Unregistered between the quit and here: nothing to start.
+      return Ok(());
+    }
+    if core_running() {
+      // Still up, so the image it runs is the one that was just replaced.
+      stop()?;
     }
     start()
   }
@@ -523,6 +701,18 @@ mod imp {
       return Ok(already_done(action));
     }
     service_direct(action, a)
+  }
+
+  /// Stop the core for an install, recording whether it was running first.
+  ///
+  /// The marker is best effort - without it the resume leaves a stopped core
+  /// alone - but a stop that fails must reach the installer, which turns it into
+  /// an aborted install instead of replacing a mapped image.
+  pub fn stop_for_update() -> Result<(), String> {
+    if let Err(e) = write_running_marker(core_running()) {
+      crate::diag::line(&format!("service: cannot record the core state: {e}"));
+    }
+    stop()
   }
 
   /// Start an elevated copy of this executable for one operation.
@@ -591,10 +781,11 @@ mod imp {
         Ok("core started".into())
       }
       ServiceAction::Stop => {
-        // Succeeds when no service is registered: the installer calls this on
-        // every install, including the first one, where there is nothing to
-        // stop. Only a registered service that refuses to stop is an error, and
-        // the package turns that into an aborted install.
+        // Succeeds when no service is registered: the installer stops the core
+        // through `stop_for_update`, which calls this, and a machine that never
+        // registered the service has nothing to stop. Only a registered service
+        // that refuses to stop is an error, and the package turns that into an
+        // aborted install.
         stop()?;
         Ok("core stopped".into())
       }
@@ -1296,7 +1487,7 @@ mod imp {
   /// service so that autostart survives, and that also keeps the image path
   /// the previous package wrote. When the new package puts the executable
   /// somewhere else, the SCM would keep launching the old one (or fail), so
-  /// the installer's `service-resume` hook rewrites the path first. No-op when
+  /// the installer's `service-restore` hook rewrites the path first. No-op when
   /// the path already matches or nothing is registered.
   fn sync_image_path(a: &Autostart) -> Result<(), String> {
     let Some(service) = service_open(SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG) else {
@@ -1601,7 +1792,7 @@ mod imp {
 
   use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
-  use super::{Autostart, ServiceAction};
+  use super::{Autostart, ServiceAction, take_running_marker, write_running_marker};
 
   /// Name of the XDG desktop entry (`auto-launch` writes `thunet.desktop`).
   const APP_NAME: &str = "thunet";
@@ -1707,9 +1898,30 @@ mod imp {
     }
   }
 
-  /// Nothing to resume by hand: systemd applies `Restart=` and the enabled
-  /// unit starts at the next login.
+  /// Start the core again if it was running when `prerm` stopped it.
+  ///
+  /// `prerm` runs the machine-wide quit, which records that state and stops the
+  /// unit; `postinst` runs this as part of `service-restore`. `restart`, not `start`:
+  /// a core that is still alive here - a stop that failed, or a package whose
+  /// `prerm` left it running - is running the image that was just replaced. A
+  /// core that was stopped - no marker and nothing active - is left alone, so
+  /// an upgrade never resurrects a session the user turned off, whether or not
+  /// autostart is enabled.
+  #[cfg(target_os = "linux")]
   pub fn resume_after_update() -> Result<(), String> {
+    let was_running = take_running_marker() || core_active();
+    if !was_running || !unit_present() {
+      return Ok(());
+    }
+    systemctl(&["restart", CORE_UNIT])
+  }
+
+  /// macOS has no service manager for the core, so nothing was stopped and
+  /// nothing has to come back. The marker is still consumed, so a leftover from
+  /// some earlier install cannot answer a later one.
+  #[cfg(not(target_os = "linux"))]
+  pub fn resume_after_update() -> Result<(), String> {
+    let _ = take_running_marker();
     Ok(())
   }
 
@@ -1774,6 +1986,21 @@ mod imp {
       return Ok(already_done(action));
     }
     service_direct(action, a)
+  }
+
+  /// Stop the core for an install, recording whether the unit was running first.
+  ///
+  /// The marker is best effort - without it the resume leaves a stopped core
+  /// alone - but a stop that fails must reach the installer, which turns it into
+  /// an aborted install instead of leaving a half-replaced tree.
+  pub fn stop_for_update() -> Result<(), String> {
+    if let Err(e) = write_running_marker(core_active()) {
+      crate::diag::line(&format!("service: cannot record the core state: {e}"));
+    }
+    if unit_present() {
+      systemctl(&["stop", CORE_UNIT])?;
+    }
+    Ok(())
   }
 
   fn needs_admin(action: ServiceAction) -> bool {
@@ -1920,6 +2147,19 @@ mod imp {
   #[cfg(target_os = "linux")]
   fn unit_enabled() -> bool {
     systemctl(&["is-enabled", "--quiet", CORE_UNIT]).is_ok()
+  }
+
+  /// Whether the unit is running right now. This is what the installer records
+  /// before it stops the core: the user's choice, not the autostart setting.
+  #[cfg(target_os = "linux")]
+  fn core_active() -> bool {
+    systemctl(&["is-active", "--quiet", CORE_UNIT]).is_ok()
+  }
+
+  /// macOS has no unit at all, so nothing is ever running as a service.
+  #[cfg(not(target_os = "linux"))]
+  fn core_active() -> bool {
+    false
   }
 
   #[cfg(target_os = "linux")]

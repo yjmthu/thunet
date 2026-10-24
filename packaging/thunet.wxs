@@ -74,9 +74,9 @@
          two apart; without the condition every upgrade would silently drop the
          autostart registration. Deferred + Impersonate="no" because deleting a
          service needs the SYSTEM token, not the user's. The machine flag for the
-         same reason as `StopCoreService`: the helper refuses to run when it
-         looks portable, and a custom action must not depend on which
-         environment it inherited. -->
+         same reason as the quit step: the helper refuses to run when it looks
+         portable, and a custom action must not depend on which environment it
+         inherited. -->
     <CustomAction Id="RemoveCoreService" FileRef="THUnetExe"
                   ExeCommand="--machine service-admin uninstall"
                   Execute="deferred" Impersonate="no" Return="ignore" />
@@ -96,29 +96,48 @@
                   ExeCommand="--machine service-purge"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
-    <!-- The install stopped the service above; bring the new build back — but
-         only when it is set to start at boot. `demand` means the user turned
-         autostart off, and an upgrade must not resurrect that session. Also
-         deferred and unimpersonated so `service-resume` (which repairs the
-         ImagePath and the state ACLs) runs with SYSTEM's rights. -->
-    <CustomAction Id="ResumeCoreService" FileRef="THUnetExe"
-                  ExeCommand="service-resume"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Put the package back the way the install found it, in one command: the
+         core the quit step stopped (only if that step recorded it as running - a
+         `demand` core the user started by hand comes back too, which the start
+         type alone cannot express), then every window it closed, each in the
+         state it answered (open on screen, or hidden in the tray).
 
-    <!-- Ask every running window to quit, and wait for them. Closing a window
-         is not enough (a tray hides itself on WM_CLOSE) and killing it skips
-         its shutdown, so the command raises the app's own machine-wide quit
-         signal instead.
+         A commit action runs only when the transaction succeeded, and as SYSTEM
+         because `WTSQueryUserToken` needs it and `service-restore` repairs the
+         ImagePath and the state ACLs. The command reads and deletes both
+         records, ignores one older than ten minutes, and skips sessions nobody
+         is logged on to. -->
+    <CustomAction Id="RestoreAfterUpdate" FileRef="THUnetExe"
+                  ExeCommand="--machine service-restore"
+                  Execute="commit" Impersonate="no" Return="ignore" />
+
+    <!-- The installer's whole machine-wide half, in one command: ask every
+         running window to quit and wait for them, then stop the service.
+         Closing a window is not enough (a tray hides itself on WM_CLOSE) and
+         killing it skips its shutdown, so the command raises the app's own
+         machine-wide quit signal instead.
 
          One signal for the whole machine, not one per session: it is a
          `Global\` event that every machine-mode window polls, which is the only
          way to reach a tray in *another* session or *another user's* account —
          a session-scoped event cannot. It needs no running core; a window that
          ignores it (a portable setup deliberately does) keeps the old
-         executable mapped and surfaces at InstallValidate, so `Return="check"`
-         here only catches a failure to raise the signal. Raising it needs
-         administrator rights, and this action can run unelevated, so the
-         command asks for elevation itself (UAC); that prompt is expected.
+         executable mapped and surfaces at InstallValidate.
+
+         The stop belongs here for the same reason: the service holds
+         `thunet.exe` open, and `InstallValidate` is exactly the action that
+         checks those files — with the Restart Manager disabled it otherwise
+         waits out its own "file in use" timeout, which measured ~56 s on a
+         silent upgrade. The command waits for STOPPED and for the process to be
+         gone itself, and writes down whether the core was running before it
+         stopped it. `Return="check"` therefore covers both halves: windows that
+         refuse to end, and a core that refuses to stop.
+
+         Raising the signal and stopping the service need administrator rights,
+         and this action can run unelevated (per-machine `Scope` only makes
+         elevation required — it does not perform it; observed on a
+         double-clicked install), so the command asks for elevation itself
+         (UAC); that prompt is expected.
 
          `WixQuietExec` keeps the child's console hidden: a plain immediate
          custom action ran `taskkill` — a console program in the user's session
@@ -128,72 +147,37 @@
     <!-- The machine flag because an immediate custom action inherits the
          environment of whatever started msiexec: with a leftover
          `THUNET_STATE_DIR` the command would look for a portable endpoint that
-         has nothing to do with the machine setup, fail to find a core, and
-         still exit 0, so the windows would survive and InstallValidate would hit
-         mapped files later, far from the actual cause. The flag clears the
-         variable for this one invocation and leaves the rest of the process
-         alone. -->
+         has nothing to do with the machine setup, and leave both the windows
+         and the service alone. The flag clears the variable for this one
+         invocation and leaves the rest of the process alone. -->
     <SetProperty Id="WixQuietExecCmdLine"
                  Value="&quot;[BINDIR]thunet.exe&quot; --machine quit --all-sessions --timeout 15000"
                  Before="QuitAllWindows" Sequence="execute" />
     <CustomAction Id="QuitAllWindows" BinaryRef="Wix4UtilCA_X64"
                   DllEntry="WixQuietExec" Execute="immediate" Return="check" />
 
-    <!-- The service holds `thunet.exe` open for as long as it runs, and
-         `InstallValidate` is exactly the action that checks those files: with
-         the Restart Manager disabled it waits out its own "file in use"
-         timeout, which measured ~56 s on a silent upgrade. Stopping here, while
-         the sequence is still in the immediate phase, removes that wait
-         entirely. It waits for STOPPED itself, so the stop type is not
-         consulted here.
-
-         The human verb, and its self-elevation is the point: an immediate
-         action runs in the installer's client process, and per-machine `Scope`
-         only makes elevation required - it does not perform it. Observed on a
-         double-clicked install: this very step raised its own UAC prompt, so
-         the client was unelevated at that moment. `service stop` asks for the
-         rights when it has to and goes straight through when it already has
-         them, so `Return="check"` holds either way. The helper, which never
-         asks, is kept for the deferred actions below, where the token is
-         SYSTEM and a prompt would be both invisible and fatal. The machine
-         flag covers the other axis: a stray `THUNET_STATE_DIR` inherited from
-         whatever started msiexec must not steer this at a portable endpoint.
-         `RemoveCoreService` below uses the helper for `uninstall`. -->
-    <CustomAction Id="StopCoreService" FileRef="THUnetExe"
-                  ExeCommand="--machine service stop"
-                  Execute="immediate" Return="check" />
-
     <InstallExecuteSequence>
-      <!-- The core is stopped through the Service Control Manager — the
-           ServiceControl entry on MainExe below — which is the installer's own
-           SCM client: no `sc.exe` or `net.exe`, hence no console window, and
-           `Wait="yes"` holds the sequence at StopServices until the service
-           reports STOPPED. Installing, upgrading and uninstalling all pass
-           through it, which matters because the service can be registered by
-           the application itself without any previous package.
-
-           Every window is asked to quit first, before InstallValidate costs
-           the files: a still-mapped image cannot be replaced with the Restart
-           Manager disabled. The request travels through the core (it is the
-           only party that can reach another session), so it also has to happen
-           while the core is still running. -->
+      <!-- Before InstallValidate costs the files: a still-mapped image cannot be
+           replaced with the Restart Manager disabled, and this one command ends
+           both holders — the windows and the service. The `ServiceControl`
+           entry on MainExe below still runs at StopServices on every install,
+           upgrade and uninstall, which is the installer's own SCM client (no
+           `sc.exe` or `net.exe`, hence no console window, and `Wait="yes"`
+           holds the sequence until the service reports STOPPED), and it covers
+           a core this command did not reach. -->
       <Custom Action="QuitAllWindows" Before="InstallValidate"
-              Condition="Installed OR WIX_UPGRADE_DETECTED" />
-      <!-- After the windows are gone and still before InstallValidate: the
-           service is the other holder of the executable. -->
-      <Custom Action="StopCoreService" After="QuitAllWindows"
               Condition="Installed OR WIX_UPGRADE_DETECTED" />
       <!-- Before RemoveFiles: the helper still has to exist. -->
       <Custom Action="RemoveCoreService" Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="PurgeMachineState" After="RemoveCoreService"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
-      <!-- After the files are in place, not during an uninstall. The stop runs
-           on a first install too, so the matching resume has to as well. -->
-      <Custom Action="ResumeCoreService" After="InstallFiles"
+      <!-- After the files are in place, not during an uninstall: the same
+           condition the quit step above uses to run. -->
+      <Custom Action="RestoreAfterUpdate" After="InstallFinalize"
               Condition="NOT REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchApp" After="InstallFinalize"
-              Condition="UILevel &gt;= 4 AND NOT REMOVE=&quot;ALL&quot;" />
+              Condition="UILevel &gt;= 4 AND NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles64Folder">

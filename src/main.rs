@@ -393,14 +393,15 @@ enum Cmd {
     #[arg(value_enum)]
     action: autostart::ServiceAction,
   },
-  /// Restart the core after an upgrade if it starts at boot (installer
-  /// internal).
-  #[command(hide = true)]
-  ServiceResume,
   /// Delete the machine state directory after a real uninstall (installer
   /// internal; never called for an upgrade or repair).
   #[command(hide = true)]
   ServicePurge,
+  /// Put the package back the way the install found it: start the core if it
+  /// was running, then restore the windows the quit step closed (installer
+  /// internal).
+  #[command(hide = true)]
+  ServiceRestore,
   /// Ask the running window to quit, then wait until it is really gone.
   ///
   /// Closing the window only hides it — that is what a tray app has to do — and
@@ -411,14 +412,17 @@ enum Cmd {
     /// Give up (and report) after this many milliseconds.
     #[arg(long, default_value_t = 20_000)]
     timeout: u64,
-    /// End every window on the machine, not just this session's.
+    /// End every window on the machine, not just this session's, and stop the
+    /// core - the whole machine-wide half of an install.
     ///
     /// The per-session doorbell cannot cross a session, so windows in other
     /// sessions or other users' accounts would otherwise survive an upgrade
     /// that leaves their executable replaced. A machine-wide signal reaches
     /// them and needs no core, so it works even when the service is stopped;
     /// raising it needs administrator rights, which this command asks for
-    /// through the same helper as the other privileged verbs. A portable setup
+    /// through the same helper as the other privileged verbs. The core is
+    /// stopped afterwards, and whether it was running is recorded so
+    /// `service-restore` can bring it back in the same state. A portable setup
     /// treats the flag as a plain quit.
     #[arg(long)]
     all_sessions: bool,
@@ -494,9 +498,9 @@ fn run(cli: Cli) -> Result<(), String> {
   // no config, no core, no window.
   if cli.signal_only {
     // The elevated half of `quit --all-sessions`: raise the machine-wide signal,
-    // give every window time to answer, write the record an upgrade reads, and
-    // exit. Nothing else - no config, no core, no window.
-    finish_machine_quit(single::machine_quit()?);
+    // give every window time to answer, write the record an upgrade reads, stop
+    // the core, and exit. Nothing else - no config, no window.
+    finish_machine_quit(single::machine_quit()?)?;
     return Ok(());
   }
   // Effective settings: config file first, explicit CLI flags win.
@@ -812,7 +816,16 @@ fn run(cli: Cli) -> Result<(), String> {
       }
       autostart::service_admin(action)
     }
-    Cmd::ServiceResume => autostart::Autostart::resume_after_update(),
+    // One command for the whole upgrade tail, because the two halves belong to
+    // one transaction: the core first (the windows connect to it), then each
+    // window in the state it answered. Both run even when the core fails to
+    // start - a slow service must not also swallow the windows - and the first
+    // error is what the installer sees.
+    Cmd::ServiceRestore => {
+      let core = autostart::Autostart::resume_after_update();
+      let windows = single::restore_windows();
+      core.and(windows)
+    }
     // Same rule as `service-admin`: the installer passes `--machine`, and a
     // portable caller must not delete the window's own state directory with a
     // verb that claims to be about the machine.
@@ -832,18 +845,18 @@ fn run(cli: Cli) -> Result<(), String> {
     } => {
       let budget = Duration::from_millis(timeout);
       if all_sessions && !ipc::portable() {
-        // The machine-wide signal is the whole mechanism: it needs no core, and
-        // an uninstall often runs with the service already stopped. Raising it
+        // The machine-wide signal is the whole mechanism: it needs no core to
+        // relay it, so it reaches windows whose core is already gone. Raising it
         // needs administrator rights, so an attempt that fails without them is
-        // retried through the same elevation helper every other privileged
-        // verb uses; the elevated copy raises the signal, holds it for a
-        // moment, and exits. This session's window is closed by the doorbell
-        // afterwards, whichever half ran the signal.
+        // retried through the same elevation helper every other privileged verb
+        // uses; the elevated copy raises the signal, holds it for a moment,
+        // writes the record and stops the core. This session's window is closed
+        // by the doorbell afterwards, whichever half ran the signal.
         match single::machine_quit() {
           Ok(signal) => {
             let waited = single::quit_and_wait(budget);
-            finish_machine_quit(signal);
-            return waited;
+            let stopped = finish_machine_quit(signal);
+            return waited.and(stopped);
           }
           Err(e) if crate::elevate::is_elevated() => return Err(e),
           Err(_) => {
@@ -860,19 +873,29 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 /// Keep the machine-wide signal up long enough for every window to see it and
-/// answer, then write the record an upgrade uses to put those windows back.
+/// answer, write the record an upgrade uses to put those windows back, then stop
+/// the core.
 ///
-/// Only an elevated process may write the record: it names other users, and an
-/// installer is the only thing that reads it.
-fn finish_machine_quit(signal: single::MachineQuit) {
+/// The order is the whole point: the answers name windows that are about to
+/// disappear, and whether the core is running is only knowable before it stops.
+/// Both are written before `stop_for_update`.
+///
+/// Only an elevated process may write the record or stop the service: the record
+/// names other users, and a service belongs to the machine. The stop's failure
+/// is returned, because an installer has to abort rather than replace an image
+/// that is still mapped.
+fn finish_machine_quit(signal: single::MachineQuit) -> Result<(), String> {
   std::thread::sleep(Duration::from_millis(1000));
+  let mut result = Ok(());
   if crate::elevate::is_elevated() {
     let acks = signal.acks();
     if let Err(e) = single::write_quit_record(&acks) {
       eprintln!("{e}");
     }
+    result = autostart::stop_for_update();
   }
   drop(signal);
+  result
 }
 
 /// Connect to the running core, or explain how to start it.

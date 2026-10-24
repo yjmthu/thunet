@@ -77,6 +77,8 @@ pub use imp::MachineQuit;
 pub struct QuitAck {
   pub uid: u32,
   pub pid: u32,
+  /// Windows session id; 0 on Unix, where the uid is what a relaunch uses.
+  pub session: u32,
   /// The window was hidden or minimized to the tray when it answered.
   pub minimized: bool,
 }
@@ -87,6 +89,65 @@ pub struct QuitAck {
 /// windows an installer never closed.
 pub fn write_quit_record(acks: &[QuitAck]) -> Result<(), String> {
   imp::write_quit_record(acks)
+}
+
+/// Put back the windows a previous installer step closed.
+///
+/// The MSI runs this as SYSTEM after the files are in place; the `.deb` runs
+/// it from `postinst`. A session (Windows) or user (Linux) with nobody logged
+/// on is skipped, and a record older than ten minutes is ignored.
+pub fn restore_windows() -> Result<(), String> {
+  imp::restore_windows()
+}
+
+/// One line of the record an upgrade reads back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordEntry {
+  Uid { uid: u32, minimized: bool },
+  Session { session: u32, minimized: bool },
+}
+
+/// Parse the record written by [`write_quit_record`].
+///
+/// Line-based on purpose: the file sits between two installer processes, and a
+/// human reading it during a failed upgrade should not need a decoder.
+fn parse_quit_record(text: &str) -> (u128, Vec<RecordEntry>) {
+  let mut at = 0;
+  let mut entries = Vec::new();
+  for line in text.lines() {
+    let mut parts = line.split_whitespace();
+    match parts.next() {
+      Some("at") => at = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+      Some("uid") => {
+        let uid = parts.next().and_then(|v| v.parse::<u32>().ok());
+        let state = parts.next().unwrap_or("minimized");
+        if let Some(uid) = uid {
+          entries.push(RecordEntry::Uid {
+            uid,
+            minimized: state != "visible",
+          });
+        }
+      }
+      Some("session") => {
+        let session = parts.next().and_then(|v| v.parse::<u32>().ok());
+        let state = parts.next().unwrap_or("minimized");
+        if let Some(session) = session {
+          entries.push(RecordEntry::Session {
+            session,
+            minimized: state != "visible",
+          });
+        }
+      }
+      _ => {}
+    }
+  }
+  (at, entries)
+}
+
+/// A record older than ten minutes belongs to an installation that never
+/// completed, and must not reopen anything.
+fn record_is_fresh(at: u128, now: u128) -> bool {
+  at > 0 && now.saturating_sub(at) <= 600_000
 }
 
 /// Best-effort cleanup before `std::process::exit`, which skips [`Guard::drop`].
@@ -258,39 +319,69 @@ mod imp {
   const MACHINE_QUIT_NAME: &str = r"Global\thunet-machine-quit";
   /// SYSTEM and administrators may set it; interactive users may only wait.
   const MACHINE_QUIT_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;IU)";
+  /// The answer channel. A `Global\` event carries no payload, so the state each
+  /// window reports travels on a machine-wide pipe instead. Pipes can be created
+  /// by any user, so the sender insists on the first instance and only raises
+  /// the event after the pipe exists.
+  const MACHINE_QUIT_PIPE: &str = r"\\.\pipe\thunet-machine-quit";
+  /// SYSTEM and administrators may do anything; interactive users may write.
+  const MACHINE_QUIT_PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GW;;;IU)";
 
   pub struct MachineQuit {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    event: windows_sys::Win32::Foundation::HANDLE,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    acks: std::sync::Arc<std::sync::Mutex<Vec<super::QuitAck>>>,
   }
 
   impl Drop for MachineQuit {
     fn drop(&mut self) {
+      self.stop.store(true, Ordering::SeqCst);
+      if let Some(thread) = self.thread.take() {
+        let _ = thread.join();
+      }
       // SAFETY: the handle came from CreateEventW and is closed exactly once.
-      unsafe { CloseHandle(self.handle) };
+      unsafe { CloseHandle(self.event) };
     }
   }
 
-  pub fn machine_quit() -> Result<MachineQuit, String> {
-    use windows_sys::Win32::Foundation::LocalFree;
+  impl MachineQuit {
+    pub fn acks(&self) -> Vec<super::QuitAck> {
+      match self.acks.lock() {
+        Ok(list) => list.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+      }
+    }
+  }
+
+  /// Build the security attributes a named object is created with.
+  fn security(
+    sddl: &str,
+  ) -> Result<
+    (
+      windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+      windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    ),
+    String,
+  > {
     use windows_sys::Win32::Security::Authorization::{
       ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
-    let sddl = wide(MACHINE_QUIT_SDDL);
+    let text = wide(sddl);
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: both pointers are valid for the call; the descriptor is released
-    // below.
+    // by the caller.
     let ok = unsafe {
       ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sddl.as_ptr(),
+        text.as_ptr(),
         SDDL_REVISION_1,
         &mut descriptor,
         std::ptr::null_mut(),
       )
     };
     if ok == 0 || descriptor.is_null() {
-      // SAFETY: plain call with no arguments.
       let err = unsafe { GetLastError() };
       return Err(format!("cannot parse the quit DACL (error {err})"));
     }
@@ -299,27 +390,158 @@ mod imp {
       lpSecurityDescriptor: descriptor,
       bInheritHandle: 0,
     };
-    let name = wide(MACHINE_QUIT_NAME);
+    Ok((attributes, descriptor))
+  }
+
+  pub fn machine_quit() -> Result<MachineQuit, String> {
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Storage::FileSystem::{
+      FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
+    };
+    use windows_sys::Win32::System::Pipes::{
+      CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    };
+
+    // The answer channel first: a window that sees the event connects here, so
+    // the pipe must exist before the event can be seen.
+    let (attributes, descriptor) = security(MACHINE_QUIT_PIPE_SDDL)?;
+    let pipe_name = wide(MACHINE_QUIT_PIPE);
+    let pipe = unsafe {
+      CreateNamedPipeW(
+        pipe_name.as_ptr(),
+        PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        0,
+        256,
+        0,
+        &attributes,
+      )
+    };
+    // SAFETY: the descriptor was allocated by `security`.
+    unsafe { LocalFree(descriptor as _) };
+    if pipe == INVALID_HANDLE_VALUE {
+      let err = unsafe { GetLastError() };
+      return Err(format!("cannot create the quit pipe (error {err})"));
+    }
+
+    let (attributes, descriptor) = security(MACHINE_QUIT_SDDL)?;
+    let event_name = wide(MACHINE_QUIT_NAME);
     // Manual reset: every waiting window has to see the request, not just the
     // first one. The name lives in the Global namespace, which needs
     // SeCreateGlobalPrivilege - i.e. the administrator rights an uninstall has.
     // SAFETY: the name and the attributes outlive the call.
-    let handle = unsafe { CreateEventW(&attributes, 1, 0, name.as_ptr()) };
-    // SAFETY: the descriptor was allocated by the conversion above.
+    let event = unsafe { CreateEventW(&attributes, 1, 0, event_name.as_ptr()) };
+    // SAFETY: the descriptor was allocated by `security`.
     unsafe { LocalFree(descriptor as _) };
-    if handle.is_null() {
-      // SAFETY: plain call with no arguments.
+    if event.is_null() {
+      // SAFETY: the pipe came from CreateNamedPipeW and is closed once.
+      unsafe { CloseHandle(pipe) };
       let err = unsafe { GetLastError() };
       return Err(format!(
         "cannot create the machine quit event (error {err})"
       ));
     }
-    // SAFETY: the handle is live.
-    unsafe { SetEvent(handle) };
-    Ok(MachineQuit { handle })
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let acks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let thread = {
+      let stop = stop.clone();
+      let acks = acks.clone();
+      // Raw handles are not `Send`; a pointer-sized integer is.
+      let raw = pipe as isize;
+      std::thread::spawn(move || {
+        read_answers(raw as windows_sys::Win32::Foundation::HANDLE, stop, acks)
+      })
+    };
+    // Only now may a window see the signal.
+    unsafe { SetEvent(event) };
+    Ok(MachineQuit {
+      event,
+      stop,
+      thread: Some(thread),
+      acks,
+    })
   }
 
-  pub fn machine_quit_requested(_minimized: bool) -> bool {
+  /// Read one answer per window off the pipe until the signal is withdrawn.
+  fn read_answers(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    acks: std::sync::Arc<std::sync::Mutex<Vec<super::QuitAck>>>,
+  ) {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+    use windows_sys::Win32::System::Pipes::{
+      ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    while !stop.load(Ordering::SeqCst) {
+      // `PIPE_NOWAIT`: returns `ERROR_PIPE_LISTENING` when no client is there,
+      // so the loop can observe the stop flag.
+      let connected = unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) } != 0;
+      let err = unsafe { GetLastError() };
+      if !connected && err != ERROR_PIPE_CONNECTED {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        continue;
+      }
+      let mut pid = 0u32;
+      let have_pid = unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } != 0;
+      let minimized = read_state(pipe);
+      let mut session = 0u32;
+      if have_pid && unsafe { ProcessIdToSessionId(pid, &mut session) } == 0 {
+        session = 0;
+      }
+      if have_pid
+        && session > 0
+        && let Ok(mut list) = acks.lock()
+      {
+        list.push(super::QuitAck {
+          uid: 0,
+          pid,
+          session,
+          minimized,
+        });
+      }
+      unsafe { DisconnectNamedPipe(pipe) };
+    }
+    // SAFETY: the pipe came from CreateNamedPipeW and is closed once, here.
+    unsafe { CloseHandle(pipe) };
+  }
+
+  /// The state line a window wrote, defaulting to the tray when it said
+  /// nothing or was too slow.
+  fn read_state(pipe: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+    let mut buffer = [0u8; 32];
+    let mut read = 0u32;
+    for _ in 0..10 {
+      // `PIPE_NOWAIT` makes this nonblocking; the client may not have written
+      // yet, hence the retries.
+      let ok = unsafe {
+        ReadFile(
+          pipe,
+          buffer.as_mut_ptr(),
+          buffer.len() as u32,
+          &mut read,
+          std::ptr::null_mut(),
+        )
+      };
+      if ok != 0 && read > 0 {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let text = String::from_utf8_lossy(&buffer[..read as usize]);
+    !text.trim().eq_ignore_ascii_case("visible")
+  }
+
+  pub fn machine_quit_requested(minimized: bool) -> bool {
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, WriteFile};
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
     let name = wide(MACHINE_QUIT_NAME);
     // SAFETY: plain Win32 calls on a NUL-terminated name that outlives them.
     let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
@@ -330,21 +552,213 @@ mod imp {
     let signaled = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
     // SAFETY: the handle is closed exactly once.
     unsafe { CloseHandle(handle) };
-    signaled
+    if !signaled {
+      return false;
+    }
+
+    // Leave the state on the answer pipe. A failure here still ends the window;
+    // the sender then restores it in the tray.
+    let pipe = wide(MACHINE_QUIT_PIPE);
+    let open = || unsafe {
+      CreateFileW(
+        pipe.as_ptr(),
+        GENERIC_WRITE,
+        0,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        0,
+        std::ptr::null_mut(),
+      )
+    };
+    let mut file = open();
+    if file == INVALID_HANDLE_VALUE {
+      let _ = unsafe { WaitNamedPipeW(pipe.as_ptr(), 200) };
+      file = open();
+    }
+    if file != INVALID_HANDLE_VALUE {
+      let line: &[u8] = if minimized {
+        b"minimized\n"
+      } else {
+        b"visible\n"
+      };
+      let mut written = 0u32;
+      // SAFETY: the handle is a live pipe and the buffer outlives the call.
+      unsafe {
+        WriteFile(
+          file,
+          line.as_ptr(),
+          line.len() as u32,
+          &mut written,
+          std::ptr::null_mut(),
+        )
+      };
+      // SAFETY: the handle is closed exactly once.
+      unsafe { CloseHandle(file) };
+    }
+    true
   }
 
-  /// The record is the Linux half of the upgrade story for now: Windows needs a
-  /// per-session relaunch from the MSI, which is written together with that
-  /// installer step.
-  pub fn write_quit_record(_acks: &[super::QuitAck]) -> Result<(), String> {
+  pub fn write_quit_record(acks: &[super::QuitAck]) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    let dir = crate::config::machine_dir();
+    let path = dir.join("quit-record");
+    if acks.is_empty() {
+      let _ = std::fs::remove_file(&path);
+      return Ok(());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let at = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+    // One line per session: a machine setup has one window per session, and a
+    // visible one wins over a hidden one.
+    let mut sessions: BTreeMap<u32, bool> = BTreeMap::new();
+    for ack in acks {
+      if ack.session == 0 {
+        continue;
+      }
+      sessions
+        .entry(ack.session)
+        .and_modify(|minimized| *minimized = *minimized && ack.minimized)
+        .or_insert(ack.minimized);
+    }
+    let mut text = format!("at {at}\n");
+    for (session, minimized) in sessions {
+      let state = if minimized { "minimized" } else { "visible" };
+      text.push_str(&format!("session {session} {state}\n"));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+  }
+
+  /// Put back the windows a previous installer step closed, one per session.
+  pub fn restore_windows() -> Result<(), String> {
+    let path = crate::config::machine_dir().join("quit-record");
+    let text = match std::fs::read_to_string(&path) {
+      Ok(text) => text,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let _ = std::fs::remove_file(&path);
+
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+    let (at, entries) = super::parse_quit_record(&text);
+    if !super::record_is_fresh(at, now) {
+      return Ok(());
+    }
+    for entry in entries {
+      let super::RecordEntry::Session { session, minimized } = entry else {
+        continue;
+      };
+      if let Err(e) = launch_in_session(session, minimized) {
+        crate::diag::line(&format!("quit-record: session {session}: {e}"));
+      }
+    }
     Ok(())
   }
 
-  impl MachineQuit {
-    /// Windows has no in-band reply yet: the event carries no payload, so the
-    /// MSI half will collect the sessions itself.
-    pub fn acks(&self) -> Vec<super::QuitAck> {
-      Vec::new()
+  /// Start the window as the user logged on to `session`.
+  fn launch_in_session(session: u32, minimized: bool) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{
+      DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary,
+    };
+    use windows_sys::Win32::System::Environment::{
+      CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    use windows_sys::Win32::System::Threading::{
+      CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { WTSQueryUserToken(session, &mut token) } == 0 {
+      let err = unsafe { GetLastError() };
+      return Err(format!("no user token (error {err})"));
+    }
+    let mut primary: HANDLE = std::ptr::null_mut();
+    let duplicated = unsafe {
+      DuplicateTokenEx(
+        token,
+        TOKEN_ALL_ACCESS,
+        std::ptr::null(),
+        SecurityImpersonation,
+        TokenPrimary,
+        &mut primary,
+      )
+    } != 0;
+    // SAFETY: the token came from WTSQueryUserToken and is closed once.
+    unsafe { CloseHandle(token) };
+    if !duplicated {
+      let err = unsafe { GetLastError() };
+      return Err(format!("cannot duplicate the token (error {err})"));
+    }
+
+    let mut environment: *mut std::ffi::c_void = std::ptr::null_mut();
+    let have_environment = unsafe { CreateEnvironmentBlock(&mut environment, primary, 0) } != 0;
+
+    let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
+    let mut command: Vec<u16> = format!(
+      "\"{}\" {}",
+      exe.display(),
+      if minimized {
+        "--minimized"
+      } else {
+        "--visible"
+      }
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let mut desktop: Vec<u16> = "winsta0\\default"
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect();
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.lpDesktop = desktop.as_mut_ptr();
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    let created = unsafe {
+      CreateProcessAsUserW(
+        primary,
+        std::ptr::null(),
+        command.as_mut_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        0,
+        CREATE_UNICODE_ENVIRONMENT,
+        if have_environment {
+          environment
+        } else {
+          std::ptr::null()
+        },
+        std::ptr::null(),
+        &startup,
+        &mut process,
+      )
+    } != 0;
+    if have_environment {
+      unsafe { DestroyEnvironmentBlock(environment) };
+    }
+    if created {
+      // SAFETY: the handles came from CreateProcessAsUserW.
+      unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+      }
+    }
+    // SAFETY: the token came from DuplicateTokenEx and is closed once.
+    unsafe { CloseHandle(primary) };
+    if created {
+      Ok(())
+    } else {
+      let err = unsafe { GetLastError() };
+      Err(format!("cannot start the window (error {err})"))
     }
   }
 }
@@ -512,6 +926,87 @@ mod imp {
     Ok(())
   }
 
+  /// Put back the windows a previous installer step closed, one per user.
+  ///
+  /// `postinst` runs this as root. `systemd-run --user --machine=<user>@.host`
+  /// is what puts the window into that user's graphical session: the user
+  /// manager already carries `DISPLAY`/`WAYLAND_DISPLAY`, which a maintainer
+  /// script cannot reconstruct by hand.
+  #[cfg(target_os = "linux")]
+  pub fn restore_windows() -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    const RECORD: &str = "/run/thunet-quit-record";
+    let text = match std::fs::read_to_string(RECORD) {
+      Ok(text) => text,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(e) => return Err(format!("{RECORD}: {e}")),
+    };
+    let _ = std::fs::remove_file(RECORD);
+
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+    let (at, entries) = super::parse_quit_record(&text);
+    if !super::record_is_fresh(at, now) {
+      return Ok(());
+    }
+    let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
+    for entry in entries {
+      let super::RecordEntry::Uid { uid, minimized } = entry else {
+        continue;
+      };
+      let Some(user) = user_name(uid) else {
+        continue;
+      };
+      let flag = if minimized {
+        "--minimized"
+      } else {
+        "--visible"
+      };
+      let machine = format!("--machine={user}@.host");
+      let status = Command::new("systemd-run")
+        .args(["--user", &machine, "--collect", "--quiet"])
+        .arg(&exe)
+        .arg(flag)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+      if let Err(e) = status {
+        crate::diag::line(&format!("quit-record: {user}: systemd-run: {e}"));
+      }
+    }
+    Ok(())
+  }
+
+  /// The account name for a uid, without a `libc` passwd-buffer dance.
+  /// `getent` is part of every Debian base system, which is where the `.deb`
+  /// runs this.
+  #[cfg(target_os = "linux")]
+  fn user_name(uid: u32) -> Option<String> {
+    let output = std::process::Command::new("getent")
+      .args(["passwd", &uid.to_string()])
+      .output()
+      .ok()?;
+    if !output.status.success() {
+      return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text
+      .split(':')
+      .next()
+      .filter(|name| !name.is_empty())
+      .map(str::to_string)
+  }
+
+  /// The `.deb` is the only user of this command, and macOS has no record.
+  #[cfg(not(target_os = "linux"))]
+  pub fn restore_windows() -> Result<(), String> {
+    Ok(())
+  }
+
   /// The machine-wide quit channel on Linux: a socket only root can create.
   ///
   /// A named event has no direct Unix equivalent; a filesystem socket in `/run`
@@ -616,6 +1111,7 @@ mod imp {
                   list.push(super::super::QuitAck {
                     uid,
                     pid,
+                    session: 0,
                     minimized,
                   });
                 }
@@ -778,21 +1274,61 @@ mod tests {
         QuitAck {
           uid: 1000,
           pid: 1,
+          session: 0,
           minimized: true,
         },
         QuitAck {
           uid: 1000,
           pid: 2,
+          session: 1,
           minimized: false,
         },
         QuitAck {
           uid: 1001,
           pid: 3,
+          session: 0,
           minimized: true,
         },
       ],
       123,
     );
     assert_eq!(text, "at 123\nuid 1000 visible\nuid 1001 minimized\n");
+  }
+
+  /// The record is shared with Windows: one parser, two key kinds, and a state
+  /// that defaults to the tray.
+  #[test]
+  fn the_record_parses_by_kind() {
+    let (at, entries) = parse_quit_record(
+      "at 123\nuid 1000 minimized\nsession 2 visible\nnot a record line\nuid 1001\n",
+    );
+    assert_eq!(at, 123);
+    assert_eq!(
+      entries,
+      vec![
+        RecordEntry::Uid {
+          uid: 1000,
+          minimized: true
+        },
+        RecordEntry::Session {
+          session: 2,
+          minimized: false
+        },
+        RecordEntry::Uid {
+          uid: 1001,
+          minimized: true
+        }
+      ]
+    );
+  }
+
+  /// Ten minutes is the line between "this transaction" and "a leftover".
+  #[test]
+  fn a_record_is_fresh_for_ten_minutes() {
+    assert!(record_is_fresh(1_000, 1_000));
+    assert!(record_is_fresh(1_000, 601_000));
+    assert!(!record_is_fresh(1_000, 601_001));
+    assert!(record_is_fresh(1_000, 999), "clock skew is not staleness");
+    assert!(!record_is_fresh(0, 1_000), "no timestamp is not fresh");
   }
 }

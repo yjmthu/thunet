@@ -1,12 +1,16 @@
 #!/bin/sh
 set -e
 
-# Ask every machine-mode window to end before the files are touched. Closing a
-# window only hides it (a tray app has to), and killing it skips its shutdown.
+# The machine-wide half of an install is one command. `quit --all-sessions` ends
+# every machine-mode window through a signal that needs no core, waits for their
+# answers and writes them down, then stops the core and records whether it was
+# running - so `postinst` can put the same windows and the same core back.
+# Closing a window only hides it (a tray app has to), and killing it skips its
+# shutdown; and the core has to go before the executable is replaced, because it
+# would otherwise keep running the old image.
 #
-# The command raises a machine-wide signal that needs no running core - an
-# uninstall often runs with the service already stopped. Portable windows are
-# left alone: they belong to a state directory, not to the machine setup.
+# Portable windows are left alone: they belong to a state directory, not to the
+# machine setup, and the command still exits for this session alone.
 #
 # `|| true`: a wedged window must neither hang nor fail a removal. Linux keeps a
 # mapped image alive, so the files free themselves anyway.
@@ -15,9 +19,5 @@ case "${1:-}" in
     /usr/bin/thunet --machine quit --all-sessions --timeout 3000 || true
     ;;
 esac
-
-if [ -d /run/systemd/system ]; then
-  systemctl stop thunet.service || true
-fi
 
 exit 0
