@@ -4412,9 +4412,11 @@ impl eframe::App for App {
     // The machine-wide request reaches windows in other sessions, and unlike
     // the per-user doorbell above it does not need a core to relay it. Portable
     // windows are left alone by an uninstall, so they never look. The answer
-    // travels back on the same connection: an upgrade reads it to put the
-    // windows back in the tray afterwards.
-    if !self.quitting && !crate::ipc::portable() && crate::single::machine_quit_requested() {
+    // carries this window's state, so an upgrade puts it back the way it was.
+    if !self.quitting
+      && !crate::ipc::portable()
+      && crate::single::machine_quit_requested(!self.shown)
+    {
       self.quit();
     }
 

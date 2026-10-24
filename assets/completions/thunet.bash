@@ -113,7 +113,7 @@ _thunet() {
 
     case "${cmd}" in
         thunet)
-            opts="-h -V --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help --version selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help"
+            opts="-h -V --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help --version selftest ac-id status login logout core service service-admin service-resume service-purge quit config shortcut completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -151,7 +151,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__ac__subcmd__id)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -189,7 +189,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__completions)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help bash elvish fish powershell zsh"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help bash elvish fish powershell zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -227,7 +227,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__config)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -265,7 +265,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__core)
-            opts="-h --service --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --service --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -527,7 +527,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__login)
-            opts="-v -i -h --verbose --interactive --cmd --bash --pwsh --zsh --sh --fish --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-v -i -h --verbose --interactive --cmd --bash --pwsh --zsh --sh --fish --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -565,7 +565,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__logout)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -603,7 +603,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__quit)
-            opts="-h --timeout --all-sessions --host --http --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --timeout --all-sessions --host --http --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -641,7 +641,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__selftest)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -679,7 +679,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help install uninstall enable disable start stop restart status"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -717,7 +717,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__admin)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help install uninstall enable disable start stop restart status"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help install uninstall enable disable start stop restart status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -755,7 +755,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__purge)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -793,7 +793,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__service__subcmd__resume)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -831,7 +831,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__shortcut)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -869,7 +869,7 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__status)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

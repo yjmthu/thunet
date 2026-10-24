@@ -23,6 +23,7 @@ _thunet() {
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -48,6 +49,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -64,6 +66,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -80,6 +83,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -106,6 +110,7 @@ _arguments "${_arguments_options[@]}" : \
 '--fish[Alias for \`--bash\`]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -122,6 +127,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -139,6 +145,7 @@ _arguments "${_arguments_options[@]}" : \
 '--service[Started by the Windows service manager; not for humans]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -155,6 +162,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -179,6 +187,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -203,6 +212,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -219,6 +229,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -236,6 +247,7 @@ _arguments "${_arguments_options[@]}" : \
 '--all-sessions[End every window on the machine, not just this session'\''s]' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -252,6 +264,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -268,6 +281,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help]' \
@@ -284,6 +298,7 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '--http[Use plain http instead of https]' \
 '--minimized[Start minimised to the tray (used by the autostart entry)]' \
+'--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
 '-h[Print help (see more with '\''--help'\'')]' \

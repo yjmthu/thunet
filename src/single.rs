@@ -60,9 +60,10 @@ pub fn machine_quit() -> Result<MachineQuit, String> {
 /// Has a machine-wide quit been asked for right now?
 ///
 /// Machine-mode windows poll this every frame; portable ones never do, because
-/// an uninstall leaves them alone.
-pub fn machine_quit_requested() -> bool {
-  imp::machine_quit_requested()
+/// an uninstall leaves them alone. `minimized` is this window's state, which the
+/// answer carries so an upgrade can restore it the same way.
+pub fn machine_quit_requested(minimized: bool) -> bool {
+  imp::machine_quit_requested(minimized)
 }
 
 pub use imp::MachineQuit;
@@ -70,12 +71,14 @@ pub use imp::MachineQuit;
 /// One machine window that answered the quit signal.
 ///
 /// The answer is what lets an upgrade put the windows back afterwards: only a
-/// machine-mode window answers, and it names the user that has to be
-/// relaunched. Portable windows never see the signal and never answer.
+/// machine-mode window answers, and it names the user and the state to restore.
+/// Portable windows never see the signal and never answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuitAck {
   pub uid: u32,
   pub pid: u32,
+  /// The window was hidden or minimized to the tray when it answered.
+  pub minimized: bool,
 }
 
 /// Write the record an upgrade reads to put the windows back.
@@ -316,7 +319,7 @@ mod imp {
     Ok(MachineQuit { handle })
   }
 
-  pub fn machine_quit_requested() -> bool {
+  pub fn machine_quit_requested(_minimized: bool) -> bool {
     let name = wide(MACHINE_QUIT_NAME);
     // SAFETY: plain Win32 calls on a NUL-terminated name that outlives them.
     let handle = unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) };
@@ -457,13 +460,19 @@ mod imp {
   #[cfg(target_os = "linux")]
   pub(super) fn record_text(acks: &[super::QuitAck], at: u128) -> String {
     let mut text = format!("at {at}\n");
-    let mut users = std::collections::BTreeSet::new();
+    // One line per user: a machine setup has one window per session, and the
+    // relaunch is per user manager. If any of that user's windows was open,
+    // the restored one is open too.
+    let mut users = std::collections::BTreeMap::new();
     for ack in acks {
-      // One per user is enough: a machine setup has one window per session, and
-      // the relaunch is per user manager.
-      if users.insert(ack.uid) {
-        text.push_str(&format!("uid {}\n", ack.uid));
-      }
+      users
+        .entry(ack.uid)
+        .and_modify(|minimized| *minimized = *minimized && ack.minimized)
+        .or_insert(ack.minimized);
+    }
+    for (uid, minimized) in users {
+      let state = if minimized { "minimized" } else { "visible" };
+      text.push_str(&format!("uid {uid} {state}\n"));
     }
     text
   }
@@ -516,6 +525,7 @@ mod imp {
   /// counted nor restarted.
   #[cfg(target_os = "linux")]
   pub(super) mod machine {
+    use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -558,8 +568,8 @@ mod imp {
       machine_quit_at(PathBuf::from(SOCKET))
     }
 
-    pub fn machine_quit_requested() -> bool {
-      request_at(Path::new(SOCKET))
+    pub fn machine_quit_requested(minimized: bool) -> bool {
+      request_at(Path::new(SOCKET), minimized)
     }
 
     /// Bind the signal at `path`. Split out so a test can use a temporary
@@ -590,11 +600,24 @@ mod imp {
           while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
               Ok((stream, _)) => {
+                // The kernel names the peer, so the uid and pid cannot be
+                // spoofed; the one line says which state to restore. A window
+                // that says nothing is restored in the tray.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut line = String::new();
+                let minimized = match BufReader::new(&stream).read_line(&mut line) {
+                  Ok(n) if n > 0 => !line.trim().eq_ignore_ascii_case("visible"),
+                  _ => true,
+                };
                 if let Some((uid, pid)) = peer(&stream)
                   && uid > 0
                   && let Ok(mut list) = acks.lock()
                 {
-                  list.push(super::super::QuitAck { uid, pid });
+                  list.push(super::super::QuitAck {
+                    uid,
+                    pid,
+                    minimized,
+                  });
                 }
               }
               Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -633,13 +656,25 @@ mod imp {
       (ok == 0).then(|| (cred.uid, cred.pid as u32))
     }
 
-    /// Ask whether the signal is up. The connection itself is this window's
-    /// answer: the sender reads the uid and pid from the kernel, so nothing has
-    /// to be written and nothing can be spoofed. `true` means the window ends.
-    pub(crate) fn request_at(path: &Path) -> bool {
+    /// Ask whether the signal is up and report this window's state. The uid and
+    /// pid come from the kernel, so they cannot be spoofed; the line only says
+    /// whether the window was hidden in the tray. `true` means the window ends.
+    pub(crate) fn request_at(path: &Path, minimized: bool) -> bool {
       // A plain file, or a socket whose sender is gone, fails to connect: a
       // crash must never turn into a spurious quit later.
-      UnixStream::connect(path).is_ok()
+      let Ok(mut stream) = UnixStream::connect(path) else {
+        return false;
+      };
+      let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+      let line = if minimized {
+        "minimized\n"
+      } else {
+        "visible\n"
+      };
+      // A failed write still means the signal was there; the sender then
+      // restores the window in the tray instead of its original state.
+      let _ = stream.write_all(line.as_bytes());
+      true
     }
   }
 
@@ -664,7 +699,7 @@ mod imp {
   }
 
   #[cfg(not(target_os = "linux"))]
-  pub fn machine_quit_requested() -> bool {
+  pub fn machine_quit_requested(_minimized: bool) -> bool {
     false
   }
 }
@@ -693,9 +728,9 @@ mod tests {
   #[test]
   fn the_machine_signal_collects_the_windows_that_answer() {
     let path = socket_path("live");
-    assert!(!imp::machine::request_at(&path), "nothing is up yet");
+    assert!(!imp::machine::request_at(&path, false), "nothing is up yet");
     let guard = imp::machine::machine_quit_at(path.clone()).expect("bind");
-    assert!(imp::machine::request_at(&path), "the signal is up");
+    assert!(imp::machine::request_at(&path, false), "the signal is up");
     // The accept thread reads the answer asynchronously.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while guard.acks().is_empty() && std::time::Instant::now() < deadline {
@@ -707,8 +742,12 @@ mod tests {
     assert_eq!(acks.len(), 1);
     assert_eq!(acks[0].uid, me);
     assert_eq!(acks[0].pid, std::process::id());
+    assert!(!acks[0].minimized, "the answer said the window was open");
     drop(guard);
-    assert!(!imp::machine::request_at(&path), "dropping withdraws it");
+    assert!(
+      !imp::machine::request_at(&path, false),
+      "dropping withdraws it"
+    );
     assert!(!path.exists(), "and removes the socket file");
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
   }
@@ -720,27 +759,40 @@ mod tests {
     let path = socket_path("stale");
     std::fs::write(&path, b"").expect("stale file");
     assert!(
-      !imp::machine::request_at(&path),
+      !imp::machine::request_at(&path, true),
       "a plain file says nothing"
     );
     let guard = imp::machine::machine_quit_at(path.clone()).expect("replace");
-    assert!(imp::machine::request_at(&path));
+    assert!(imp::machine::request_at(&path, true));
     drop(guard);
     let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
   }
 
   /// The record is line-based, one line per user, so `postinst` can read it
-  /// with `awk` – and two sessions of one user come back once.
+  /// with `awk`; two sessions of one user come back once, and a visible one
+  /// wins over a hidden one.
   #[test]
-  fn the_record_names_each_user_once() {
+  fn the_record_names_each_user_and_its_state() {
     let text = imp::record_text(
       &[
-        QuitAck { uid: 1000, pid: 1 },
-        QuitAck { uid: 1000, pid: 2 },
-        QuitAck { uid: 1001, pid: 3 },
+        QuitAck {
+          uid: 1000,
+          pid: 1,
+          minimized: true,
+        },
+        QuitAck {
+          uid: 1000,
+          pid: 2,
+          minimized: false,
+        },
+        QuitAck {
+          uid: 1001,
+          pid: 3,
+          minimized: true,
+        },
       ],
       123,
     );
-    assert_eq!(text, "at 123\nuid 1000\nuid 1001\n");
+    assert_eq!(text, "at 123\nuid 1000 visible\nuid 1001 minimized\n");
   }
 }

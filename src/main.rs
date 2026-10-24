@@ -184,6 +184,12 @@ struct Cli {
   /// Start minimised to the tray (used by the autostart entry).
   #[arg(long, global = true)]
   minimized: bool,
+  /// Start on screen even when the saved preference says to start in the tray.
+  ///
+  /// Internal: an upgrade passes it when the window it is putting back was
+  /// open. It wins over both `--minimized` and `start_minimized`.
+  #[arg(long, global = true, hide = true)]
+  visible: bool,
   /// Where `config.json` and `credential.bin` live. The Windows service is
   /// registered with the installing user's directory, because the token it
   /// runs under has no profile of its own.
@@ -518,8 +524,10 @@ fn run(cli: Cli) -> Result<(), String> {
     };
     // `--minimized` (the autostart entry passes it) and the saved setting are
     // equivalent: a launch without the flag still starts in the tray when the
-    // user asked for that in the settings page.
-    let minimized = cli.minimized || cfg.start_minimized;
+    // user asked for that in the settings page. `--visible` overrides both: an
+    // upgrade restoring a window that was open must not honour a preference
+    // that would hide it.
+    let minimized = !cli.visible && (cli.minimized || cfg.start_minimized);
     // The window never starts a service by itself: it only talks to one that
     // already answers (autostart at boot, `thunet service start`, or the
     // status page's *Start* button). Starting one here would make a deliberate
