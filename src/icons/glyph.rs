@@ -230,6 +230,50 @@ pub fn heading_icon(
   .tint(color)
 }
 
+/// The copy mark: two overlapping sheets, the front one filled with the row's
+/// background so its outline reads as being in front.
+///
+/// Painted like the device badges rather than shipped as a texture: a device
+/// row has no texture slot of its own, and the whole mark is two rectangles.
+/// `bg` is the surface it is drawn on, which is what the front sheet is filled
+/// with to cut the back one where they cross.
+pub fn paint_copy_icon(
+  painter: &egui::Painter,
+  rect: egui::Rect,
+  ink: egui::Color32,
+  bg: egui::Color32,
+) {
+  let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+  painter.extend(copy_icon_shapes(rect, ink, bg));
+}
+
+/// The two sheets of the copy mark, laid out on a 16 × 16 grid scaled into
+/// `rect`.
+///
+/// Returned instead of painted so the geometry can be checked without a
+/// renderer, the same way the device badges are.
+fn copy_icon_shapes(rect: egui::Rect, ink: egui::Color32, bg: egui::Color32) -> Vec<egui::Shape> {
+  let s = rect.width() / 16.0;
+  let at = |x: f32, y: f32| rect.min + egui::vec2(x * s, y * s);
+  let stroke: egui::Stroke = egui::Stroke::new((1.3 * s).max(1.0), ink);
+  let radius = egui::CornerRadius::same(((2.0 * s).round() as u8).max(1));
+  let sheet = |min: (f32, f32), max: (f32, f32), fill: egui::Color32| {
+    egui::Shape::Rect(egui::epaint::RectShape::new(
+      egui::Rect::from_min_max(at(min.0, min.1), at(max.0, max.1)),
+      radius,
+      fill,
+      stroke,
+      egui::StrokeKind::Inside,
+    ))
+  };
+  vec![
+    // Back sheet, peeking out at the top right.
+    sheet((5.5, 1.0), (15.0, 10.5), egui::Color32::TRANSPARENT),
+    // Front sheet, filled so it cuts the back sheet's outline.
+    sheet((1.0, 5.5), (10.5, 15.0), bg),
+  ]
+}
+
 /// A close button in the macOS window-controls style.
 ///
 /// A flat 13 px red circle with no outline; the cross only appears while the
@@ -289,5 +333,22 @@ mod tests {
     let centre = |img: &egui::ColorImage| img.pixels[32 * 64 + 32].a();
     assert_eq!(centre(&open), 255, "the open eye has a pupil");
     assert_eq!(centre(&closed), 0, "the closed eye is only a lid");
+  }
+
+  /// The copy mark has to stay inside its box: its two sheets are offset from
+  /// the centre, so an arithmetic slip would paint over the neighbouring
+  /// column and only show up in a screenshot.
+  #[test]
+  fn the_copy_mark_stays_in_its_box() {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0));
+    let shapes = copy_icon_shapes(rect, egui::Color32::BLACK, egui::Color32::WHITE);
+    assert_eq!(shapes.len(), 2, "two sheets");
+    for shape in &shapes {
+      let bounds = shape.visual_bounding_rect();
+      assert!(
+        rect.expand(0.6).contains_rect(bounds),
+        "the mark paints outside its box: {bounds:?}"
+      );
+    }
   }
 }

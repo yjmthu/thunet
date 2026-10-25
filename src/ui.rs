@@ -27,7 +27,7 @@ use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
   eye_closed_image, eye_open_image, gear_image, heading_icon, icon_button, icon_texture, make_icon,
-  paint_device_icon,
+  paint_copy_icon, paint_device_icon,
 };
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
@@ -2539,9 +2539,16 @@ impl App {
     let devices = &self.info.devices;
     let n = self.info.devices_total;
     let mut open = true;
+    // The list cannot call back into `self`, so a copy click records the address
+    // and the clipboard is written once the modal has finished laying out.
+    let mut copy = None;
     let modal = egui::Modal::new(egui::Id::unique("thunet_devices_popup")).show(ctx, |ui| {
-      devices_list(ui, devices, n, t, &mut open, self.cfg.privacy);
+      devices_list(ui, devices, n, t, &mut open, self.cfg.privacy, &mut copy);
     });
+    if let Some(text) = copy {
+      ctx.copy_text(text);
+      self.toast_ok(t.copied.to_string());
+    }
     // The dimmed backdrop and Escape are the framework's own dismissal, so the
     // close button is one more way out rather than the only one.
     if !open || modal.should_close() {
@@ -2575,6 +2582,7 @@ fn devices_list(
   t: &Texts,
   open: &mut bool,
   privacy: bool,
+  copy: &mut Option<String>,
 ) -> DevicesLayout {
   let title = format!("{}{n}", t.devices_title);
   let body = egui::TextStyle::Body.resolve(ui.style());
@@ -2596,7 +2604,13 @@ fn devices_list(
   }
   // Each column gets what its widest entry needs, so an address is only elided
   // when the dialog hits its cap - never because a neighbouring column was
-  // reserved for nothing.
+  // reserved for nothing. The copy mark closes the address column, so its slot
+  // is reserved on top of the widest address.
+  let addr_w = if devices.is_empty() {
+    0.0
+  } else {
+    addr_w + DEVICES_GAP + DEVICES_ICON
+  };
   let rows_w = DEVICES_EDGE_PAD
     + DEVICES_DOT
     + DEVICES_GAP
@@ -2652,10 +2666,21 @@ fn devices_list(
               ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::hover());
             paint_device_icon(ui.painter(), icon, device_kind(&d.os, &d.class), ink, bg);
             fixed_cell(ui, (&d.id, "addr"), addr_w, row_h, |ui| {
-              let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
-              // `truncate` elides at the column's width and, by default, shows
-              // the whole address on hover when it had to.
-              ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
+              let raw = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+              let addr = private_value(raw, privacy);
+              // The mark is laid out first in a right-to-left row, so it sits on
+              // the column's right edge; the address then gets what is left and
+              // elides there (`truncate` shows the whole value on hover). It
+              // copies the real address even while privacy mode masks it, the
+              // way the status page's *Copy* button does.
+              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if copy_mark(ui, t).clicked() {
+                  *copy = Some(raw.to_string());
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                  ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
+                });
+              });
             });
             if kind_w > 0.0 {
               fixed_cell(ui, (&d.id, "kind"), kind_w, row_h, |ui| {
@@ -2712,6 +2737,26 @@ fn fixed_cell(
       .layout(egui::Layout::left_to_right(egui::Align::Center)),
   );
   add(&mut cell);
+}
+
+/// The copy mark on the right edge of one device row's address column.
+///
+/// A painted glyph instead of the *Copy* text button the settings page uses:
+/// the row is only one line tall, so a label would not fit. The caller lays it
+/// out first in a right-to-left row, which is what pins it to the edge.
+fn copy_mark(ui: &mut egui::Ui, t: &Texts) -> egui::Response {
+  let (rect, resp) =
+    ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::click());
+  let resp = resp
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text(t.copy);
+  let ink = if resp.hovered() {
+    ui.visuals().strong_text_color()
+  } else {
+    ui.visuals().text_color()
+  };
+  paint_copy_icon(ui.painter(), rect, ink, ui.visuals().window_fill());
+  resp
 }
 
 /// One copyable address row: the address against the left edge of the value
@@ -4103,6 +4148,7 @@ mod tests {
     let mut out = ctx.run_ui(input, |ui| {
       egui::CentralPanel::default().show(ui, |ui| {
         let mut open = true;
+        let mut copied = None;
         layout = Some(devices_list(
           ui,
           &devices,
@@ -4110,6 +4156,7 @@ mod tests {
           t,
           &mut open,
           false,
+          &mut copied,
         ));
       });
     });
