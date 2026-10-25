@@ -399,10 +399,8 @@ mod imp {
 
     // The answer channel first: a window that sees the event connects here, so
     // the pipe must exist before the event can be seen.
-    let listener = crate::ipc::endpoint::Endpoint::bind(
-      MACHINE_QUIT_PIPE,
-      crate::ipc::INTERACTIVE_SDDL,
-    )?;
+    let listener =
+      crate::ipc::endpoint::Endpoint::bind(MACHINE_QUIT_PIPE, crate::ipc::INTERACTIVE_SDDL)?;
 
     let (attributes, descriptor) = security(MACHINE_QUIT_SDDL)?;
     let event_name = wide(MACHINE_QUIT_NAME);
