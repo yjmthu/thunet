@@ -699,7 +699,21 @@ fn mac_class_from_model(model: &str) -> &'static str {
   }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "android")]
+fn device_class() -> Option<&'static str> {
+  // Android has no SMBIOS chassis to name, so this is the portal's own category
+  // for phones and tablets — the same class the official client is recorded
+  // under. Sending nothing (the old behaviour) left the device list's type
+  // column empty, because the portal stores `name` as the class.
+  Some("Smartphones/PDAs/Tablets")
+}
+
+#[cfg(not(any(
+  target_os = "linux",
+  target_os = "windows",
+  target_os = "macos",
+  target_os = "android"
+)))]
 fn device_class() -> Option<&'static str> {
   None
 }
@@ -959,7 +973,42 @@ mod link_imp {
   }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Android: a `NativeActivity` cannot reach `ConnectivityManager` without JNI,
+/// so the Activity answers the question and writes the transport behind the
+/// default network to `files/link.txt`. Reading a five-byte file is cheaper
+/// than a JNI call and keeps the core free of a Java dependency.
+#[cfg(target_os = "android")]
+mod link_imp {
+  use crate::proto::LinkKind;
+
+  pub fn link_kind() -> LinkKind {
+    let path = crate::config::dir().join("link.txt");
+    match std::fs::read_to_string(path) {
+      Ok(text) => match text.trim() {
+        "wlan" => LinkKind::Wlan,
+        "ethernet" => LinkKind::Ethernet,
+        "other" => LinkKind::Other,
+        "none" => LinkKind::None,
+        // A word this build does not know: fall through to the route check
+        // rather than claim there is no link.
+        _ => fallback(),
+      },
+      // Before the first write (the Activity registers its callback while the
+      // core is already probing) the route table still answers.
+      Err(_) => fallback(),
+    }
+  }
+
+  fn fallback() -> LinkKind {
+    if crate::srun::link_up() {
+      LinkKind::Other
+    } else {
+      LinkKind::None
+    }
+  }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 mod link_imp {
   use crate::proto::LinkKind;
 

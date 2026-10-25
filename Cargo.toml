@@ -7,6 +7,12 @@ license = "MIT"
 repository = "https://github.com/yjmthu/thunet"
 authors = ["THUnet contributors"]
 
+[lib]
+name = "thunet"
+# Android packages this as `lib/<abi>/libthunet.so`; the desktop binary keeps
+# linking the rlib.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 ureq = "3"
 serde = { version = "1", features = ["derive"] }
@@ -33,10 +39,13 @@ eframe = { version = "0.37.0", default-features = false, features = [
   # `Hyperlink` / `Context::open_url` only reach the browser through
   # egui-winit's `webbrowser` dependency, which this feature enables.
   "links",
+  # Android's activity glue. It only enables winit's Android backend, so it is
+  # harmless on desktop.
+  "android-native-activity",
   "x11",
   "wayland",
 ] }
-tray-icon = "0.26.1"
+
 sys-locale = "0.3.2"
 interprocess = "2.4.6"
 # Password prompt (`thunet login -i`): echo off with the terminal restored
@@ -64,6 +73,18 @@ inherits = "dev"
 # Embeds assets/thunet.ico (and the version block) into the Windows executable.
 [build-dependencies]
 winresource = "0.1"
+
+# The tray exists on every desktop; Android has no notification area.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tray-icon = "0.26.1"
+
+# `AndroidApp` comes from winit; the Android feature itself is enabled through
+# eframe's `android-native-activity`, and Cargo unifies it into this dependency.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = "0.30"
+# egui-winit's clipboard is in-process only on Android, so the Activity is
+# called over JNI to reach the system clipboard (`src/clipboard.rs`).
+jni = "0.21"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = [

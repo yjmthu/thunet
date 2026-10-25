@@ -2,9 +2,9 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A small cross-platform tray app that logs you into the Tsinghua University campus network (`auth4.tsinghua.edu.cn`, SRun3K portal) and keeps the connection alive.
+A small cross-platform app that logs you into the Tsinghua University campus network (`auth4.tsinghua.edu.cn`, SRun3K portal) and keeps the connection alive. On the desktop it lives in the tray; on Android it is a plain APK.
 
-One executable, no runtime dependencies, no console window, runs on Windows, Linux and macOS, and speaks Chinese or English.
+One executable, no runtime dependencies, no console window; runs on Windows, Linux, macOS and Android, and speaks Chinese or English.
 
 > **New here?** Read [Quick start](#1-quick-start) — you only need your TUNET account name and password. The protocol details are at the very end of this document; you never need them to use the app.
 
@@ -17,6 +17,10 @@ One executable, no runtime dependencies, no console window, runs on Windows, Lin
 3. [Everyday tasks](#3-everyday-tasks)
 4. [Troubleshooting](#4-troubleshooting)
 5. [Command line](#5-command-line)
+
+**Android**
+
+- [Android](#android)
 
 **Reference**
 
@@ -44,6 +48,7 @@ One executable, no runtime dependencies, no console window, runs on Windows, Lin
    | Windows | `thunet-<version>-x64.msi` | double-click, `msiexec /i thunet-<version>-x64.msi` (administrator rights, installs to `Program Files`; one or two elevation prompts, see [§7](#7-installing-uninstalling-shortcuts)), or `winget install --id THUnet.THUnet -e` once published (see [Installing with winget](#8-installing-with-winget)) |
    | Debian / Ubuntu | `thunet_<version>-1_amd64.deb` | `sudo apt install ./thunet_<version>-1_amd64.deb` |
    | other Linux | `thunet-<version>-linux-x64.tar.gz` | unpack and run `./thunet` (optionally `./thunet shortcut` for a desktop launcher) |
+   | Android 13+ (arm64) | `thunet-<version>-arm64.apk` | download it on the phone and tap it (sideloading; see [Android](#android)) |
 
 2. **Run it.** Start `THUnet` from the Start Menu / application menu, or run `thunet` in a terminal. A small window opens; everything the app does is written to the log strip at the bottom of that window.
 3. **Open Settings.** Click the gear in the top-right corner of the window.
@@ -140,6 +145,46 @@ Closing the window hides it — the app keeps working. `Quit` ends the window an
 ### Feedback messages
 
 Every action answers with a coloured strip at the bottom of the window: **green** for success, **red** for failure, **blue** for information such as "already online", "copied", or the state a switch just moved to ("Start with system: On"). Nothing succeeds silently.
+
+## Android
+
+THUnet runs on Android too: the same program, the same two pages, the same account. It is a normal APK rather than a store app, so you install it yourself — *sideloading* — and Android asks once to allow installs from the browser or file manager you used.
+
+| Status page | Settings |
+| --- | --- |
+| <img src="docs/images/en-android-status.png" width="250" alt="The THUnet status page on Android, with the account and the addresses hidden"> | <img src="docs/images/en-android-settings.png" width="250" alt="The THUnet settings page on Android"> |
+
+*The Android app with **Hide private info** on, so the account and the addresses are shown as dots.*
+
+### Installing
+
+1. Download `thunet-<version>-arm64.apk` on the phone (Android 13 or newer, arm64 devices) and tap it.
+2. Let the browser or file manager install apps when Android asks, then tap **Install**.
+3. Open THUnet, tap the gear, enter your TUNET account and password, tick **Remember password** and tap **Apply**.
+4. Back on the status page, tap **Connect** — or leave **Connect on startup** on and the next launch does it for you.
+
+The system back gesture is the arrow in the corner: it closes an open menu, the device list or a question first, then leaves the settings page for the status page, and only then sends the app to the background.
+
+### How much stays behind
+
+The **Background** row is the phone's version of the desktop's autostart row, in the same order:
+
+| Level | What it means |
+| --- | --- |
+| Off | Nothing stays behind. Swiping the app away ends the session; opening it again is the only way back. |
+| Wi-Fi change | Android wakes the app when Wi-Fi changes and signs in, with no notification. A 15-minute background job covers the rest. |
+| Resident | A foreground service with a silent notification: the session survives a swipe from recents and also starts at boot. Android asks for the notification permission the first time. |
+
+**Stay online** is a different switch and keeps its desktop meaning: whether the core signs back in after the session drops, independent of anything staying behind.
+
+### Worth knowing
+
+- **Notifications.** Only *Resident* shows one; it is silent, low-priority, and its buttons disconnect or return to *Wi-Fi change*. Login failures stay in the log, never in the shade.
+- **Secure detection.** Off by default, next to *Hide private info*: it reads the Wi-Fi name to recognise `Tsinghua-Secure` and skip the portal. A Wi-Fi name needs the location permission, which the switch asks for; without it the app simply falls back to the network probes.
+- **Password managers.** The account and password fields are drawn by the app, but they are registered with Android's autofill support, so Bitwarden and others offer to fill them and to save a new pair.
+- **Battery savers.** Some vendors (MIUI, EMUI, ColorOS …) stop background apps aggressively. If *Resident* does not survive a swipe, allow THUnet to run in the background in the system settings; *Force stop* always wins until you open the app again.
+- **Updates.** Download the new APK and tap it over the old one: settings and the saved password are kept, as long as the signing key is the same. A debug build and a release build use different keys, so switching between them means uninstalling first.
+- **One file per phone.** Releases are `arm64-v8a` only; older 32-bit phones cannot install them.
 
 ## 3. Everyday tasks
 
@@ -482,7 +527,8 @@ Sources:
 | `assets/thunet.ico`, `assets/thunet.svg` | Icons used by the packages and shortcuts |
 | `assets/thunet.desktop` | Launcher entry installed by the `.deb` |
 | `assets/completions/` | bash/zsh/fish completion scripts installed by the `.deb`; a unit test keeps them in sync with the CLI |
-| `scripts/make_icon.py` | Regenerates the icon assets (`pixi run -e tools python scripts/make_icon.py`) |
+| `scripts/make_icon.py` | Regenerates the icon assets for Windows, Linux and Android (`pixi run -e tools python scripts/make_icon.py`) |
+| `scripts/android_build.sh` | Builds the Rust core into `android/app/src/main/jniLibs` (called by Gradle and by `pixi run -e android apk-debug`) |
 
 Notes:
 
@@ -491,6 +537,48 @@ Notes:
 - **`deb-debug` packages a debug build of the same `.deb`.** cargo-deb refuses the built-in `dev` profile, so the build uses the `pkgdebug` profile (`target/pkgdebug/`, debug assertions and symbols kept, `--no-strip`); the `1debug` revision names the file and sorts above the release package, and the settings footer shows `Debug`.
 - `dotnet` and WiX are installed inside `.pixi/` — nothing is added to your global .NET tool list and no admin rights are needed.
 - Binaries are unsigned; Windows SmartScreen will warn on first run until a code signing certificate is used (`signtool sign /fd sha256 ...`).
+
+### Building the Android APK
+
+The Android port keeps the same crate: one Activity, egui for the UI, and the core in the app's own process (the portable layout), so the protocol code is untouched. It needs the `android` pixi environment (JDK 21), an SDK with platform 36 and an NDK, and the two Rust targets (`rustup target add aarch64-linux-android x86_64-linux-android`):
+
+```
+pixi run -e android apk-debug          # android/app/build/outputs/apk/debug/app-debug.apk
+pixi run -e android apk-release        # android/app/build/outputs/apk/release/app-release.apk
+```
+
+What that runs:
+
+1. `./gradlew assembleDebug` depends on the `cargoNdkDebug` task, which calls `scripts/android_build.sh debug` → `cargo ndk -t arm64-v8a -t x86_64 -P 33 -o android/app/src/main/jniLibs build`.
+2. Gradle then assembles the APK (`applicationId io.github.yjmthu.thunet`, `minSdk 33`, `targetSdk 36`) with the launcher icon from `scripts/make_icon.py` and the narrow `network_security_config`.
+
+The script finds the SDK through `ANDROID_HOME`, `sdk.dir` in `android/local.properties` (git-ignored) or `$HOME/Android/Sdk`, and `cargo-ndk` picks the newest NDK under it. Passing `-PnoRust` to Gradle skips the Rust step when the `.so` files are already current; a proxy has to reach Gradle separately (`GRADLE_OPTS='-Dhttps.proxyHost=… -Dhttps.proxyPort=…'`).
+
+Install it by sideloading:
+
+```
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n io.github.yjmthu.thunet/.ThunetActivity
+```
+
+Notes:
+
+- **ABIs.** Debug carries `arm64-v8a` and `x86_64` (the emulator); release is `arm64-v8a` only. The filters are declared per build type on purpose: a list in `defaultConfig` is merged with them, which once put a stale x86_64 debug library into a release APK.
+- **Signing.** Release builds read `android/keystore.properties` (git-ignored), which points at a keystore kept outside the repository; without that file `assembleRelease` still builds, but unsigned. The key *is* the update identity: an installed app only accepts a newer APK signed with the same key, so back the keystore and its passwords up somewhere safe, and uninstall a debug build before installing a release one.
+- **Versions.** `versionName` comes from `Cargo.toml` and `versionCode` is `major * 10000 + minor * 100 + patch` (0.1.5 → 105), so the APK follows the same single source of truth as the desktop packages.
+- **Cleartext.** Only the five names in `android/app/src/main/res/xml/network_security_config.xml` may use plain HTTP: the three connectivity probes and the two portal names. Unknown HTTP portals are therefore not followed, which is acceptable for a THUnet client and keeps the rest of the app HTTPS-only.
+- **What the Activity reports.** Insets, the default network's transport and the system night mode arrive as small files in `files/`, because a `NativeActivity` reaches those APIs only through JNI. They are read by `src/ui.rs` (insets), `src/srun.rs` (`link.txt`) and `src/theme.rs` (`theme.txt`).
+- **Touch.** A 450 ms hold on a log line tints that line, ticks the phone and opens its menu (Copy line / Copy all); the line stays tinted while the menu is open, so the target is never a guess.
+- **Credential fields.** Both rows are ordinary egui text fields, so the settings page keeps its look. Three things are bridged. The pair is published to the autofill framework as a *virtual view structure* (hints, the on-screen rectangle of each field, and its current value), which is what makes a password manager's dropdown and save prompt appear. The keyboard talks to the same invisible host through an `InputConnection`: composition and candidate commits become egui IME events, so Sogou's “red” really lands in the field. And a long press on a field pastes the system clipboard into it.
+- **Which link.** While a Wi-Fi network is connected, the app binds its process to it (`ThunetApp`). Android keeps cellular as the default network while the campus Wi-Fi is not yet validated, and without the binding the probes and the portal login would ask the carrier instead of the campus gateway — the status page would claim there is no campus portal. The `Link` row reports the bound link.
+- **Back.** Back takes one step inside the window before it leaves the task: a long-press menu, the switch confirmation or the device list closes first, then the settings page returns to the status page, and only then does the task go to the background. The step is answered by Rust (`Native.backPressed`) so the system gesture and the button behave the same. The task is never finished: the Android event loop can only be created once per process, so a finished Activity would leave the next launch on the splash screen while the core kept running.
+- **Background (default off).** How much of the app stays behind mirrors the desktop's autostart triad: *Off* (nothing), *Wi-Fi change* (the core wakes on a network change, no notification) and *Resident* (a foreground service with a silent, low-importance notification, plus a start at boot). Android only keeps a process alive after the task is swiped away in the last case. `Stay online` is unaffected by this: it decides whether the core signs back in, exactly as on the desktop.
+- **Wi-Fi change.** A live callback covers every change while the process lives; a one-shot network request wakes it the next time Wi-Fi appears (armed only while offline), and a 15-minute WorkManager job covers the rest. Nothing wakes the app after "Force stop", and a process killed while online may wait for that job — that is the price of having no notification.
+- **Resident.** Choosing it asks for the notification permission first; a refusal drops back to *Wi-Fi change* and the row says so. The notification opens the app and carries *Disconnect* and *Stop keep-alive* (which returns to *Wi-Fi change*).
+- **Secure detection (off by default).** Next to *Hide private info*, this optional switch reads the Wi-Fi name to tell `Tsinghua-Secure` (OS-level 802.1X, no portal login) from a portal network. Reading the SSID needs the location permission, which the switch requests; without it the app falls back to the network probes, exactly as before.
+- **Device list.** The login reports `AndroidOS` and the portal's phone/tablet category, so the status page's device list shows a type where it used to be empty.
+- **Settings.** The system back gesture (edge swipe) or the back arrow leaves the settings page for the status page; the same gesture closes an open menu, the device list and the switch confirmation first.
+- **Notifications.** Only the resident notification exists; login failures stay in the log, never in the shade.
 
 ## 11. Project layout
 
@@ -508,6 +596,9 @@ Notes:
 | `src/i18n.rs` | Chinese/English strings |
 | `src/logline.rs` | log record and `[YYYY-MM-DD HH:MM:SS] [LEVEL] msg` rendering |
 | `src/wifi.rs` | current SSID, enterprise-Wi-Fi detection |
+| `src/android.rs` | Android entry point: state directory, logging, panic hook, `android_main` |
+| `src/tray.rs` | tray façade (inert on Android) |
+| `android/` | Gradle project: `ThunetActivity`, manifest, network security config, icons |
 | `docs/protocol.md` | SRun3K login walkthrough (see §9) |
 | `packaging/`, `scripts/` | installer sources and helper scripts |
 

@@ -115,6 +115,11 @@ fn state_dir() -> PathBuf {
     env_path("APPDATA")
   } else if cfg!(target_os = "macos") {
     env_path("HOME").join("Library").join("Application Support")
+  } else if cfg!(target_os = "android") {
+    // Android has no user profile. The app injects its private directory
+    // through `THUNET_STATE_DIR`; this path is only reached before that
+    // happens, and `temp_dir` is writable inside the sandbox.
+    std::env::temp_dir()
   } else {
     match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
       Some(xdg) => PathBuf::from(xdg),

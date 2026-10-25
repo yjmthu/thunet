@@ -10,6 +10,10 @@ platforms = ["win-64", "linux-64"]
 tools = ["tools"]
 dev = ["dev"]
 package = ["package", "dev"]
+# Android SDK tooling: a JDK for `sdkmanager`/Gradle and Gradle itself, kept out
+# of `dev` so desktop builds never download them. The SDK and NDK live in
+# `~/Android/Sdk`, not here.
+android = ["android"]
 
 [dependencies]
 python = "3.14.*"
@@ -45,6 +49,21 @@ bzip2 = "*"
 
 [feature.dev.target.linux-64.activation]
 scripts = ["scripts/activate_linux.sh"]
+
+# JDK 21 is the LTS that current AGP and Gradle both support. Gradle is left
+# unpinned so the environment can follow what conda-forge ships; the Android
+# project's wrapper pins the exact version it needs.
+[feature.android.dependencies]
+openjdk = "21.*"
+gradle = "*"
+
+[feature.android.tasks]
+# `pixi run -e android apk-debug` -> android/app/build/outputs/apk/debug/app-debug.apk
+# The Gradle build calls scripts/android_build.sh, so the APK always carries a
+# freshly built Rust core. A proxy needs GRADLE_OPTS (see README).
+apk-debug = { cmd = "./gradlew assembleDebug", cwd = "android" }
+# arm64 only, and unsigned until a release key exists (see README §10).
+apk-release = { cmd = "./gradlew assembleRelease", cwd = "android" }
 
 [feature.dev.tasks]
 # Refresh `.vscode/settings.json` and `.zed/settings.json` so rust-analyzer

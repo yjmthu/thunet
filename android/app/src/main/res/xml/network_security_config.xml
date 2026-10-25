@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The core speaks HTTP only where the protocol requires it: the three captive
+  probes that decide what the network is, and the campus portal itself. Every
+  other request (and every redirect an ordinary page could send us to) stays
+  HTTPS-only, so a hostile network cannot downgrade it.
+
+  Unknown HTTP portals (hotel Wi-Fi, other campuses) are therefore not followed;
+  the app reports "no campus network" there. That is the point of a THUnet
+  client, and it keeps the cleartext surface to five names.
+-->
+<network-security-config>
+  <base-config cleartextTrafficPermitted="false" />
+  <domain-config cleartextTrafficPermitted="true">
+    <!-- src/srun.rs::net_env and ::detect_ac_id -->
+    <domain includeSubdomains="false">connect.rom.miui.com</domain>
+    <domain includeSubdomains="false">www.msftconnecttest.com</domain>
+    <domain includeSubdomains="false">www.baidu.com</domain>
+    <!-- the portal, which redirects to index_<ac_id>.html -->
+    <domain includeSubdomains="false">auth4.tsinghua.edu.cn</domain>
+    <domain includeSubdomains="false">login.tsinghua.edu.cn</domain>
+  </domain-config>
+</network-security-config>

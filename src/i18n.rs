@@ -104,6 +104,32 @@ pub struct Texts {
   /// Hover on a disabled *Apply*: the form is incomplete, or nothing changed.
   pub password_required: &'static str,
   pub nothing_to_apply: &'static str,
+  /// Android: read the Wi-Fi name to tell `Tsinghua-Secure` from a portal
+  /// network. Off by default because it needs the location permission.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub secure_detection: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub secure_detection_hint: &'static str,
+  /// Android: how much of the app stays behind, mirroring the desktop's
+  /// autostart triad, plus the hint for the level currently chosen.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_mode: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_off: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_wake: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_service: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_off_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_wake_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_service_hint: &'static str,
+  /// Android: the resident level was asked for but the notification permission
+  /// was refused, so the effective level is "network changes".
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_denied: &'static str,
   /// Connect was pressed while no account/password is available at all.
   pub no_credentials: &'static str,
   /// Prefix of the compile-time stamp next to the version.
@@ -301,6 +327,16 @@ static ZH: Texts = Texts {
   auto_connect_without_credentials_online: "当前会话可继续，但没有保存密码——掉线后不会自动重连",
   password_required: "保存密码或更换账号都需要重新输入密码",
   nothing_to_apply: "没有需要应用的修改",
+  secure_detection: "Secure 检测",
+  secure_detection_hint: "读取 Wi-Fi 名称需要定位权限（并开启定位服务）；未授权时不作判断，只靠网络探测。",
+  background_mode: "后台运行",
+  background_off: "关闭",
+  background_wake: "网络变化",
+  background_service: "常驻",
+  background_off_hint: "不在后台做任何事；关掉应用后再打开是唯一回来的方式。",
+  background_wake_hint: "Wi-Fi 变化时唤醒并登录（无通知）；其余情况由 15 分钟一次的后台任务兜底。",
+  background_service_hint: "前台服务 + 静默通知：划掉任务后会话仍在线，并在开机时自动启动。",
+  background_denied: "常驻后台需要通知权限；当前按“网络变化”运行。",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
   on: "已开启",
@@ -422,6 +458,16 @@ static EN: Texts = Texts {
   auto_connect_without_credentials_online: "This session keeps running, but no password is saved — it will not reconnect on its own",
   password_required: "Saving a password or changing the account needs the password typed in",
   nothing_to_apply: "Nothing to apply",
+  secure_detection: "Secure detection",
+  secure_detection_hint: "Reading the Wi-Fi name needs the location permission (and location services); without it the app falls back to the network probes.",
+  background_mode: "Background",
+  background_off: "Off",
+  background_wake: "Wi-Fi change",
+  background_service: "Resident",
+  background_off_hint: "Nothing stays behind; reopening the app is the only way back.",
+  background_wake_hint: "Wakes on a Wi-Fi change and signs in, with no notification; a 15-minute job covers the rest.",
+  background_service_hint: "A foreground service with a silent notification: the session survives a swipe and starts at boot.",
+  background_denied: "Resident needs the notification permission; running on Wi-Fi change instead.",
   no_credentials: "No account or password saved",
   built: "Built at",
   on: "On",

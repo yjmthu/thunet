@@ -1,0 +1,13 @@
+# Build output, the local SDK path and signing material.
+#
+# Everything here describes one machine's Android toolchain, so the patterns
+# stay next to the project they belong to instead of in the repository root.
+local.properties
+.gradle/
+.kotlin/
+build/
+app/build/
+app/src/main/jniLibs/
+keystore.properties
+*.jks
+*.keystore

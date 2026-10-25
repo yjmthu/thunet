@@ -1,0 +1,109 @@
+plugins {
+  id 'com.android.application'
+}
+
+// The Rust core is built by `scripts/android_build.sh`, not by Gradle itself,
+// so `pixi run -e android apk-debug` and a bare `./gradlew assembleDebug` both
+// produce the same libraries. The script owns the SDK lookup; Gradle only says
+// which profile is being built. Pass -PnoRust when the .so files are current.
+def rustBuild = { String profile ->
+  tasks.register("cargoNdk${profile.capitalize()}", Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'bash', 'scripts/android_build.sh', profile
+  }
+}
+def cargoDebug = rustBuild('debug')
+def cargoRelease = rustBuild('release')
+
+// The version has one source of truth: the desktop packaging scripts read
+// Cargo.toml, so the APK reads it too. `versionCode` has to keep growing, so it
+// is the semver packed into an integer (0.1.5 -> 105).
+def cargoToml = new File(rootProject.projectDir.parentFile, 'Cargo.toml')
+def matcher = (cargoToml.text =~ /(?m)^version\s*=\s*"([^"]+)"/)
+def versionNameValue = matcher.find() ? matcher.group(1) : '0.0.0'
+def (versionMajor, versionMinor, versionPatch) = versionNameValue.tokenize('.').collect { it.toInteger() }
+def versionCodeValue = versionMajor * 10000 + versionMinor * 100 + versionPatch
+
+// Signing material is machine-specific and git-ignored; without the file the
+// release build stays unsigned (which is still useful for a size check).
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+  keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+tasks.configureEach { task ->
+  if (project.hasProperty('noRust')) {
+    return
+  }
+  if (task.name == 'preDebugBuild') {
+    task.dependsOn cargoDebug
+  } else if (task.name == 'preReleaseBuild') {
+    task.dependsOn cargoRelease
+  }
+}
+
+android {
+  namespace 'io.github.yjmthu.thunet'
+  compileSdk 36
+  // Pins the NDK that built the libraries: it is also what lets AGP strip
+  // libthunet.so, which is otherwise 300 MB of debug symbols in the APK.
+  ndkVersion '29.0.14206865'
+
+  defaultConfig {
+    applicationId 'io.github.yjmthu.thunet'
+    minSdk 33
+    targetSdk 36
+    versionCode versionCodeValue
+    versionName versionNameValue
+  }
+
+  signingConfigs {
+    release {
+      if (keystorePropertiesFile.exists()) {
+        storeFile file(keystoreProperties['storeFile'])
+        storePassword keystoreProperties['storePassword']
+        keyAlias keystoreProperties['keyAlias']
+        keyPassword keystoreProperties['keyPassword']
+      }
+    }
+  }
+
+  buildTypes {
+    debug {
+      // The emulator is x86_64; a physical device is arm64.
+      ndk {
+        abiFilters 'arm64-v8a', 'x86_64'
+      }
+    }
+    release {
+      // Phones only, and stated here rather than in `defaultConfig`: the two
+      // lists would be merged, which is how a stale x86_64 debug library once
+      // ended up in a release APK.
+      ndk {
+        abiFilters 'arm64-v8a'
+      }
+      minifyEnabled false
+      if (keystorePropertiesFile.exists()) {
+        signingConfig signingConfigs.release
+      }
+    }
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  packaging {
+    jniLibs {
+      // Uncompressed and page-aligned in the APK, which is what Android 15+
+      // requires for 16 KB page sizes.
+      useLegacyPackaging false
+    }
+  }
+}
+
+dependencies {
+  // The periodic backstop that covers "killed while online, then Wi-Fi".
+  implementation 'androidx.work:work-runtime:2.12.0'
+}

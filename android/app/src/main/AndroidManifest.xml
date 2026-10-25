@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+  <!-- Only used by the optional "Secure detection" setting: reading the Wi-Fi
+       name (SSID) is what tells Tsinghua-Secure from a portal network. -->
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+  <!-- The keep-alive toggle: a foreground service must be able to show its
+       notification, and Android 13+ gates that on this runtime permission. -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <!-- WorkManager holds a wake lock while the periodic backstop runs. -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <application
+    android:name=".ThunetApp"
+    android:label="THUnet"
+    android:icon="@mipmap/ic_launcher"
+    android:allowBackup="false"
+    android:enableOnBackInvokedCallback="true"
+    android:networkSecurityConfig="@xml/network_security_config">
+
+    <activity
+      android:name=".ThunetActivity"
+      android:exported="true"
+      android:configChanges="orientation|keyboardHidden|screenSize|uiMode"
+      android:windowSoftInputMode="adjustResize"
+      android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+      <meta-data android:name="android.app.lib_name" android:value="thunet" />
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+
+    <!-- `specialUse` has no daily quota; `dataSync` would hit the Android 15
+         six-hour cap. The subtype is what the Play policy would read. -->
+    <service
+      android:name=".KeepAliveService"
+      android:exported="false"
+      android:foregroundServiceType="specialUse">
+      <property
+        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+        android:value="Campus network session keep-alive: keeps the authenticated session open and reconnects after a Wi-Fi change" />
+    </service>
+
+    <!-- One-shot wake-up when the Wi-Fi it waited for appears. -->
+    <receiver android:name=".NetworkWakeReceiver" android:exported="false" />
+    <!-- The notification's disconnect action. -->
+    <receiver android:name=".NotificationActionReceiver" android:exported="false" />
+    <!-- Start the service at boot only when the toggle says so. -->
+    <receiver android:name=".BootReceiver" android:exported="false">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED" />
+      </intent-filter>
+    </receiver>
+  </application>
+</manifest>
