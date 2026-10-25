@@ -86,6 +86,11 @@ ZED_HEADER = """\
 // what makes cargo, rustc and the GTK build scripts resolve inside the pixi
 // environment.
 //
+// A rust-analyzer found on `PATH` is written as `lsp.rust-analyzer.binary.path`:
+// Zed's managed download comes from github.com, and when that times out Zed
+// starts the empty temporary file instead and the server dies with
+// `Permission denied`.
+//
 // Regenerate after moving the checkout or updating the toolchain:
 //   pixi run -e dev -- python scripts/vscode_settings.py
 """
@@ -136,15 +141,20 @@ def settings_text(env: dict[str, str]) -> str:
 
 
 def zed_settings_text(env: dict[str, str]) -> str:
+  binary: dict[str, object] = {"env": env}
+  # Point Zed at a local rust-analyzer when there is one. Its own download
+  # (github.com) times out on this network, and the failed attempt leaves a
+  # zero-byte file that Zed then tries to start.
+  rust_analyzer = shutil.which("rust-analyzer")
+  if rust_analyzer is not None:
+    binary["path"] = rust_analyzer
+  else:
+    # Nothing on `PATH`: let Zed manage (and download) the server itself.
+    binary["ignore_system_version"] = True
   settings = {
     "lsp": {
       "rust-analyzer": {
-        "binary": {
-          # There is no rust-analyzer inside the pixi environment, so use the
-          # one Zed manages instead of searching `PATH`.
-          "ignore_system_version": True,
-          "env": env,
-        },
+        "binary": binary,
         "initialization_options": {
           # "discover" runs `rustc --print sysroot` through `PATH`.
           "cargo": {"sysroot": "discover"},
