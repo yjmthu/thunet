@@ -453,6 +453,13 @@ fn run(cli: Cli) -> Result<(), String> {
     // The elevated half of `quit --all-sessions`: raise the machine-wide signal,
     // give every window time to answer, write the record an upgrade reads, stop
     // the core, and exit. Nothing else - no config, no window.
+    //
+    // This half has no console and usually runs as the installer's helper, which
+    // looks at the exit code alone: without a log file a failed answer ("zero
+    // windows answered") is what an install that silently restores nothing looks
+    // like. The machine directory is the log the service already writes.
+    #[cfg(windows)]
+    diag::set_file(config::machine_dir().join("core.log"));
     finish_machine_quit(single::machine_quit()?)?;
     return Ok(());
   }
@@ -799,24 +806,22 @@ fn run(cli: Cli) -> Result<(), String> {
       let budget = Duration::from_millis(timeout);
       if all_sessions && !ipc::portable() {
         // The machine-wide signal is the whole mechanism: it needs no core to
-        // relay it, so it reaches windows whose core is already gone. Raising it
-        // needs administrator rights, so an attempt that fails without them is
-        // retried through the same elevation helper every other privileged verb
-        // uses; the elevated copy raises the signal, holds it for a moment,
-        // writes the record and stops the core. This session's window is closed
-        // by the doorbell afterwards, whichever half ran the signal.
-        match single::machine_quit() {
-          Ok(signal) => {
-            let waited = single::quit_and_wait(budget);
-            let stopped = finish_machine_quit(signal);
-            return waited.and(stopped);
-          }
-          Err(e) if crate::elevate::is_elevated() => return Err(e),
-          Err(_) => {
-            crate::elevate::run_as_admin(&["--machine", "--signal-only"])?;
-            return single::quit_and_wait(budget);
-          }
+        // relay it, so it reaches windows whose core is already gone. Both halves
+        // need administrator rights, and the second one cannot be guessed: an
+        // immediate custom action runs with the installer's unelevated token, and
+        // binding the signal can succeed there while writing the record and
+        // stopping the service do not. So the token alone decides - a process
+        // that is not elevated delegates the whole job to the same helper every
+        // other privileged verb uses, and the elevated copy raises the signal,
+        // holds it for a moment, writes the record and stops the core. This
+        // session's window is closed by the doorbell afterwards.
+        if !crate::elevate::is_elevated() {
+          crate::elevate::run_as_admin(&["--machine", "--signal-only"])?;
+          return single::quit_and_wait(budget);
         }
+        let signal = single::machine_quit()?;
+        let waited = single::quit_and_wait(budget);
+        return waited.and(finish_machine_quit(signal));
       }
       // Portable: one window per state directory, so "all sessions" is this
       // setup and nothing machine-wide (or administrator-only) is involved.
@@ -839,13 +844,18 @@ fn run(cli: Cli) -> Result<(), String> {
 /// that is still mapped.
 fn finish_machine_quit(signal: single::MachineQuit) -> Result<(), String> {
   std::thread::sleep(Duration::from_millis(1000));
+  let acks = signal.acks();
+  crate::diag::line(&format!("quit: {} window(s) answered", acks.len()));
   let mut result = Ok(());
   if crate::elevate::is_elevated() {
-    let acks = signal.acks();
     if let Err(e) = single::write_quit_record(&acks) {
       eprintln!("{e}");
     }
     result = autostart::stop_for_update();
+  } else {
+    // The next install would restore nothing, and the only other symptom is a
+    // silent upgrade: say why, in the log an installer leaves behind.
+    crate::diag::line("quit: not elevated, so the record and the core are left alone");
   }
   drop(signal);
   result
