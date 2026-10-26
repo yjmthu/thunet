@@ -3414,6 +3414,11 @@ impl PasteHold {
     let (Some(origin), Some(latest)) = (origin, latest) else {
       return false;
     };
+    // The field is read from the pointer, not from a widget response, so a
+    // finger resting on a dialog above it would read as a press on the field.
+    if ui.ctx().layer_id_at(origin) != Some(ui.layer_id()) {
+      return false;
+    }
     if !rect.contains(origin) || (latest - origin).length() > Self::SLOP {
       return false;
     }
@@ -3490,6 +3495,14 @@ impl LogHold {
     let (Some(origin), Some(latest)) = (origin, latest) else {
       return false;
     };
+    // The pane is the bottom of the stack, and this reads the pointer itself
+    // rather than a widget response, so it has to ask what is on top: with the
+    // device dialog (or a menu) over the line, the finger is not aiming at the
+    // log at all, and a press here would tint the line and open a second menu
+    // behind the dialog.
+    if ui.ctx().layer_id_at(origin) != Some(ui.layer_id()) {
+      return false;
+    }
     if !rect.contains(origin) || (latest - origin).length() > Self::SLOP {
       return false;
     }
@@ -4971,7 +4984,7 @@ mod tests {
     for _ in 0..3 {
       let mut height = 0.0;
       let mut out = ctx.run_ui(input.clone(), |ui| {
-        let modal = egui::Modal::new(egui::Id::new("devices")).show(ui.ctx(), |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("devices")).show(ui.ctx(), |ui| {
           let mut open = true;
           let mut copied = None;
           devices_list(
