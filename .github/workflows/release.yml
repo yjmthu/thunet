@@ -288,16 +288,50 @@ jobs:
           # that proxy, so the tracked copy is dropped for this build only.
           sed -i -E '/^systemProp\.https?\.proxy(Host|Port)=/d' android/gradle.properties
 
+      # `secrets` is not an allowed context in a step's `if:`, so whether a key
+      # exists is published as an output instead (same trick as WINGET_TOKEN).
+      - name: Check for the signing key
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "${KEYSTORE:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; building an unsigned APK."
+          fi
+
+      - name: Materialize the signing key
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # `storeFile` is resolved relative to the :app project, so it has to be
+          # absolute here or Gradle looks under android/app/.
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$RUNNER_TEMP/release.jks" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" \
+            > android/keystore.properties
+
       - name: Build APK
         run: pixi run -e android apk-release
 
       - name: Name the artifact
+        id: apk
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
           set -euo pipefail
-          # An unsigned release is what AGP names `app-release-unsigned.apk`;
-          # taking whatever sits in the directory also covers a signed build.
+          suffix=""
+          [ "$SIGNED" = 'true' ] || suffix="-unsigned"
+          # Signed builds land in `app-release.apk`, unsigned ones in
+          # `app-release-unsigned.apk`; taking whatever is there covers both.
           out="android/app/build/outputs/apk/release"
           apk="$(find "$out" -maxdepth 1 -name '*.apk' -print -quit)"
           if [ -z "$apk" ]; then
@@ -306,12 +340,30 @@ jobs:
             exit 1
           fi
           mkdir -p dist
-          cp "$apk" "dist/thunet-${VERSION}-arm64.apk"
-          ls -l "dist/thunet-${VERSION}-arm64.apk"
+          file="dist/thunet-${VERSION}-arm64${suffix}.apk"
+          cp "$apk" "$file"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          ls -l "$file"
+
+      - name: Check the signature
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          FILE: ${{ steps.apk.outputs.file }}
+        run: |
+          set -euo pipefail
+          signer="$(ls -1 "$ANDROID_HOME"/build-tools/*/apksigner | tail -n1)"
+          "$signer" verify --print-certs "$FILE"
+
+      # An unsigned APK cannot be installed at all, so it is not attached to the
+      # release; the job still succeeds, with a warning that says why.
+      - name: Say why no APK was published
+        if: steps.signing.outputs.enabled != 'true'
+        run: echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; the APK is unsigned, so it stays out of the release."
 
       # Appends to the release the Windows job creates, exactly like the Linux
       # job; no generate_release_notes here for the same reason.
       - name: Publish release assets
+        if: steps.signing.outputs.enabled == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
