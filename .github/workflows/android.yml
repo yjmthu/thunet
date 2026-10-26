@@ -62,6 +62,11 @@ jobs:
           java-version: '21'
 
       - uses: android-actions/setup-android@v3
+        with:
+          # The default package list starts with `tools`, which no longer exists in
+          # the SDK repository ("Failed to find package 'tools'"). Platform and
+          # NDK are installed by the step below.
+          packages: platform-tools
 
       - name: Install SDK platform and NDK
         run: |
