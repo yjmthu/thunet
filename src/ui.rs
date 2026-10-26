@@ -2689,6 +2689,11 @@ impl App {
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
+                  // The picked rows are painted as one band once the loop knows
+                  // where they are: each row is its own widget with the scroll
+                  // area's spacing between, so tinting them one by one left a
+                  // seam at every gap and a range looked like many selections.
+                  let mut pick_band: Option<egui::Rect> = None;
                   for (index, line) in visible.iter().enumerate() {
                     let color = {
                       let visuals = ui.visuals();
@@ -2705,22 +2710,25 @@ impl App {
                     );
                     // A press on a line is tinted from the moment it lands, so
                     // the target of the hold - a finger or the left button - is
-                    // never a guess, and the picked rows are tinted more strongly
-                    // so aiming at the other end of a range never looks like
-                    // having selected it.
+                    // never a guess. It is a lighter tint than a pick, so aiming
+                    // at the other end of a range never looks like having
+                    // selected it.
                     let held = {
                       let fired = self.log_hold.poll(ui, index, row);
                       let pressed = self.log_hold.pressed_at(index);
-                      let picked = self.log_hold.picked(index);
-                      if pressed || picked {
+                      if self.log_hold.picked(index) {
+                        pick_band = Some(match pick_band {
+                          Some(band) => band.union(row),
+                          None => row,
+                        });
+                      } else if pressed {
                         let bg = ui.visuals().selection.bg_fill;
-                        let alpha = if picked {
-                          PICK_TINT_ALPHA
-                        } else {
-                          PRESS_TINT_ALPHA
-                        };
-                        let tint =
-                          egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
+                        let tint = egui::Color32::from_rgba_unmultiplied(
+                          bg.r(),
+                          bg.g(),
+                          bg.b(),
+                          PRESS_TINT_ALPHA,
+                        );
                         ui.painter().rect_filled(
                           row.expand(1.0),
                           egui::CornerRadius::same(3),
@@ -2745,6 +2753,20 @@ impl App {
                       spot,
                       pick,
                       &picked,
+                    );
+                  }
+                  if let Some(band) = pick_band {
+                    let bg = ui.visuals().selection.bg_fill;
+                    let tint = egui::Color32::from_rgba_unmultiplied(
+                      bg.r(),
+                      bg.g(),
+                      bg.b(),
+                      PICK_TINT_ALPHA,
+                    );
+                    ui.painter().rect_filled(
+                      band.expand(1.0),
+                      egui::CornerRadius::same(3),
+                      tint,
                     );
                   }
                 });
@@ -3944,36 +3966,30 @@ fn log_menu(
     None => popup.at_pointer_fixed(),
   };
   popup.show(|ui| {
-    match pick {
-      // A range: the second hold reached another line, so the menu copies the
-      // rows between them rather than only the one under the finger.
-      Some((first, last)) if last > first => {
-        let label = format!("{} ({})", t.copy_selection, last - first + 1);
-        if ui.button(label).clicked() {
-          *copy_request = Some(picked(first, last));
-          ui.close();
-        }
+    // A range gets one action: copy exactly those lines. "Copy all" beside it
+    // would only offer a way to overreach from a menu that exists to copy a
+    // selection.
+    let range = pick.filter(|(first, last)| last > first);
+    if let Some((first, last)) = range {
+      let label = format!("{} ({})", t.copy_selection, last - first + 1);
+      if ui.button(label).clicked() {
+        *copy_request = Some(picked(first, last));
+        ui.close();
       }
-      // One line picked by a hold. The text comes from the pick, not from this
-      // row, so the two cannot disagree when the popup sits on the anchor of a
-      // range that was just collapsed.
-      Some((first, last)) => {
-        if ui.button(t.copy_line).clicked() {
-          *copy_request = Some(picked(first, last));
-          ui.close();
-        }
+    } else {
+      if ui.button(t.copy_line).clicked() {
+        // A hold on one row copies that row; a desktop right click with no hold
+        // copies the row the popup belongs to.
+        *copy_request = Some(match pick {
+          Some((first, last)) => picked(first, last),
+          None => text.to_owned(),
+        });
+        ui.close();
       }
-      // A right click with no hold (the desktop): the row's own text.
-      None => {
-        if ui.button(t.copy_line).clicked() {
-          *copy_request = Some(text.to_owned());
-          ui.close();
-        }
+      if ui.button(t.copy_all).clicked() {
+        *copy_request = Some(everything.to_owned());
+        ui.close();
       }
-    }
-    if ui.button(t.copy_all).clicked() {
-      *copy_request = Some(everything.to_owned());
-      ui.close();
     }
   });
 }
