@@ -4958,6 +4958,48 @@ mod tests {
     assert_eq!(devices_scroll_max(2000.0, true), 620.0);
   }
 
+  /// A toast produced while a dialog is open has to be readable. A modal draws
+  /// its dimming backdrop as a `Foreground` layer, so a toast in that same order
+  /// lost to it - which is how the device list hid the "copied" confirmation it
+  /// had just produced. `Tooltip` is the one order nothing draws over.
+  #[test]
+  fn a_toast_is_drawn_above_a_dialog() {
+    let toast = Toast {
+      msg: "copied".into(),
+      at: Instant::now(),
+      kind: ToastKind::Ok,
+    };
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(400.0, 890.0),
+      )),
+      ..Default::default()
+    };
+    // Two frames: an area is registered the first time it runs, and the layer
+    // order of the second frame is the one that gets painted.
+    for _ in 0..2 {
+      let mut out = ctx.run_ui(input.clone(), |ui| {
+        let _ = egui::Modal::new(egui::Id::unique("devices")).show(ui.ctx(), |ui| {
+          ui.label("devices");
+        });
+        paint_toast(ui.ctx(), Some(&toast));
+      });
+      // Font and texture uploads belong to the renderer; epaint asserts when an
+      // unapplied delta is dropped.
+      out.textures_delta.clear();
+    }
+    // Back-to-front, so the last layer is the topmost one.
+    let layers: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    let top = *layers.last().expect("the frame registered a layer");
+    assert_eq!(
+      top.order,
+      egui::Order::Tooltip,
+      "the toast must be the topmost layer, above the modal backdrop"
+    );
+  }
+
   #[test]
   fn the_device_dialog_height_does_not_follow_itself() {
     // A modal lays its content out with the height it had last frame. Reading
@@ -5739,8 +5781,13 @@ fn paint_toast(ctx: &egui::Context, toast: Option<&Toast>) {
   // Give it the window width (minus a margin) so short messages stay on one
   // line and only genuinely long ones wrap or get clipped at the edge.
   let max_w = (ctx.content_rect().width() - 32.0).max(120.0);
+  // Above a modal, not merely above the page: a modal's dimming backdrop is a
+  // `Foreground` layer too, and with the toast in that same order the winner is
+  // whichever layer was created first - which is why a dialog hid the "copied"
+  // confirmation it had just produced. `Tooltip` is the only order nothing draws
+  // over, and a toast takes no input, so nothing is lost by putting it there.
   egui::Area::new(egui::Id::unique("thunet_toast"))
-    .order(egui::Order::Foreground)
+    .order(egui::Order::Tooltip)
     .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
     .default_width(max_w)
     .show(ctx, |ui| {
