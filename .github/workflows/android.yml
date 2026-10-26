@@ -13,6 +13,10 @@ name: Android
 on:
   workflow_dispatch:
   push:
+    # Branches only. A tag already builds this commit in the `Release` workflow,
+    # and without this line a tag push runs this check a second time for the same
+    # tree (a third, when the branch and its tag are pushed together).
+    branches: ["**"]
     paths:
       - ".github/workflows/android.yml"
       - "android/**"
