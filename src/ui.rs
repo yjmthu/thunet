@@ -2525,6 +2525,8 @@ impl App {
             let label_w = field_label_width(ui, t);
             field_label(ui, t.password, label_w);
             let id = ui.make_persistent_id("thunet-password-field");
+            // Only the autofill bridge needs this; nothing else in the row does.
+            #[cfg(target_os = "android")]
             let focused = ui.ctx().memory(|m| m.has_focus(id));
             let keep_hint = core_password && self.pass_edit.is_empty();
             let mut input = egui::TextEdit::singleline(&mut self.pass_edit)
@@ -2678,6 +2680,8 @@ impl App {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                   for (index, line) in visible.iter().enumerate() {
+                    #[cfg(not(target_os = "android"))]
+                    let _ = index;
                     let color = {
                       let visuals = ui.visuals();
                       level_color(line.level, visuals)
