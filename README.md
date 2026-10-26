@@ -555,7 +555,7 @@ What that runs:
 1. `./gradlew assembleDebug` depends on the `cargoNdkDebug` task, which calls `scripts/android_build.sh debug` → `cargo ndk -t arm64-v8a -t x86_64 -P 33 -o android/app/src/main/jniLibs build`.
 2. Gradle then assembles the APK (`applicationId io.github.yjmthu.thunet`, `minSdk 33`, `targetSdk 36`) with the launcher icon from `scripts/make_icon.py` and the narrow `network_security_config`.
 
-The script finds the SDK through `ANDROID_HOME`, `sdk.dir` in `android/local.properties` (git-ignored) or `$HOME/Android/Sdk`, and `cargo-ndk` picks the newest NDK under it. Passing `-PnoRust` to Gradle skips the Rust step when the `.so` files are already current; a proxy has to reach Gradle separately (`GRADLE_OPTS='-Dhttps.proxyHost=… -Dhttps.proxyPort=…'`).
+The script finds the SDK through `ANDROID_HOME`, `sdk.dir` in `android/local.properties` (git-ignored) or `$HOME/Android/Sdk`, and `cargo-ndk` picks the newest NDK under it. Passing `-PnoRust` to Gradle skips the Rust step when the `.so` files are already current; a machine that needs a proxy for Google Maven puts `systemProp.https.proxyHost` / `systemProp.https.proxyPort` in its own `~/.gradle/gradle.properties`, never in `android/gradle.properties`, which is shared.
 
 Install it by sideloading:
 
