@@ -85,6 +85,14 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/app/build.gradle') }}
           restore-keys: gradle-${{ runner.os }}-
 
+      - name: Drop the developer proxy
+        run: |
+          # `android/gradle.properties` carries this project's development proxy
+          # on 127.0.0.1:13395, and its own comment says those four lines belong in
+          # ~/.gradle/gradle.properties on a machine that needs them. No runner has
+          # that proxy, so the tracked copy is dropped for this build only.
+          sed -i -E '/^systemProp\.https?\.proxy(Host|Port)=/d' android/gradle.properties
+
       - name: Build APK
         run: pixi run -e android apk-release
 
