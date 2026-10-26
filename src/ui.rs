@@ -2705,13 +2705,22 @@ impl App {
                     );
                     // A press on a line is tinted from the moment it lands, so
                     // the target of the hold - a finger or the left button - is
-                    // never a guess.
+                    // never a guess, and the picked rows are tinted more strongly
+                    // so aiming at the other end of a range never looks like
+                    // having selected it.
                     let held = {
                       let fired = self.log_hold.poll(ui, index, row);
-                      if self.log_hold.marked(index) {
+                      let pressed = self.log_hold.pressed_at(index);
+                      let picked = self.log_hold.picked(index);
+                      if pressed || picked {
                         let bg = ui.visuals().selection.bg_fill;
+                        let alpha = if picked {
+                          PICK_TINT_ALPHA
+                        } else {
+                          PRESS_TINT_ALPHA
+                        };
                         let tint =
-                          egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 56);
+                          egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
                         ui.painter().rect_filled(
                           row.expand(1.0),
                           egui::CornerRadius::same(3),
@@ -3497,6 +3506,16 @@ impl LogPick {
   }
 }
 
+/// Tint of the row under a press that has not matured into a hold yet.
+///
+/// A press is only an aim; the picked rows are what the menu will act on. Both
+/// use the theme's selection colour so they read as one gesture, with half the
+/// weight for the aim, or a finger would look like it had already selected the
+/// row it is merely resting on.
+const PRESS_TINT_ALPHA: u8 = 24;
+/// Tint of the rows the copy menu acts on.
+const PICK_TINT_ALPHA: u8 = 64;
+
 /// A press resting on a log line, for the copy menu.
 ///
 /// Shorter than egui's own 0.8 s long touch: a log line is a small target and
@@ -3592,9 +3611,14 @@ impl LogHold {
     self.pick.range()
   }
 
-  /// Should line `index` be tinted right now?
-  fn marked(&self, index: usize) -> bool {
-    self.pick.covers(index) || self.pressed.is_some_and(|(on, _)| on == index)
+  /// Should this row show the faint "a press is on it" tint?
+  fn pressed_at(&self, index: usize) -> bool {
+    self.pressed.is_some_and(|(on, _)| on == index)
+  }
+
+  /// Is this row part of the range the menu acts on?
+  fn picked(&self, index: usize) -> bool {
+    self.pick.covers(index)
   }
 
   /// Did the press that is (or just was) down open a menu?
@@ -5105,6 +5129,24 @@ mod tests {
     // Lifting without a hold is a tap, and a tap is what deselects.
     hold.clear_if_closed(false, false);
     assert_eq!(hold.pick.range(), None);
+  }
+
+  /// A press is an aim, a pick is a decision: the two have to look different,
+  /// and neither may stand in for the other.
+  #[test]
+  fn a_press_and_a_pick_are_different_states() {
+    assert!(
+      PRESS_TINT_ALPHA < PICK_TINT_ALPHA,
+      "the aim has to be lighter than the selection"
+    );
+    let mut hold = LogHold::default();
+    hold.pick.hold(3);
+    hold.pick.hold(6);
+    hold.pressed = Some((9, 0.0));
+    assert!(hold.picked(3) && hold.picked(4) && hold.picked(6));
+    assert!(!hold.picked(9), "a press outside the range is not picked");
+    assert!(hold.pressed_at(9));
+    assert!(!hold.pressed_at(4), "a picked row carries no press");
   }
 
   /// A toast produced while a dialog is open has to be readable. A modal draws
