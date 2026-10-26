@@ -51,6 +51,16 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      # The runner image's default JDK is 11 and `sdkmanager` refuses anything
+      # below 17 ("Your version was detected as 11.0.32.1"). The pixi environment
+      # only exports JAVA_HOME inside `pixi run`, so the action that reads the SDK
+      # licenses needs a JDK of its own; this one is also what Gradle would pick
+      # up outside pixi.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - uses: android-actions/setup-android@v3
 
       - name: Install SDK platform and NDK

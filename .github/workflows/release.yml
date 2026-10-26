@@ -241,6 +241,16 @@ jobs:
       # Platform 36 and NDK 29 are newer than what the runner image ships, and
       # `ndkVersion` in android/app/build.gradle pins that exact NDK: AGP looks it
       # up under $ANDROID_HOME/ndk and fails the build when it is a different one.
+      # The runner image's default JDK is 11 and `sdkmanager` refuses anything
+      # below 17 ("Your version was detected as 11.0.32.1"). The pixi environment
+      # only exports JAVA_HOME inside `pixi run`, so the action that reads the SDK
+      # licenses needs a JDK of its own; this one is also what Gradle would pick
+      # up outside pixi.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
       - uses: android-actions/setup-android@v3
 
       - name: Install SDK platform and NDK
