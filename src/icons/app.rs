@@ -1,6 +1,7 @@
 //! The app, window and tray artwork: a disc with a white "T".
 
 use eframe::egui;
+#[cfg(not(target_os = "android"))]
 use tray_icon::Icon;
 
 use crate::session::State;
@@ -86,6 +87,7 @@ fn letter_cover(x: f32, y: f32, size: f32) -> f32 {
 }
 
 /// Tray icon in one state's colour.
+#[cfg(not(target_os = "android"))]
 pub fn make_icon(rgb: [u8; 3]) -> Icon {
   const S: usize = 64;
   Icon::from_rgba(disc_rgba(S, rgb), S as u32, S as u32).expect("valid rgba")

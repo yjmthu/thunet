@@ -102,26 +102,39 @@ fn endpoint(machine: bool) -> String {
     // peer check in `attach` is what authorizes the client.
     return "@thunet-control".into();
   }
-  use std::os::unix::fs::PermissionsExt as _;
-
-  // The state directory is part of the name: two portable setups of one user
-  // (two `--state-dir`s) are two independent cores, and a frontend must never
-  // attach to the other one's session.
-  let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-    Some(base) => {
-      std::path::PathBuf::from(base).join(format!("thunet-{}", crate::config::state_tag()))
-    }
-    None => std::env::temp_dir().join(format!(
-      "thunet-{}-{}",
-      user_tag(),
-      crate::config::state_tag()
-    )),
-  };
-  if std::fs::create_dir_all(&dir).is_ok() {
-    // The socket inherits the directory's permissions: owner only.
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+  #[cfg(target_os = "android")]
+  {
+    // The app's private directory: writable inside the sandbox and short
+    // enough for `sun_path`. `THUNET_STATE_DIR` is the same directory the
+    // config and credential use, so two setups never share a socket.
+    let dir = std::env::var_os("THUNET_STATE_DIR")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|| std::env::temp_dir().join("thunet"));
+    return dir.join("control.sock").to_string_lossy().into_owned();
   }
-  dir.join("control.sock").to_string_lossy().into_owned()
+  #[cfg(not(target_os = "android"))]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The state directory is part of the name: two portable setups of one user
+    // (two `--state-dir`s) are two independent cores, and a frontend must never
+    // attach to the other one's session.
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+      Some(base) => {
+        std::path::PathBuf::from(base).join(format!("thunet-{}", crate::config::state_tag()))
+      }
+      None => std::env::temp_dir().join(format!(
+        "thunet-{}-{}",
+        user_tag(),
+        crate::config::state_tag()
+      )),
+    };
+    if std::fs::create_dir_all(&dir).is_ok() {
+      // The socket inherits the directory's permissions: owner only.
+      let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir.join("control.sock").to_string_lossy().into_owned()
+  }
 }
 
 #[cfg(windows)]
@@ -142,6 +155,7 @@ fn endpoint(machine: bool) -> String {
   )
 }
 
+#[cfg(not(target_os = "android"))]
 fn user_tag() -> String {
   let raw = std::env::var("USER")
     .or_else(|_| std::env::var("LOGNAME"))
@@ -236,7 +250,12 @@ impl Hub {
       Ev::Log(line) => crate::diag::line(&line.render()),
       // Replies to one-off requests belong to the client that asked; they are
       // not part of the state a late frontend needs.
-      Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::Credentials(_) | Ev::AcId(_) => {}
+      Ev::Notify { .. }
+      | Ev::Beat
+      | Ev::Status(_)
+      | Ev::Core(_)
+      | Ev::Credentials(_)
+      | Ev::AcId(_) => {}
     }
     // Only log lines are replayed: a toast belongs to the action that raised
     // it, and replaying one to a fresh frontend would look like news.
@@ -1400,7 +1419,10 @@ pub fn request_stop() {
 /// [`Serve::AlreadyRunning`] and the window talks to that core instead.
 pub fn host_core() -> Result<(), String> {
   if HOSTED.swap(true, Ordering::Relaxed) {
-    return Err("this window already runs the core; stop it first".into());
+    // Idempotent on purpose: on Android the keep-alive service may host the
+    // core first and the Activity then asks for the same thing, which is not
+    // a conflict.
+    return Ok(());
   }
   STOP.store(false, Ordering::Relaxed);
   let spawned = std::thread::Builder::new()

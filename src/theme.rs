@@ -7,21 +7,29 @@
 //! portal (`org.freedesktop.portal.Settings`, key
 //! `org.freedesktop.appearance` / `color-scheme`), the interface GNOME, KDE and
 //! the other desktops implement, so that is what is read here.
+//!
+//! Android reports nothing through winit either. `ThunetActivity` reads
+//! `Configuration.uiMode` and writes `files/theme.txt`, and [`refresh`] turns
+//! that into the same answer this module gives the desktop.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// `color-scheme` values from the portal, plus this module's own "not known"
 /// state (also what it stays at when there is no portal to ask).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const UNKNOWN: u8 = 0;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const DARK: u8 = 1;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const LIGHT: u8 = 2;
 
 /// The last value the portal reported.
 #[cfg(target_os = "linux")]
+static SCHEME: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+/// The last night mode the Activity wrote.
+#[cfg(target_os = "android")]
 static SCHEME: AtomicU8 = AtomicU8::new(UNKNOWN);
 
 /// The session bus, held for the life of the process: the `SettingChanged`
@@ -43,7 +51,36 @@ pub fn system() -> Option<eframe::egui::Theme> {
   }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "android")]
+pub fn system() -> Option<eframe::egui::Theme> {
+  match SCHEME.load(Ordering::Relaxed) {
+    DARK => Some(eframe::egui::Theme::Dark),
+    LIGHT => Some(eframe::egui::Theme::Light),
+    _ => None,
+  }
+}
+
+/// Re-read the night mode the Activity wrote.
+///
+/// Called on a slow timer instead of per frame: the file is small but the
+/// answer only changes when the system theme does, and the caller compares the
+/// resolved theme anyway.
+#[cfg(target_os = "android")]
+pub fn refresh(ctx: &eframe::egui::Context) {
+  let scheme = match std::fs::read_to_string(crate::config::dir().join("theme.txt")) {
+    Ok(text) => match text.trim() {
+      "dark" => DARK,
+      "light" => LIGHT,
+      _ => UNKNOWN,
+    },
+    Err(_) => UNKNOWN,
+  };
+  if SCHEME.swap(scheme, Ordering::Relaxed) != scheme {
+    ctx.request_repaint();
+  }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn system() -> Option<eframe::egui::Theme> {
   None
 }

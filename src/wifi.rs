@@ -533,7 +533,24 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::probe_ssid;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Android: the Activity writes the connected Wi-Fi name to `files/ssid.txt`,
+/// and only while the user's SSID detection setting is on and the location
+/// permission is held. An empty file means "no name", which is also what a
+/// refused permission leaves behind — the probes then decide, exactly as they
+/// did before the setting existed.
+#[cfg(target_os = "android")]
+pub fn probe_ssid() -> Result<Option<String>, String> {
+  let path = crate::config::dir().join("ssid.txt");
+  match std::fs::read_to_string(path) {
+    Ok(text) => {
+      let name = text.trim();
+      Ok((!name.is_empty()).then(|| name.to_string()))
+    }
+    Err(_) => Ok(None),
+  }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub fn probe_ssid() -> Result<Option<String>, String> {
   Ok(None)
 }

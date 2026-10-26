@@ -1792,7 +1792,75 @@ mod imp {
   }
 }
 
-#[cfg(not(windows))]
+/// Android has no service manager and no tray: the background keep-alive
+/// toggle (a foreground service) is the only thing that keeps the process
+/// alive, and it is controlled from the window, not from here.
+#[cfg(target_os = "android")]
+mod imp {
+  use super::{Autostart, ServiceAction};
+
+  fn unsupported() -> String {
+    "Android has no system service; use the background keep-alive setting".into()
+  }
+
+  pub fn tray_registered(_a: &Autostart) -> bool {
+    false
+  }
+
+  pub fn core_registered() -> bool {
+    false
+  }
+
+  pub fn core_starts_at_boot() -> bool {
+    false
+  }
+
+  pub fn enable_tray(_a: &Autostart) -> Result<(), String> {
+    Err(unsupported())
+  }
+
+  pub fn disable_tray(_a: &Autostart) -> Result<(), String> {
+    Ok(())
+  }
+
+  pub fn refresh_tray(_a: &Autostart) -> Result<(), String> {
+    Ok(())
+  }
+
+  pub fn enable_core(_a: &Autostart) -> Result<(), String> {
+    Err(unsupported())
+  }
+
+  pub fn disable_core() -> Result<(), String> {
+    Ok(())
+  }
+
+  pub fn prepare_service(_a: &Autostart) -> Result<bool, String> {
+    Ok(false)
+  }
+
+  pub fn resume_after_update() -> Result<(), String> {
+    Ok(())
+  }
+
+  pub fn purge_machine_state() -> Result<(), String> {
+    Ok(())
+  }
+
+  pub fn service(_action: ServiceAction, _a: &Autostart) -> Result<String, String> {
+    Err(unsupported())
+  }
+
+  pub fn service_direct(_action: ServiceAction, _a: &Autostart) -> Result<String, String> {
+    Err(unsupported())
+  }
+
+  pub fn stop_for_update() -> Result<(), String> {
+    Ok(())
+  }
+}
+
+#[cfg(all(not(windows), not(target_os = "android")))]
 mod imp {
   use std::path::PathBuf;
 

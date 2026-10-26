@@ -104,6 +104,57 @@ pub struct Texts {
   /// Hover on a disabled *Apply*: the form is incomplete, or nothing changed.
   pub password_required: &'static str,
   pub nothing_to_apply: &'static str,
+  /// Android: read the Wi-Fi name to tell `Tsinghua-Secure` from a portal
+  /// network. Off by default because it needs the location permission.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub secure_detection: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub secure_detection_hint: &'static str,
+  /// Android: how much of the app stays behind, mirroring the desktop's
+  /// autostart triad, plus the hint for the level currently chosen.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_mode: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_off: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_wake: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_service: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_off_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_wake_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_service_hint: &'static str,
+  /// Android: shown under the resident level only. A swipe from recents is a
+  /// force-stop on ROMs that clean up aggressively, the foreground service
+  /// included, so the one thing that saves the session is not something the
+  /// app can do itself.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_rom_hint: &'static str,
+  /// Android: the resident level was asked for but the notification permission
+  /// was refused, so the effective level is "network changes".
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_denied: &'static str,
+  /// Android: the battery-optimisation exemption that lets the wake-up survive
+  /// a swipe on ROMs that otherwise force-stop the app.
+  ///
+  /// The OEM toggles behind it are unreadable, so the row states only what the
+  /// user confirms; it never claims an authorisation it cannot see.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_ok: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_missing: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_authorize: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_check: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_ready: &'static str,
   /// Connect was pressed while no account/password is available at all.
   pub no_credentials: &'static str,
   /// Prefix of the compile-time stamp next to the version.
@@ -115,6 +166,8 @@ pub struct Texts {
   pub copied: &'static str,
   pub copy_line: &'static str,
   pub copy_all: &'static str,
+  /// Label for copying a range of log lines; the menu appends the count.
+  pub copy_selection: &'static str,
   pub network_unavailable: &'static str,
   pub no_login_needed: &'static str,
   pub not_campus_network: &'static str,
@@ -155,6 +208,8 @@ pub struct Texts {
   pub link: &'static str,
   pub link_ethernet: &'static str,
   pub link_wlan: &'static str,
+  pub link_mobile: &'static str,
+  pub link_usb: &'static str,
   pub link_none: &'static str,
   pub link_other: &'static str,
   /// Tooltip of the heartbeat ring beside the state label.
@@ -207,6 +262,10 @@ pub struct Texts {
   pub ac_unreachable: &'static str,
   /// State label: the link reaches the internet without a portal session.
   pub online_without_portal: &'static str,
+  /// State label: the link is not the campus network at all.
+  pub online_other_network: &'static str,
+  /// Status banner: that other network needs no login, and that is good news.
+  pub online_no_portal: &'static str,
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
   pub autostart_failed: &'static str,
@@ -257,6 +316,8 @@ impl crate::proto::LinkKind {
       LinkKind::None => t.link_none,
       LinkKind::Ethernet => t.link_ethernet,
       LinkKind::Wlan => t.link_wlan,
+      LinkKind::Mobile => t.link_mobile,
+      LinkKind::Usb => t.link_usb,
       LinkKind::Other => t.link_other,
     }
   }
@@ -301,6 +362,24 @@ static ZH: Texts = Texts {
   auto_connect_without_credentials_online: "当前会话可继续，但没有保存密码——掉线后不会自动重连",
   password_required: "保存密码或更换账号都需要重新输入密码",
   nothing_to_apply: "没有需要应用的修改",
+  secure_detection: "Secure 检测",
+  secure_detection_hint: "读取 Wi-Fi 名称需要定位权限（并开启定位服务）；未授权时不作判断，只靠网络探测。",
+  background_mode: "后台运行",
+  background_off: "关闭",
+  background_wake: "网络变化",
+  background_service: "常驻",
+  background_off_hint: "不在后台做任何事；关掉应用后再打开是唯一回来的方式。",
+  background_wake_hint: "Wi-Fi 变化时唤醒并登录（无通知）；其余情况由 15 分钟一次的后台任务兜底。",
+  background_service_hint: "前台服务 + 静默通知：会话持续在线，并在开机时自动启动。",
+  background_rom_hint: "MIUI/HyperOS 等系统会把“划掉任务”当成强制停止，前台服务也会一起被杀；在最近任务里锁住本应用卡片才能留在后台。",
+  background_denied: "常驻后台需要通知权限；当前按“网络变化”运行。",
+  background_power: "允许后台唤醒",
+  background_power_ok: "系统电量限制已解除",
+  background_power_missing: "系统电量限制未解除：后台网络会被封锁",
+  background_authorize: "去设置",
+  background_power_check: "已在系统设置中开启自启动、省电策略设为“无限制”",
+  background_power_hint: "未解除时系统会封锁后台网络，唤醒后也登录不了；另需在系统设置里打开“自启动”。",
+  background_power_ready: "划掉应用后，下次连上 Wi-Fi 仍会被唤醒。",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
   on: "已开启",
@@ -308,6 +387,7 @@ static ZH: Texts = Texts {
   copied: "已复制",
   copy_line: "复制本行",
   copy_all: "复制全部",
+  copy_selection: "复制选中的行",
   network_unavailable: "当前没有网络连接（网线未插或 Wi-Fi 未连接），暂不尝试登录",
   no_login_needed: "当前网络不经过校园门户（未检测到拦截），本机不会尝试登录",
   not_campus_network: "当前网络不是清华校园网登录环境，跳过登录",
@@ -332,12 +412,16 @@ static ZH: Texts = Texts {
   lang_en: "English",
   online: "在线",
   online_without_portal: "已联网（未登录）",
+  online_other_network: "在线（其他网络）",
+  online_no_portal: "当前网络不是校园网，可直接上网，无需门户登录",
   authenticating: "认证中",
   offline: "离线",
   account: "账号",
   link: "网络",
   link_ethernet: "以太网",
   link_wlan: "WLAN",
+  link_mobile: "移动数据",
+  link_usb: "USB 共享",
   link_none: "未连接",
   link_other: "其他",
   heartbeat_hint: "在线每 15 秒、离线每 10 秒查询一次门户状态",
@@ -422,6 +506,24 @@ static EN: Texts = Texts {
   auto_connect_without_credentials_online: "This session keeps running, but no password is saved — it will not reconnect on its own",
   password_required: "Saving a password or changing the account needs the password typed in",
   nothing_to_apply: "Nothing to apply",
+  secure_detection: "Secure detection",
+  secure_detection_hint: "Reading the Wi-Fi name needs the location permission (and location services); without it the app falls back to the network probes.",
+  background_mode: "Background",
+  background_off: "Off",
+  background_wake: "Wi-Fi change",
+  background_service: "Resident",
+  background_off_hint: "Nothing stays behind; reopening the app is the only way back.",
+  background_wake_hint: "Wakes on a Wi-Fi change and signs in, with no notification; a 15-minute job covers the rest.",
+  background_service_hint: "A foreground service with a silent notification: the session stays up and starts at boot.",
+  background_rom_hint: "MIUI/HyperOS and similar ROMs turn a swipe from recents into a force-stop, service included; lock the card in recents to stay online.",
+  background_denied: "Resident needs the notification permission; running on Wi-Fi change instead.",
+  background_power: "Background wake-up",
+  background_power_ok: "Battery restriction lifted",
+  background_power_missing: "Battery restriction in place: background network is blocked",
+  background_authorize: "Open settings",
+  background_power_check: "Autostart is on and the power policy is unrestricted",
+  background_power_hint: "While the restriction is in place the system blocks this app's background network, so a wake-up cannot sign in; autostart has to be allowed as well.",
+  background_power_ready: "A swiped-away app is still woken on the next Wi-Fi.",
   no_credentials: "No account or password saved",
   built: "Built at",
   on: "On",
@@ -429,6 +531,7 @@ static EN: Texts = Texts {
   copied: "Copied",
   copy_line: "Copy line",
   copy_all: "Copy all",
+  copy_selection: "Copy selected lines",
   network_unavailable: "No network connection (cable unplugged / Wi-Fi down), not logging in",
   no_login_needed: "This link does not go through the campus portal (nothing intercepts HTTP); no login is attempted",
   not_campus_network: "This does not look like the Tsinghua campus login network; skipping",
@@ -453,12 +556,16 @@ static EN: Texts = Texts {
   lang_en: "English",
   online: "Online",
   online_without_portal: "Online (unauthenticated)",
+  online_other_network: "Online (other network)",
+  online_no_portal: "This is not the campus network; the internet works directly, so no portal login is needed",
   authenticating: "Authenticating",
   offline: "Offline",
   account: "Account",
   link: "Link",
   link_ethernet: "Ethernet",
   link_wlan: "WLAN",
+  link_mobile: "Mobile data",
+  link_usb: "USB tethering",
   link_none: "No link",
   link_other: "Other",
   heartbeat_hint: "Portal status is polled every 15 s online and 10 s offline",

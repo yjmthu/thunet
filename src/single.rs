@@ -399,10 +399,30 @@ mod imp {
 
     // The answer channel first: a window that sees the event connects here, so
     // the pipe must exist before the event can be seen.
-    let listener = crate::ipc::endpoint::Endpoint::bind(
-      MACHINE_QUIT_PIPE,
-      crate::ipc::INTERACTIVE_SDDL,
-    )?;
+    //
+    // An elevated sender creates a high-integrity object, and a window running as
+    // the interactive user may not write to one - `connect` fails with access
+    // denied and the record never names it. A low mandatory label is what makes
+    // the pipe writable downwards while the DACL keeps deciding who may connect.
+    // Only the elevated half needs it: a pipe created by an unelevated process is
+    // already at the caller's integrity level.
+    let sddl = if crate::elevate::is_elevated() {
+      format!("{}S:(ML;;NW;;;LW)", crate::ipc::INTERACTIVE_SDDL)
+    } else {
+      crate::ipc::INTERACTIVE_SDDL.to_string()
+    };
+    let listener = match crate::ipc::endpoint::Endpoint::bind(MACHINE_QUIT_PIPE, &sddl) {
+      Ok(listener) => listener,
+      // Setting a mandatory label is part of the object's SACL, and a token
+      // without the privilege for that refuses the whole pipe. The answer channel
+      // is worth a degraded attempt - a window that cannot answer leaves only
+      // itself unrestored - but never an aborted install.
+      Err(e) if crate::elevate::is_elevated() => {
+        crate::diag::line(&format!("quit: cannot label the answer pipe: {e}"));
+        crate::ipc::endpoint::Endpoint::bind(MACHINE_QUIT_PIPE, crate::ipc::INTERACTIVE_SDDL)?
+      }
+      Err(e) => return Err(e),
+    };
 
     let (attributes, descriptor) = security(MACHINE_QUIT_SDDL)?;
     let event_name = wide(MACHINE_QUIT_NAME);
@@ -484,14 +504,22 @@ mod imp {
     // has it: a pipe drops both the buffered line and the client's identity if
     // the client goes away before the server accepts the connection. A failure
     // here still ends the window; the sender then restores it in the tray.
-    if let Ok(mut conn) = crate::ipc::endpoint::connect(MACHINE_QUIT_PIPE) {
-      let line = if minimized {
-        "minimized\n"
-      } else {
-        "visible\n"
-      };
-      let _ = conn.write_line(line);
-      let _ = conn.wait_ack();
+    match crate::ipc::endpoint::connect(MACHINE_QUIT_PIPE) {
+      Ok(mut conn) => {
+        let line = if minimized {
+          "minimized\n"
+        } else {
+          "visible\n"
+        };
+        if let Err(e) = conn.write_line(line) {
+          crate::diag::line(&format!("quit: cannot write the answer: {e}"));
+        } else {
+          // The acknowledgement only means "recorded": a timeout is not a
+          // failure, and the sender logs how many windows answered.
+          let _ = conn.wait_ack();
+        }
+      }
+      Err(e) => crate::diag::line(&format!("quit: cannot answer the machine signal: {e}")),
     }
     true
   }

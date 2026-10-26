@@ -26,7 +26,10 @@ use crate::session::State;
 /// from the same build, so this stays at 1 and the shapes may change freely.
 /// Raise it the first time an old core can meet a new frontend: a released
 /// build, or an upgrade that cannot restart both halves together.
-pub const VERSION: u8 = 1;
+///
+/// 2: [`Ev::Beat`] was added, and the window no longer takes a status answer as
+/// the heartbeat.
+pub const VERSION: u8 = 2;
 
 /// What the frontend asks the core to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +109,15 @@ pub enum LoginEnv {
   NoNetwork,
   /// A captive portal that is not the campus one (hotel, airport, ...).
   OtherPortal,
-  /// The internet works directly, so there is nothing to log in to.
+  /// The internet works directly, so there is nothing to log in to. The probe
+  /// found the machine behind the campus portal, which answered but reported
+  /// no signed-in identity for this address - a campus link without a session,
+  /// not a different network.
   NoPortal,
+  /// The internet works directly and the portal is not behind this link at all:
+  /// home Wi-Fi, mobile data, a hotspot. Nothing on this link is the campus
+  /// network, so no login will ever be attempted.
+  OtherNetwork,
 }
 
 /// Which physical link carries the machine's default route.
@@ -125,6 +135,14 @@ pub enum LinkKind {
   Ethernet,
   /// Wi-Fi.
   Wlan,
+  /// A phone's cellular link: the phone itself, or a computer whose route goes
+  /// through one (a tethered phone). Named on its own because "Other" says
+  /// nothing about the one link a campus client most often falls back to.
+  Mobile,
+  /// Wired Ethernet provided by a phone over USB (USB tethering). It reaches
+  /// the OS as an ordinary Ethernet adapter, so the platform has to say which
+  /// one it is.
+  Usb,
   /// Anything else: a tunnel, a virtual switch, a modem.
   Other,
 }
@@ -233,6 +251,10 @@ impl std::fmt::Display for Failure {
 pub enum Ev {
   State(State),
   Info(Value),
+  /// One status poll finished, whether or not the portal answered. The window
+  /// walks the turtle from this beat; [`Ev::Info`] carries what the answer
+  /// said.
+  Beat,
   Log(Line),
   /// `Some` = a failure to surface; `None` = clear the banner.
   Error(Option<Failure>),
@@ -309,7 +331,7 @@ mod tests {
     });
     let text = wire.line().unwrap();
     assert!(!text.contains('\n') || text.ends_with('\n'));
-    assert!(text.starts_with("{\"v\":1,"), "{text}");
+    assert!(text.starts_with(&format!("{{\"v\":{VERSION},")), "{text}");
     match Wire::parse(text.trim_end()).unwrap().msg {
       Msg::Cmd(Cmd::SetCredentials {
         username,

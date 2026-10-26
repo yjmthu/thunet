@@ -13,12 +13,6 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use serde_json::Value;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
-// Click events exist only in the Windows backend; the Linux one
-// (`libappindicator`) never reports a click, so nothing there consumes these.
-#[cfg(windows)]
-use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
@@ -26,13 +20,14 @@ use crate::core::{POLL_OFFLINE, POLL_ONLINE};
 use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
-  eye_closed_image, eye_open_image, gear_image, heading_icon, icon_button, icon_texture, make_icon,
-  paint_device_icon,
+  eye_closed_image, eye_open_image, gear_image, heading_icon, icon_button, icon_texture,
+  paint_copy_icon, paint_device_icon,
 };
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
 use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, Failure, LinkKind, LoginEnv, ToastKind};
 use crate::session::State;
+use crate::tray::{Action, Tray};
 
 impl LoginEnv {
   /// Is a login attempt possible here at all?
@@ -47,7 +42,7 @@ impl LoginEnv {
       LoginEnv::EnterpriseWifi(ssid) => Some(t.secure_wifi.replacen("{}", ssid, 1)),
       LoginEnv::NoNetwork => Some(t.network_unavailable.to_string()),
       LoginEnv::OtherPortal => Some(t.not_campus_network.to_string()),
-      LoginEnv::NoPortal => Some(t.no_login_needed.to_string()),
+      LoginEnv::NoPortal | LoginEnv::OtherNetwork => Some(t.no_login_needed.to_string()),
     }
   }
 }
@@ -399,7 +394,11 @@ fn human_uptime(secs: u64) -> String {
 
 fn level_color(level: Level, visuals: &egui::Visuals) -> egui::Color32 {
   match level {
-    Level::Debug => egui::Color32::from_gray(135),
+    // `gray(135)` sat within five levels of the dark theme's body text
+    // (`gray(140)`), so debug looked like info. The theme's own weak colour is
+    // dimmer than the body text in both themes, which is the point of the
+    // level.
+    Level::Debug => visuals.weak_text_color(),
     Level::Info => visuals.text_color(),
     Level::Warn => egui::Color32::from_rgb(216, 160, 48),
     Level::Error => egui::Color32::from_rgb(228, 112, 112),
@@ -412,11 +411,36 @@ fn level_color(level: Level, visuals: &egui::Visuals) -> egui::Color32 {
 /// credentials and endpoints, and a user running both has to be able to tell
 /// which one is asking.
 fn app_name() -> &'static str {
-  if crate::ipc::portable() {
-    "THUnet Portable"
-  } else {
+  #[cfg(target_os = "android")]
+  {
+    // The app is always portable-like on Android; the marker would only
+    // confuse the one mode the platform has.
     "THUnet"
   }
+  #[cfg(not(target_os = "android"))]
+  {
+    if crate::ipc::portable() {
+      "THUnet Portable"
+    } else {
+      "THUnet"
+    }
+  }
+}
+
+/// System-bar and IME insets written by `ThunetActivity` in physical pixels:
+/// `top bottom ime`. Zeros until the first callback.
+#[cfg(target_os = "android")]
+fn android_insets() -> (f32, f32) {
+  let Ok(text) = std::fs::read_to_string(crate::config::dir().join("insets.txt")) else {
+    return (0.0, 0.0);
+  };
+  let mut parts = text
+    .split_whitespace()
+    .filter_map(|v| v.parse::<f32>().ok());
+  let top = parts.next().unwrap_or(0.0);
+  let bottom = parts.next().unwrap_or(0.0);
+  let ime = parts.next().unwrap_or(0.0);
+  (top, bottom.max(ime))
 }
 
 // (the session loop now lives in `core.rs`)
@@ -488,6 +512,11 @@ pub struct App {
   /// session rides on is the first thing to check when it comes and goes.
   uplink: LinkKind,
   next_uplink: Instant,
+  /// The addresses this machine holds on the current link. The portal row wins
+  /// while the portal answers; these fill in on mobile data, another network,
+  /// or a campus link without a session, where the portal has nothing to say.
+  local_ip4: String,
+  local_ip6: String,
   state: State,
   info: Info,
   /// When the last status answer arrived. The turtle beside the state label
@@ -498,6 +527,42 @@ pub struct App {
   /// The device badge was clicked and its list is showing.
   devices_open: bool,
   logs: Vec<Line>,
+  /// Android's background level, as written by the Activity into
+  /// `files/background.txt`. Read on the slow tick; the settings row shows it.
+  #[cfg(target_os = "android")]
+  background: crate::background::Mode,
+  /// The last request for the resident level lost the notification permission,
+  /// so the effective level is lower and the row says why.
+  #[cfg(target_os = "android")]
+  background_denied: bool,
+  /// The user confirmed the OEM toggles that let the wake-up survive a swipe.
+  /// They cannot be read, so this is their answer, not a guess.
+  #[cfg(target_os = "android")]
+  background_allowed: bool,
+  /// The system's battery exemption is in place. This one is readable, and it
+  /// is what decides whether the app has a background network at all.
+  #[cfg(target_os = "android")]
+  background_power: bool,
+  /// The Android SSID-detection setting; without the location permission it
+  /// stays off and the network probes decide.
+  #[cfg(target_os = "android")]
+  secure_detection: bool,
+  /// Which credential field the autofill service last heard about.
+  #[cfg(target_os = "android")]
+  autofill_focus: Option<AutofillKind>,
+  /// The value last reported to the service, so a keystroke is sent once.
+  #[cfg(target_os = "android")]
+  autofill_value: String,
+  /// Where the focused field was last reported, in physical pixels. The window
+  /// moves when the keyboard opens, and the service places its dropdown from
+  /// this rectangle.
+  #[cfg(target_os = "android")]
+  autofill_rect: Option<[i32; 4]>,
+  /// Long-press detection for the credential fields' clipboard paste.
+  #[cfg(target_os = "android")]
+  paste: PasteHold,
+  /// Long-press detection for the log menu, and the lines it picks.
+  log_hold: LogHold,
   /// The failure the red banner shows. Stored as a kind rather than as words,
   /// so the banner is re-worded by a language switch instead of keeping the
   /// language it arrived in.
@@ -547,10 +612,11 @@ pub struct App {
   env: LoginEnv,
   page: Page,
   toast: Option<Toast>,
-  /// `None` when the platform refused to create a tray icon (no notification
-  /// area, e.g. inside a validation sandbox). The app then stays window-only:
-  /// closing quits instead of hiding, and a hidden start is not attempted.
-  tray: Option<TrayIcon>,
+  /// Inert on Android. `available()` is false when the platform refused to
+  /// create an icon (no notification area, e.g. a validation sandbox): the app
+  /// then stays window-only, so closing quits instead of hiding and a hidden
+  /// start is not attempted.
+  tray: Tray,
   /// Colour of the icon currently installed in the tray; `set_icon` rewrites a
   /// temp PNG and re-announces the indicator, so it must only run on a change.
   tray_rgb: Option<[u8; 3]>,
@@ -562,12 +628,11 @@ pub struct App {
   /// The privacy eye in the status header, one texture per state.
   eye_open: Option<egui::TextureHandle>,
   eye_closed: Option<egui::TextureHandle>,
-  connect_item: MenuItem,
-  disconnect_item: MenuItem,
-  show_item: MenuItem,
-  hide_item: MenuItem,
-  quit_item: MenuItem,
   started: bool,
+  /// Input focus in the previous frame. The false-to-true edge is what a return
+  /// from the background looks like on Android, and logging it is what makes
+  /// "the session survived being hidden" observable.
+  was_focused: bool,
   /// `--minimized`/`start_minimized`: the first painted frame must not be
   /// left on screen (eframe shows the root window after it unconditionally).
   hide_at_start: bool,
@@ -619,6 +684,14 @@ fn autostart_entry(minimized: bool) -> Option<Autostart> {
 
 impl App {
   pub fn new(cfg: Config, minimized: bool, font: Option<&'static str>) -> Self {
+    // The core owns the credential: it read the sealed blob at startup, and the
+    // window must not hold a second copy. Portable mode is exactly where
+    // `Config::load()` hands the window the plaintext (the core and the window
+    // share a state directory), and seeding `pass_edit` with it made the window
+    // treat a saved password as an unsaved edit — the *Unsaved* marker never
+    // cleared after a restart on Android.
+    let mut cfg = cfg;
+    cfg.password.clear();
     // The root window already exists at this point (eframe creates it before
     // calling the app creator) but has not been shown yet, so cloaking it here
     // means the forced show after the first painted frame stays invisible.
@@ -634,8 +707,6 @@ impl App {
     let min_level = Level::from_setting(&cfg.log_level);
     let t = lang.texts();
 
-    let connect_item = MenuItem::with_id("connect", t.connect, true, None);
-    let disconnect_item = MenuItem::with_id("disconnect", t.disconnect, true, None);
     // Portable is visible in the title and the tray tooltip: the two modes
     // keep separate state, credentials and endpoints, so the user has to be
     // able to tell which one this window is. The application id is left alone
@@ -645,31 +716,14 @@ impl App {
     let portable = crate::ipc::portable();
     let app_title = app_name();
 
-    let show_item = MenuItem::with_id("show", t.show_window, true, None);
-    let hide_item = MenuItem::with_id("hide", t.hide_window, true, None);
-    let quit_item = MenuItem::with_id("quit", t.quit, true, None);
-    let menu = Menu::new();
-    let _ = menu.append_items(&[&connect_item, &disconnect_item]);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    // Autostart is deliberately absent: the three modes (off / service /
-    // service + tray) live in the settings page, and registering the service
-    // needs a UAC prompt that should not be one stray click away.
-    let _ = menu.append_items(&[&show_item, &hide_item]);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&quit_item);
-
-    let tray = TrayIconBuilder::new()
-      .with_menu(Box::new(menu.clone()))
-      // The menu lives on the right button; a left click brings the window back.
-      .with_menu_on_left_click(false)
-      .with_tooltip(app_title)
-      .with_icon(make_icon(app_fill(State::Offline)))
-      .build()
-      .ok();
+    // The autostart modes live in the settings page; the tray menu deliberately
+    // has no entry for them, because registering the service can raise a UAC
+    // prompt that should not be one stray click away.
+    let tray = Tray::new(app_title, t, app_fill(State::Offline));
     // Without a tray icon there is no way back into a hidden window, so an
     // invisible start has to be cancelled and the window left on screen.
-    let start_hidden = minimized && tray.is_some();
-    if minimized && tray.is_none() {
+    let start_hidden = minimized && tray.available();
+    if minimized && !tray.available() {
       cloak::set(false);
     }
 
@@ -714,7 +768,8 @@ impl App {
 
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
-    if tray.is_none() {
+    #[cfg(not(target_os = "android"))]
+    if !tray.available() {
       logs.push(Line::warn(
         "tray: unavailable, the window stays visible and closing quits",
       ));
@@ -736,20 +791,41 @@ impl App {
       core_version_warned: false,
       uplink: crate::srun::link_kind(),
       next_uplink: Instant::now(),
+      local_ip4: String::new(),
+      local_ip6: String::new(),
       state: State::Offline,
       info: Info::default(),
       last_heartbeat: None,
       turtle: None,
       devices_open: false,
       logs,
+      #[cfg(target_os = "android")]
+      background: crate::background::Mode::read(),
+      #[cfg(target_os = "android")]
+      background_denied: crate::background::denied(),
+      #[cfg(target_os = "android")]
+      background_allowed: crate::background::allowed(),
+      #[cfg(target_os = "android")]
+      background_power: crate::background::power_ok(),
+      #[cfg(target_os = "android")]
+      secure_detection: crate::secure_wifi::enabled(),
+      #[cfg(target_os = "android")]
+      autofill_focus: None,
+      #[cfg(target_os = "android")]
+      autofill_value: String::new(),
+      #[cfg(target_os = "android")]
+      autofill_rect: None,
+      #[cfg(target_os = "android")]
+      paste: PasteHold::default(),
+      log_hold: LogHold::default(),
       last_error: None,
       banner_height: 0.0,
       window_extra: 0.0,
       service_warned: false,
       core_stale: None,
       core_answered: false,
-      user_edit: cfg.username.clone(),
-      pass_edit: cfg.password.clone(),
+      user_edit: cfg.username.chars().take(ACCOUNT_MAX_CHARS).collect(),
+      pass_edit: String::new(),
       remember: cfg.remember_password,
       // Until the worker's first probe lands, assume a login is possible: a
       // wrongly disabled button is worse than a click that reports why not.
@@ -772,12 +848,8 @@ impl App {
       back_arrow: None,
       eye_open: None,
       eye_closed: None,
-      connect_item,
-      disconnect_item,
-      show_item,
-      hide_item,
-      quit_item,
       started: false,
+      was_focused: false,
       hide_at_start: start_hidden,
       centered: false,
       cloaked: start_hidden,
@@ -805,6 +877,18 @@ impl App {
     if let Some(link) = &self.link {
       link.send(cmd);
     }
+  }
+
+  /// Ask the core for a status answer, starting the turtle's walk over.
+  ///
+  /// The core restarts its own poll cadence when it handles this (`last_status`
+  /// in `core.rs`), so the track has to start over at the same moment: without
+  /// this the turtle kept the phase it had, walked to the right end and then sat
+  /// there until the next scheduled beat - which is exactly what a refresh that
+  /// "succeeded but did nothing" looked like.
+  fn refresh(&mut self, quiet: bool) {
+    self.last_heartbeat = Some(Instant::now());
+    self.send(Cmd::Refresh { quiet });
   }
 
   fn next_event(&self) -> Option<Ev> {
@@ -1043,11 +1127,7 @@ impl App {
     self.cfg.lang = setting.to_string();
     self.lang = Lang::from_setting(setting);
     let t = self.lang.texts();
-    self.connect_item.set_text(t.connect);
-    self.disconnect_item.set_text(t.disconnect);
-    self.show_item.set_text(t.show_window);
-    self.hide_item.set_text(t.hide_window);
-    self.quit_item.set_text(t.quit);
+    self.tray.set_texts(t);
     self.send(Cmd::SetLang(self.lang));
     if let Err(e) = self.cfg.save() {
       self.logs.push(Line::error(format!("config: {e}")));
@@ -1158,6 +1238,9 @@ impl App {
     };
     match saved {
       Ok(()) => {
+        // The form is submitted: let a password manager offer to save the pair.
+        #[cfg(target_os = "android")]
+        let _ = crate::android_jni::autofill_save();
         // Only now do the edits become the new baseline, so a failed save
         // leaves the *Unsaved* markers in place.
         let typed = !next.password.is_empty();
@@ -1204,7 +1287,7 @@ impl App {
     // An account that was refused is only reported until the user takes the
     // edit back; the stored pair is the one that works, so ask the portal again
     // and let that answer clear the banner.
-    self.send(Cmd::Refresh { quiet: true });
+    self.refresh(true);
   }
 
   /// Ask before an account switch that has nothing to fall back on.
@@ -1428,6 +1511,7 @@ impl App {
 
   /// "Start minimised" and "start with the system" are independent settings,
   /// so changing one rewrites the auto-launch command line.
+  #[cfg(not(target_os = "android"))]
   fn apply_start_minimized(&mut self, on: bool) {
     self.cfg.start_minimized = on;
     if let Err(e) = self.cfg.save() {
@@ -1547,6 +1631,17 @@ impl App {
     !matches!(self.env, LoginEnv::EnterpriseWifi(_))
   }
 
+  /// Can *Disconnect* act on anything?
+  ///
+  /// The verb belongs to the portal. On a link that is not the campus portal
+  /// (mobile data, another network) or behind someone else's captive portal
+  /// there is no session of ours to end, so the button is greyed out exactly as
+  /// it is on an 802.1X network. The account form stays enabled: editing the
+  /// saved credential does not touch the portal.
+  fn can_disconnect(&self) -> bool {
+    self.portal_verbs() && !matches!(self.env, LoginEnv::OtherNetwork | LoginEnv::OtherPortal)
+  }
+
   /// Words and colour for the state line, and for the tray icon with them.
   ///
   /// One helper because the two drifted apart: the window showed "online" for
@@ -1560,6 +1655,12 @@ impl App {
       // which is the opposite of what the probe just measured.
       State::Offline if self.env == LoginEnv::NoPortal => {
         (t.online_without_portal, app_fill(State::Online))
+      }
+      // Same reading, different cause: the link is not the campus network at
+      // all (home Wi-Fi, mobile data). It is named separately so the label does
+      // not claim a campus session that never existed.
+      State::Offline if self.env == LoginEnv::OtherNetwork => {
+        (t.online_other_network, app_fill(State::Online))
       }
       State::Offline => (t.offline, app_fill(State::Offline)),
     }
@@ -1606,14 +1707,13 @@ impl App {
   }
 
   fn handle_menu(&mut self, ctx: &egui::Context) {
-    while let Ok(ev) = MenuEvent::receiver().try_recv() {
-      match ev.id().0.as_str() {
-        "connect" => self.send(Cmd::Connect),
-        "disconnect" => self.send(Cmd::Disconnect),
-        "quit" => self.quit(),
-        "show" => self.show_window(ctx),
-        "hide" => self.hide_window(ctx),
-        _ => {}
+    while let Some(action) = self.tray.poll() {
+      match action {
+        Action::Connect => self.send(Cmd::Connect),
+        Action::Disconnect => self.send(Cmd::Disconnect),
+        Action::Quit => self.quit(),
+        Action::Show => self.show_window(ctx),
+        Action::Hide => self.hide_window(ctx),
       }
     }
   }
@@ -1635,11 +1735,19 @@ impl App {
         self.push_log(Line::info(format!("connected to the {kind} core")));
       }
       match ev {
-        Ev::State(s) => self.state = s,
+        Ev::State(s) => {
+          if s != self.state {
+            // A new state starts a new poll cadence (15 s online, 10 s offline),
+            // so the last cycle's position cannot be carried into it: a Turtle
+            // at the old period's end would sit still until the next beat.
+            self.last_heartbeat = Some(Instant::now());
+          }
+          self.state = s;
+        }
         Ev::Info(v) => {
           self.info = info_from(&v);
-          self.last_heartbeat = Some(Instant::now());
         }
+        Ev::Beat => self.last_heartbeat = Some(Instant::now()),
         Ev::Log(line) => self.push_log(line),
         Ev::Error(e) => self.last_error = e,
         Ev::Notify { msg, kind } => {
@@ -1693,6 +1801,19 @@ impl App {
   }
 
   fn paint(&mut self, ui: &mut egui::Ui) {
+    #[cfg(target_os = "android")]
+    {
+      let (top, bottom) = android_insets();
+      let ppp = ui.ctx().pixels_per_point();
+      let top = top / ppp;
+      let bottom = bottom / ppp;
+      // Keep the footer above the navigation bar and the keyboard. The pages
+      // align their bottom edge to the layout, so shortening it is what moves
+      // the footer up.
+      let height = (ui.available_height() - bottom).max(0.0);
+      ui.set_max_height(height);
+      ui.add_space(top);
+    }
     // Only the frame that actually paints the log pane may claim it, so a right
     // click on another page never looks like one on the log.
     LogCopyClick::set_log_rect(ui.ctx(), egui::Rect::NOTHING);
@@ -1862,15 +1983,29 @@ impl App {
               ui.label(t.link);
               ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
               ui.end_row();
+              // The portal's address while it has an answer, otherwise the one
+              // this machine holds on the current link: mobile data and other
+              // networks have no portal row, and "—" would hide the only
+              // address there is to copy.
+              let ip4 = if self.info.ip4.is_empty() {
+                self.local_ip4.clone()
+              } else {
+                self.info.ip4.clone()
+              };
+              let ip6 = if self.info.ip6.is_empty() {
+                self.local_ip6.clone()
+              } else {
+                self.info.ip6.clone()
+              };
               ui.label(t.ipv4);
-              if address_cell(ui, private_value(&self.info.ip4, self.cfg.privacy), t) {
-                ui.ctx().copy_text(self.info.ip4.clone());
+              if address_cell(ui, private_value(&ip4, self.cfg.privacy), t) {
+                crate::clipboard::copy(ui.ctx(), &ip4);
                 self.toast_ok(t.copied.to_string());
               }
               ui.end_row();
               ui.label(t.ipv6);
-              if address_cell(ui, private_value(&self.info.ip6, self.cfg.privacy), t) {
-                ui.ctx().copy_text(self.info.ip6.clone());
+              if address_cell(ui, private_value(&ip6, self.cfg.privacy), t) {
+                crate::clipboard::copy(ui.ctx(), &ip6);
                 self.toast_ok(t.copied.to_string());
               }
               ui.end_row();
@@ -1961,15 +2096,14 @@ impl App {
               // drawn from it: ask before the 30 s round is due.
               self.next_core_query = Instant::now();
             }
-            // A core that still wants to be online is trying or waiting: this
-            // button is how the user calls that off, so it has to work while
-            // the machine is offline too.
-            let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
+            // A core that still wants to be online is trying or waiting: while a
+            // login attempt is in flight the state is *Authenticating* and this
+            // button calls it off. Between attempts the page says *Offline*, and
+            // there is no session to end - leaving the button lit there read as
+            // "both verbs are available with nothing connected".
+            let can_stop = can_stop(self.state, self.can_disconnect());
             if ui
-              .add_enabled(
-                (online || wanted) && self.portal_verbs(),
-                egui::Button::new(t.disconnect),
-              )
+              .add_enabled(can_stop, egui::Button::new(t.disconnect))
               .on_disabled_hover_text(
                 self
                   .env
@@ -1982,7 +2116,7 @@ impl App {
               self.next_core_query = Instant::now();
             }
             if ui.button(t.refresh).clicked() {
-              self.send(Cmd::Refresh { quiet: false });
+              self.refresh(false);
             }
           });
         } else {
@@ -2082,38 +2216,46 @@ impl App {
           // manager, so a portable process must not offer them at all: it has
           // no service, and choosing one is exactly how a portable run would
           // leave a registration behind on a machine that never asked for one.
-          if self.portable {
-            ui.label(t.portable_autostart);
-          } else {
-            let mut mode = self.autostart_mode;
-            ui.horizontal(|ui| {
-              ui.label(t.autostart);
-              for (value, label) in [
-                (Mode::Off, t.autostart_off),
-                (Mode::Core, t.autostart_core),
-                (Mode::All, t.autostart_all),
-              ] {
-                ui.radio_value(&mut mode, value, label);
+          #[cfg(not(target_os = "android"))]
+          {
+            if self.portable {
+              ui.label(t.portable_autostart);
+            } else {
+              let mut mode = self.autostart_mode;
+              ui.horizontal(|ui| {
+                ui.label(t.autostart);
+                for (value, label) in [
+                  (Mode::Off, t.autostart_off),
+                  (Mode::Core, t.autostart_core),
+                  (Mode::All, t.autostart_all),
+                ] {
+                  ui.radio_value(&mut mode, value, label);
+                }
+              });
+              if mode != self.autostart_mode {
+                self.apply_autostart_mode(mode);
               }
-            });
-            if mode != self.autostart_mode {
-              self.apply_autostart_mode(mode);
             }
           }
 
           // Startup and session behaviour share one row: the settings page has
           // to fit the fixed window height. *Start minimised* is only
           // meaningful when the tray is part of the autostart mode.
-          let mut start_min = self.cfg.start_minimized;
-          let tray_starts = !self.portable && self.autostart_mode != Mode::Core;
           let mut auto_conn = self.cfg.auto_connect;
           let mut keep_on = self.cfg.keep_online;
+          // `Start minimised` and the tray are desktop concepts; Android has
+          // neither a tray nor a hidden start.
+          #[cfg(not(target_os = "android"))]
+          let mut start_min = self.cfg.start_minimized;
+          #[cfg(not(target_os = "android"))]
+          let tray_starts = !self.portable && self.autostart_mode != Mode::Core;
           // These three labels are the widest set on the page, and English is
           // the tighter one: a slightly narrower gap keeps them on one row in
           // both languages (`the_startup_switches_fit_on_one_row` pins it).
           ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.horizontal(|ui| {
+              #[cfg(not(target_os = "android"))]
               if ui
                 .add_enabled(
                   tray_starts,
@@ -2145,6 +2287,116 @@ impl App {
               }
             });
           });
+          // Android's background level. It mirrors the desktop's autostart
+          // triad (nothing / core only / core + always-present entry point);
+          // the service and the notification permission are the Activity's, so
+          // the row asks for a level and shows what the Activity wrote back.
+          #[cfg(target_os = "android")]
+          {
+            use crate::background::Mode;
+            let mut mode = self.background;
+            ui.horizontal(|ui| {
+              ui.label(t.background_mode);
+              for (value, label) in [
+                (Mode::Off, t.background_off),
+                (Mode::Wake, t.background_wake),
+                (Mode::Service, t.background_service),
+              ] {
+                ui.radio_value(&mut mode, value, label);
+              }
+            });
+            if mode != self.background {
+              if let Err(e) = crate::background::set(mode) {
+                self.toast_err(e);
+              }
+              // The resident level can open the permission dialog, so the
+              // answer is the files, not the request.
+              self.background = crate::background::Mode::read();
+              self.background_denied = crate::background::denied();
+            }
+            // Touch has no hover: what the chosen level costs is written
+            // inline, and a refused permission says why it fell back.
+            let hint = if self.background_denied {
+              t.background_denied
+            } else {
+              match self.background {
+                Mode::Off => t.background_off_hint,
+                Mode::Wake => t.background_wake_hint,
+                Mode::Service => t.background_service_hint,
+              }
+            };
+            ui.add(
+              egui::Label::new(
+                egui::RichText::new(hint)
+                  .small()
+                  .color(ui.visuals().weak_text_color()),
+              )
+              .wrap(),
+            );
+            // A swipe from recents is a force-stop on aggressive ROMs, and it
+            // takes the foreground service with it. Only the recents card lock
+            // prevents that, so the level that is supposed to survive a swipe
+            // says what still needs doing on the device.
+            if self.background == Mode::Service {
+              ui.add(
+                egui::Label::new(
+                  egui::RichText::new(t.background_rom_hint)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+              );
+            }
+            // Asking for this is what turns "wakes on the next Wi-Fi" into
+            // something that survives a swipe: without the exemption the ROM
+            // may force-stop the app, which cancels the registration too.
+            //
+            // The two toggles that matter on MIUI are unreadable and are not
+            // the same switch as the AOSP whitelist the dialog below changes,
+            // so the row never claims an authorisation of its own: it opens the
+            // right screens and keeps the user's confirmation.
+            if self.background != Mode::Off {
+              let mut authorize = false;
+              ui.horizontal(|ui| {
+                ui.label(t.background_power);
+                authorize = ui.button(t.background_authorize).clicked();
+              });
+              // Readable, and it is the switch the firewall follows: without it
+              // the system drops this app's packets in the background.
+              let (state, color) = if self.background_power {
+                (t.background_power_ok, ui.visuals().weak_text_color())
+              } else {
+                (t.background_power_missing, ui.visuals().warn_fg_color)
+              };
+              ui.add(egui::Label::new(egui::RichText::new(state).small().color(color)).wrap());
+              let mut allowed = self.background_allowed;
+              if ui
+                .checkbox(&mut allowed, t.background_power_check)
+                .changed()
+              {
+                self.background_allowed = allowed;
+                if let Err(e) = crate::background::set_allowed(allowed) {
+                  self.toast_err(e);
+                }
+              }
+              let hint = if self.background_allowed {
+                t.background_power_ready
+              } else {
+                t.background_power_hint
+              };
+              ui.add(
+                egui::Label::new(
+                  egui::RichText::new(hint)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+              );
+              if authorize && let Err(e) = crate::background::request_power() {
+                self.toast_err(e);
+              }
+            }
+          }
           ui.add_space(2.0);
           ui.horizontal(|ui| {
             // Privacy is window-only state: it changes what is drawn, never
@@ -2161,6 +2413,7 @@ impl App {
                 self.toast_err(e);
               }
             }
+            #[cfg(not(target_os = "android"))]
             if ui.button(t.desktop_shortcut).clicked() {
               match crate::shortcut::create_desktop_shortcut() {
                 Ok(()) => self.toast_ok(t.done.to_string()),
@@ -2170,7 +2423,36 @@ impl App {
                 }
               }
             }
+            // Reading the Wi-Fi name needs the location permission, which only
+            // the user can grant; the Activity asks when this is ticked.
+            #[cfg(target_os = "android")]
+            {
+              let mut secure = self.secure_detection;
+              if ui
+                .checkbox(&mut secure, t.secure_detection)
+                .on_hover_text(t.secure_detection_hint)
+                .changed()
+              {
+                if let Err(e) = crate::secure_wifi::set(secure) {
+                  self.toast_err(e);
+                }
+                // The permission dialog answers asynchronously, so the file is
+                // the answer, not this call.
+                self.secure_detection = crate::secure_wifi::enabled();
+              }
+            }
           });
+          // Touch has no hover, and the permission requirement is the one thing
+          // the checkbox cannot say by itself.
+          #[cfg(target_os = "android")]
+          ui.add(
+            egui::Label::new(
+              egui::RichText::new(t.secure_detection_hint)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+          );
 
           ui.add_space(2.0);
           // The rule under the shortcut button is unconditional: it is the line
@@ -2205,40 +2487,90 @@ impl App {
             self.core_cred.as_ref(),
             match_hint,
           );
+          #[cfg(target_os = "android")]
+          let mut field_focus: Option<(AutofillKind, egui::Rect, bool)> = None;
           ui.horizontal(|ui| {
             let label_w = field_label_width(ui, t);
             field_label(ui, t.account, label_w);
             let id = ui.make_persistent_id("thunet-account-field");
+            let focused = ui.ctx().memory(|m| m.has_focus(id));
             let mut edit = egui::TextEdit::singleline(&mut self.user_edit)
               .id(id)
+              .char_limit(ACCOUNT_MAX_CHARS)
               .desired_width(FIELD_WIDTH);
             // Privacy mode keeps the account off the screen, but a masked edit
             // box could not be typed into: it unmasks while it has the focus.
-            if self.cfg.privacy && !ui.ctx().memory(|m| m.has_focus(id)) {
+            if self.cfg.privacy && !focused {
               edit = edit.password(true);
             }
-            ui.add_enabled(credentials_live, edit);
+            #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+            let resp = ui.add_enabled(credentials_live, edit);
+            // egui gets no `InputConnection` on Android; the bridges are the
+            // long-press paste here and the virtual autofill view plus the
+            // keyboard connection below.
+            #[cfg(target_os = "android")]
+            {
+              if focused {
+                field_focus = Some((AutofillKind::User, resp.rect, resp.clicked()));
+              }
+              if credentials_live {
+                self.paste_sync(ui, id, AutofillKind::User, resp.rect);
+              } else {
+                // A disabled box is not a paste target: the form refuses the
+                // credential on this network (802.1X), so a finger resting on
+                // it must not put the clipboard into it either.
+                self.paste.forget();
+              }
+            }
             if stored.username {
               unsaved_marker(ui, t);
             }
           });
+          // Android has no hover, and *Apply* is the only control on this page
+          // whose greyed-out state is not explained by the row itself. Its hint
+          // is written underneath instead of in a tooltip (item J).
+          #[cfg(target_os = "android")]
+          let mut apply_hint: Option<&'static str> = None;
           ui.horizontal(|ui| {
             let label_w = field_label_width(ui, t);
             field_label(ui, t.password, label_w);
+            let id = ui.make_persistent_id("thunet-password-field");
+            // Only the autofill bridge needs this; nothing else in the row does.
+            #[cfg(target_os = "android")]
+            let focused = ui.ctx().memory(|m| m.has_focus(id));
             let keep_hint = core_password && self.pass_edit.is_empty();
             let mut input = egui::TextEdit::singleline(&mut self.pass_edit)
+              .id(id)
               .password(true)
+              .char_limit(PASSWORD_MAX_CHARS)
               .desired_width(FIELD_WIDTH);
             if keep_hint {
               // The core holds a password the window cannot show; an empty
               // field means "keep it" rather than "no password".
               input = input.hint_text(t.password_keep);
             }
-            ui.add_enabled(credentials_live, input);
+            #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+            let resp = ui.add_enabled(credentials_live, input);
+            #[cfg(target_os = "android")]
+            {
+              if focused {
+                field_focus = Some((AutofillKind::Password, resp.rect, resp.clicked()));
+              }
+              if credentials_live {
+                self.paste_sync(ui, id, AutofillKind::Password, resp.rect);
+              } else {
+                self.paste.forget();
+              }
+            }
             if stored.password {
               unsaved_marker(ui, t);
             }
           });
+          // One update per frame, after both fields: a switch is a single
+          // enter (Java exits the previous virtual id itself), and the IME is
+          // never hidden and re-shown for it.
+          #[cfg(target_os = "android")]
+          self.autofill_update(ui.ctx(), field_focus);
           ui.horizontal(|ui| {
             if ui
               .add_enabled(
@@ -2271,6 +2603,10 @@ impl App {
               apply = apply.fill(ui.visuals().selection.bg_fill);
             }
             let enabled = credentials_live && self.switch_pending.is_none() && may_apply;
+            #[cfg(target_os = "android")]
+            if credentials_live && !enabled && stored.any() {
+              apply_hint = Some(t.password_required);
+            }
             let response = ui
               .add_enabled(enabled, apply)
               .on_disabled_hover_text(if stored.any() {
@@ -2297,6 +2633,17 @@ impl App {
               unsaved_marker(ui, t);
             }
           });
+          #[cfg(target_os = "android")]
+          if let Some(hint) = apply_hint {
+            ui.add(
+              egui::Label::new(
+                egui::RichText::new(hint)
+                  .small()
+                  .color(ui.visuals().weak_text_color()),
+              )
+              .wrap(),
+            );
+          }
         }
         let visible: Vec<&Line> = self
           .logs
@@ -2304,8 +2651,16 @@ impl App {
           .filter(|l| l.level >= self.min_level)
           .collect();
         // Masking happens here rather than when the line is stored, so the
-        // toggle also reaches lines that were already in the pane.
-        let accounts = self.accounts();
+        // toggle also reaches lines that were already in the pane. The names are
+        // owned because the hold lives in `self` and the pane closure below
+        // mutates it: a `&self` borrow from this point would exclude that
+        // closure.
+        let accounts = self
+          .accounts()
+          .into_iter()
+          .map(str::to_owned)
+          .collect::<Vec<String>>();
+        let accounts = accounts.iter().map(String::as_str).collect::<Vec<_>>();
         let hidden = self.cfg.privacy;
         if self.page == Page::Status && !visible.is_empty() {
           ui.add_space(8.0);
@@ -2315,6 +2670,22 @@ impl App {
             .map(|l| masked_log(l.render(), &accounts, hidden))
             .collect::<Vec<_>>()
             .join("\n");
+          // The text of a picked range. Built only when the menu button is
+          // pressed: joining a long span of lines on every frame while the menu
+          // is open would be pure waste, and the range can change under it.
+          let picked = |first: usize, last: usize| -> String {
+            let end = match visible.len() {
+              0 => return String::new(),
+              n => n - 1,
+            };
+            let first = first.min(end);
+            let last = last.min(end).max(first);
+            visible[first..=last]
+              .iter()
+              .map(|line| masked_log(line.render(), &accounts, hidden))
+              .collect::<Vec<_>>()
+              .join("\n")
+          };
           // The context menu cannot call back into `self`, so record the
           // requested text and copy it once the scroll area has finished.
           let mut copy_request: Option<String> = None;
@@ -2330,33 +2701,93 @@ impl App {
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                  for line in &visible {
+                  // The picked rows are painted as one band once the loop knows
+                  // where they are: each row is its own widget with the scroll
+                  // area's spacing between, so tinting them one by one left a
+                  // seam at every gap and a range looked like many selections.
+                  let mut pick_band: Option<egui::Rect> = None;
+                  for (index, line) in visible.iter().enumerate() {
                     let color = {
                       let visuals = ui.visuals();
                       level_color(line.level, visuals)
                     };
                     let text = masked_log(line.render(), &accounts, hidden);
                     let resp = ui.add(log_entry(ui, text.clone(), color));
-                    // A right click on a selection is turned into a copy before
-                    // egui sees it (`LogCopyClick`), so this menu only shows up
-                    // when nothing is selected.
-                    resp.context_menu(|ui| {
-                      if ui.button(t.copy_line).clicked() {
-                        copy_request = Some(text.clone());
-                        ui.close();
+                    // The hold target is the whole row, glyphs or not: a short
+                    // line leaves most of the width empty, and a press on that
+                    // blank part is still aiming at this line.
+                    let row = egui::Rect::from_min_max(
+                      egui::pos2(ui.max_rect().left(), resp.rect.top()),
+                      egui::pos2(ui.max_rect().right(), resp.rect.bottom()),
+                    );
+                    // A press on a line is tinted from the moment it lands, so
+                    // the target of the hold - a finger or the left button - is
+                    // never a guess. It is a lighter tint than a pick, so aiming
+                    // at the other end of a range never looks like having
+                    // selected it.
+                    let held = {
+                      let fired = self.log_hold.poll(ui, index, row);
+                      let pressed = self.log_hold.pressed_at(index);
+                      if self.log_hold.picked(index) {
+                        pick_band = Some(match pick_band {
+                          Some(band) => band.union(row),
+                          None => row,
+                        });
+                      } else if pressed {
+                        let bg = ui.visuals().selection.bg_fill;
+                        let tint = egui::Color32::from_rgba_unmultiplied(
+                          bg.r(),
+                          bg.g(),
+                          bg.b(),
+                          PRESS_TINT_ALPHA,
+                        );
+                        ui.painter().rect_filled(
+                          row.expand(1.0),
+                          egui::CornerRadius::same(3),
+                          tint,
+                        );
                       }
-                      if ui.button(t.copy_all).clicked() {
-                        copy_request = Some(everything.clone());
-                        ui.close();
-                      }
-                    });
+                      fired
+                    };
+                    let armed = self.log_hold.fired();
+                    let spot = self.log_hold.spot();
+                    // Read after `poll`, so the row that was just held already
+                    // sees the range it extended.
+                    let pick = self.log_hold.range();
+                    log_menu(
+                      &resp,
+                      t,
+                      &text,
+                      &everything,
+                      &mut copy_request,
+                      held,
+                      armed,
+                      spot,
+                      pick,
+                      &picked,
+                    );
+                  }
+                  if let Some(band) = pick_band {
+                    let bg = ui.visuals().selection.bg_fill;
+                    let tint = egui::Color32::from_rgba_unmultiplied(
+                      bg.r(),
+                      bg.g(),
+                      bg.b(),
+                      PICK_TINT_ALPHA,
+                    );
+                    ui.painter().rect_filled(
+                      band.expand(1.0),
+                      egui::CornerRadius::same(3),
+                      tint,
+                    );
                   }
                 });
             },
           );
           LogCopyClick::set_log_rect(ui.ctx(), pane.response.rect);
           if let Some(text) = copy_request {
-            ui.ctx().copy_text(text);
+            crate::clipboard::copy(ui.ctx(), &text);
+            self.push_log(Line::debug(format!("copied {} chars", text.len())));
             self.toast_ok(self.t().copied.to_string());
           }
         }
@@ -2422,6 +2853,10 @@ impl App {
                     new_tab: true,
                   });
                 }
+                // The build stamp is desktop-width; on a 412 pt phone it
+                // overflows the strip. The version on the left still answers
+                // "which build is this".
+                #[cfg(not(target_os = "android"))]
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                   ui.label(egui::RichText::new(build_time_label(t)).small().weak());
                 });
@@ -2539,9 +2974,16 @@ impl App {
     let devices = &self.info.devices;
     let n = self.info.devices_total;
     let mut open = true;
+    // The list cannot call back into `self`, so a copy click records the address
+    // and the clipboard is written once the modal has finished laying out.
+    let mut copy = None;
     let modal = egui::Modal::new(egui::Id::unique("thunet_devices_popup")).show(ctx, |ui| {
-      devices_list(ui, devices, n, t, &mut open, self.cfg.privacy);
+      devices_list(ui, devices, n, t, &mut open, self.cfg.privacy, &mut copy);
     });
+    if let Some(text) = copy {
+      crate::clipboard::copy(ctx, &text);
+      self.toast_ok(t.copied.to_string());
+    }
     // The dimmed backdrop and Escape are the framework's own dismissal, so the
     // close button is one more way out rather than the only one.
     if !open || modal.should_close() {
@@ -2563,6 +3005,32 @@ struct DevicesLayout {
   grid: f32,
 }
 
+/// How tall the rows inside the device dialog may be.
+///
+/// A desktop window is short, so a fixed cap is right there. A phone is tall and
+/// portrait: most of the modal, but never the whole screen, so the page behind
+/// still shows around it. The screen height is passed in rather than read from
+/// the dialog, because a modal lays its content out with the size that content
+/// had last frame - a fraction of that is a feedback loop, not a measurement.
+fn devices_scroll_max(screen_h: f32, phone: bool) -> f32 {
+  if phone {
+    (screen_h * 0.6).clamp(DEVICES_SCROLL_MAX, 620.0)
+  } else {
+    DEVICES_SCROLL_MAX
+  }
+}
+
+/// May the *Disconnect* button act right now?
+///
+/// Only a state above *Offline* has a session to end. The core's intent flag is
+/// deliberately not part of this: while an automatic attempt is between retries
+/// the page says *Offline*, and a lit-up *Disconnect* there looked like "both
+/// verbs are available with nothing connected". A login that is actually in
+/// flight shows *Authenticating*, which is where cancelling belongs.
+fn can_stop(state: State, verbs: bool) -> bool {
+  state != State::Offline && verbs
+}
+
 /// Draw the dialog body: the title row with its close button, then the rows.
 ///
 /// The width is measured before anything is laid out. The title row, the rule
@@ -2575,6 +3043,7 @@ fn devices_list(
   t: &Texts,
   open: &mut bool,
   privacy: bool,
+  copy: &mut Option<String>,
 ) -> DevicesLayout {
   let title = format!("{}{n}", t.devices_title);
   let body = egui::TextStyle::Body.resolve(ui.style());
@@ -2596,7 +3065,13 @@ fn devices_list(
   }
   // Each column gets what its widest entry needs, so an address is only elided
   // when the dialog hits its cap - never because a neighbouring column was
-  // reserved for nothing.
+  // reserved for nothing. The copy mark closes the address column, so its slot
+  // is reserved on top of the widest address.
+  let addr_w = if devices.is_empty() {
+    0.0
+  } else {
+    addr_w + DEVICES_GAP + DEVICES_ICON
+  };
   let rows_w = DEVICES_EDGE_PAD
     + DEVICES_DOT
     + DEVICES_GAP
@@ -2617,8 +3092,15 @@ fn devices_list(
   // no-op here, because a vertical layout with a centred cross axis makes every
   // widget fill the *available* width (`Layout::next_frame`), so the title row
   // and the separator kept stretching to the panel's width.
+  //
+  // The height may not come from this dialog either: a modal lays its content
+  // out with the size that content had *last frame* as the max rect, so
+  // `available_height()` here is the list's own previous height and any fraction
+  // of it converges to itself (on a phone it shrank frame by frame). The screen
+  // is the only honest bound.
   let avail = ui.available_rect_before_wrap();
-  let body_rect = egui::Rect::from_min_size(avail.min, egui::vec2(width, avail.height()));
+  let screen = ui.ctx().content_rect();
+  let body_rect = egui::Rect::from_min_size(avail.min, egui::vec2(width, screen.height()));
   let row_h = ui
     .text_style_height(&egui::TextStyle::Body)
     .max(ui.text_style_height(&egui::TextStyle::Monospace))
@@ -2639,8 +3121,14 @@ fn devices_list(
     }
     // The rows fill the body: the dots line up against the dialog's right edge
     // instead of floating after the shortest address.
+    //
+    // A desktop window is short, so a fixed cap is right there. A phone is tall
+    // and portrait, and a 180 pt letterbox in the middle of the screen reads
+    // badly: the list takes most of the modal instead, while `auto_shrink`
+    // still keeps a two-row list from stretching.
+    let scroll_max = devices_scroll_max(screen.height(), cfg!(target_os = "android"));
     egui::ScrollArea::vertical()
-      .max_height(DEVICES_SCROLL_MAX)
+      .max_height(scroll_max)
       .auto_shrink([false, true])
       .show(ui, |ui| {
         for d in devices {
@@ -2652,10 +3140,21 @@ fn devices_list(
               ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::hover());
             paint_device_icon(ui.painter(), icon, device_kind(&d.os, &d.class), ink, bg);
             fixed_cell(ui, (&d.id, "addr"), addr_w, row_h, |ui| {
-              let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
-              // `truncate` elides at the column's width and, by default, shows
-              // the whole address on hover when it had to.
-              ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
+              let raw = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
+              let addr = private_value(raw, privacy);
+              // The mark is laid out first in a right-to-left row, so it sits on
+              // the column's right edge; the address then gets what is left and
+              // elides there (`truncate` shows the whole value on hover). It
+              // copies the real address even while privacy mode masks it, the
+              // way the status page's *Copy* button does.
+              ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if copy_mark(ui, t).clicked() {
+                  *copy = Some(raw.to_string());
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                  ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
+                });
+              });
             });
             if kind_w > 0.0 {
               fixed_cell(ui, (&d.id, "kind"), kind_w, row_h, |ui| {
@@ -2712,6 +3211,26 @@ fn fixed_cell(
       .layout(egui::Layout::left_to_right(egui::Align::Center)),
   );
   add(&mut cell);
+}
+
+/// The copy mark on the right edge of one device row's address column.
+///
+/// A painted glyph instead of the *Copy* text button the settings page uses:
+/// the row is only one line tall, so a label would not fit. The caller lays it
+/// out first in a right-to-left row, which is what pins it to the edge.
+fn copy_mark(ui: &mut egui::Ui, t: &Texts) -> egui::Response {
+  let (rect, resp) =
+    ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::click());
+  let resp = resp
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text(t.copy);
+  let ink = if resp.hovered() {
+    ui.visuals().strong_text_color()
+  } else {
+    ui.visuals().text_color()
+  };
+  paint_copy_icon(ui.painter(), rect, ink, ui.visuals().window_fill());
+  resp
 }
 
 /// One copyable address row: the address against the left edge of the value
@@ -2883,6 +3402,368 @@ const COMBO_WIDTH: f32 = 78.0;
 /// still leaving room on the same row for the *Unsaved* marker.
 const FIELD_WIDTH: f32 = 250.0;
 
+/// Longest account the portal accepts.
+const ACCOUNT_MAX_CHARS: usize = 10;
+/// Longest password the portal accepts.
+const PASSWORD_MAX_CHARS: usize = 64;
+
+/// The two virtual autofill ids, shared with `ThunetActivity.AutofillHost`.
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutofillKind {
+  User,
+  Password,
+}
+
+#[cfg(target_os = "android")]
+impl AutofillKind {
+  /// Must match `AutofillHost.USER` / `AutofillHost.PASSWORD` on the Java side.
+  fn id(self) -> i32 {
+    match self {
+      Self::User => 1,
+      Self::Password => 2,
+    }
+  }
+}
+
+/// A finger resting on a credential field, for the clipboard paste.
+#[cfg(target_os = "android")]
+#[derive(Default)]
+struct PasteHold {
+  /// When the current hold began.
+  started: Option<f64>,
+  /// The paste already fired for this press.
+  fired: bool,
+}
+
+#[cfg(target_os = "android")]
+impl PasteHold {
+  /// How long a finger stays on the field before the clipboard is read.
+  const HOLD: f64 = 0.5;
+  /// Movement that turns a hold into a drag (the text edit's own selection).
+  const SLOP: f32 = 12.0;
+
+  /// True once per hold on `rect`, after the finger has rested there.
+  fn poll(&mut self, ui: &egui::Ui, rect: egui::Rect) -> bool {
+    let (down, origin, latest, now) = ui.input(|i| {
+      (
+        i.pointer.primary_down(),
+        i.pointer.press_origin(),
+        i.pointer.latest_pos(),
+        i.time,
+      )
+    });
+    if !down {
+      self.started = None;
+      self.fired = false;
+      return false;
+    }
+    let (Some(origin), Some(latest)) = (origin, latest) else {
+      return false;
+    };
+    // The field is read from the pointer, not from a widget response, so a
+    // finger resting on a dialog above it would read as a press on the field.
+    if ui.ctx().layer_id_at(origin) != Some(ui.layer_id()) {
+      return false;
+    }
+    if !rect.contains(origin) || (latest - origin).length() > Self::SLOP {
+      return false;
+    }
+    if self.fired {
+      return false;
+    }
+    // A finger held still produces no input events, so the frame that would
+    // notice the hold needs an explicit pulse.
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
+    let started = *self.started.get_or_insert(now);
+    if now - started < Self::HOLD {
+      return false;
+    }
+    self.fired = true;
+    true
+  }
+
+  /// Drop a hold in progress, e.g. because the field under the finger was
+  /// disabled while it was being held.
+  fn forget(&mut self) {
+    self.started = None;
+    self.fired = false;
+  }
+}
+
+/// The log lines the copy menu acts on.
+///
+/// A hold marks one line; a second hold on another line reaches to it, so
+/// "everything between these two" is one gesture away without a text selection
+/// that touch cannot express. Kept apart from the gesture that feeds it, because
+/// the arithmetic is what a test can hold still.
+#[derive(Default)]
+struct LogPick {
+  /// The line the first hold marked, and the one the menu is anchored on.
+  anchor: Option<usize>,
+  /// The line a later hold reached, if there was one.
+  tip: Option<usize>,
+}
+
+impl LogPick {
+  /// A hold landed on `index`.
+  ///
+  /// The first hold opens the menu, a later one on another line extends the
+  /// pick to it, and holding the anchor again collapses back to that one line.
+  /// A third line moves the far end instead of starting over, which is what a
+  /// finger that slipped one row wants.
+  fn hold(&mut self, index: usize) {
+    match self.anchor {
+      None => self.anchor = Some(index),
+      Some(first) if first == index => self.tip = None,
+      Some(_) => self.tip = Some(index),
+    }
+  }
+
+  /// The lines to copy, `first..=last`, or `None` while nothing is picked.
+  fn range(&self) -> Option<(usize, usize)> {
+    let anchor = self.anchor?;
+    let tip = self.tip.unwrap_or(anchor);
+    Some((anchor.min(tip), anchor.max(tip)))
+  }
+
+  /// Whether line `index` belongs to the pick, for the tint.
+  fn covers(&self, index: usize) -> bool {
+    self
+      .range()
+      .is_some_and(|(first, last)| (first..=last).contains(&index))
+  }
+
+  fn clear(&mut self) {
+    self.anchor = None;
+    self.tip = None;
+  }
+}
+
+/// Tint of the row under a press that has not matured into a hold yet.
+///
+/// A press is only an aim; the picked rows are what the menu will act on. Both
+/// use the theme's selection colour so they read as one gesture, with half the
+/// weight for the aim, or a finger would look like it had already selected the
+/// row it is merely resting on.
+const PRESS_TINT_ALPHA: u8 = 24;
+/// Tint of the rows the copy menu acts on.
+const PICK_TINT_ALPHA: u8 = 64;
+
+/// A press resting on a log line, for the copy menu.
+///
+/// Shorter than egui's own 0.8 s long touch: a log line is a small target and
+/// the menu is the only thing a hold can do. It is the left button on the
+/// desktop and a finger on a phone; either way the line it landed on is tinted
+/// so the target is obvious, and a phone ticks.
+#[derive(Default)]
+struct LogHold {
+  /// Line index under the finger, and when it first landed there.
+  pressed: Option<(usize, f64)>,
+  /// The lines the open menu acts on.
+  pick: LogPick,
+  /// Where the press that opened the menu landed, in points. The popup is
+  /// anchored here: `at_pointer_fixed` has no pointer to read on the release
+  /// frame (a finger leaves no hover), and the menu would be open but unpainted.
+  spot: Option<egui::Pos2>,
+  /// The tick already fired for this press.
+  fired: bool,
+}
+
+impl LogHold {
+  /// How long a finger stays on a line before its menu opens.
+  const HOLD: f64 = 0.45;
+  /// Movement that turns a hold into a scroll.
+  const SLOP: f32 = 12.0;
+
+  /// True on the frame a hold on line `index` matures.
+  fn poll(&mut self, ui: &egui::Ui, index: usize, rect: egui::Rect) -> bool {
+    let (down, origin, latest, now) = ui.input(|i| {
+      (
+        i.pointer.primary_down(),
+        i.pointer.press_origin(),
+        i.pointer.latest_pos(),
+        i.time,
+      )
+    });
+    if !down {
+      // `fired` deliberately survives the release: that release still counts
+      // as a click in egui (the press was shorter than 0.8 s), and the menu
+      // must not close on it.
+      self.pressed = None;
+      return false;
+    }
+    if self.pressed.is_none() {
+      // A new press starts; the previous one's hold no longer applies.
+      self.fired = false;
+    }
+    let (Some(origin), Some(latest)) = (origin, latest) else {
+      return false;
+    };
+    // The pane is the bottom of the stack, and this reads the pointer itself
+    // rather than a widget response, so it has to ask what is on top: with the
+    // device dialog (or a menu) over the line, the finger is not aiming at the
+    // log at all, and a press here would tint the line and open a second menu
+    // behind the dialog.
+    if ui.ctx().layer_id_at(origin) != Some(ui.layer_id()) {
+      return false;
+    }
+    if !rect.contains(origin) || (latest - origin).length() > Self::SLOP {
+      return false;
+    }
+    if self.fired {
+      return false;
+    }
+    // A finger held still produces no input events, so the frame that would
+    // notice the hold needs an explicit pulse.
+    ui.ctx().request_repaint_after(Duration::from_millis(80));
+    let started = match self.pressed {
+      Some((on, started)) if on == index => started,
+      _ => {
+        self.pressed = Some((index, now));
+        now
+      }
+    };
+    if now - started < Self::HOLD {
+      return false;
+    }
+    self.fired = true;
+    self.pick.hold(index);
+    self.spot = Some(origin);
+    #[cfg(target_os = "android")]
+    let _ = crate::android_jni::haptic();
+    true
+  }
+
+  /// Where the menu should be anchored, if a hold opened one.
+  fn spot(&self) -> Option<egui::Pos2> {
+    self.spot
+  }
+
+  /// The lines the open menu acts on.
+  fn range(&self) -> Option<(usize, usize)> {
+    self.pick.range()
+  }
+
+  /// Should this row show the faint "a press is on it" tint?
+  fn pressed_at(&self, index: usize) -> bool {
+    self.pressed.is_some_and(|(on, _)| on == index)
+  }
+
+  /// Is this row part of the range the menu acts on?
+  fn picked(&self, index: usize) -> bool {
+    self.pick.covers(index)
+  }
+
+  /// Did the press that is (or just was) down open a menu?
+  fn fired(&self) -> bool {
+    self.fired
+  }
+
+  /// Forget the picked lines once their menu has closed.
+  ///
+  /// A press that is still down holds the pick open: pressing another row closes
+  /// the first menu immediately (`CloseOnClickOutside`), and the hold that would
+  /// extend the pick only matures half a second later. Clearing on the closed
+  /// menu alone would restart the pick on that second row instead of reaching to
+  /// it. A tap - press and release with no hold - still ends it, which is how a
+  /// click elsewhere deselects.
+  fn clear_if_closed(&mut self, any_popup_open: bool, pointer_down: bool) {
+    if !any_popup_open && !pointer_down {
+      self.pick.clear();
+      self.spot = None;
+    }
+  }
+}
+
+#[cfg(target_os = "android")]
+impl App {
+  /// Keep the autofill framework's copy of the form in step with egui.
+  ///
+  /// The field only exists on the surface, so Java is told where it is (in
+  /// physical pixels, which is what the service expects) and what it holds.
+  /// The value is resent only when it changes: the save prompt depends on
+  /// `notifyValueChanged`, but a frame-by-frame repeat is noise.
+  fn autofill_update(
+    &mut self,
+    ctx: &egui::Context,
+    focus: Option<(AutofillKind, egui::Rect, bool)>,
+  ) {
+    let Some((kind, rect, clicked)) = focus else {
+      if self.autofill_focus.is_some() {
+        self.autofill_focus = None;
+        self.autofill_value.clear();
+        self.autofill_rect = None;
+        let _ = crate::android_jni::autofill_leave();
+      }
+      return;
+    };
+    let value = match kind {
+      AutofillKind::User => self.user_edit.clone(),
+      AutofillKind::Password => self.pass_edit.clone(),
+    };
+    let ppp = ctx.pixels_per_point();
+    let min = rect.min.to_vec2() * ppp;
+    let size = rect.size() * ppp;
+    let px = [
+      min.x.round() as i32,
+      min.y.round() as i32,
+      size.x.round() as i32,
+      size.y.round() as i32,
+    ];
+    // `notifyViewEntered` starts a fill request: once when the field gains the
+    // focus, and again only when the user taps it (a deliberate "show me the
+    // suggestions again", because the system drops its response when the app
+    // goes to the background). Window focus changes are ignored on purpose —
+    // the dropdown itself takes that focus away, and reacting to it made the
+    // field leave and re-enter, so the dropdown kept flashing. Switching fields
+    // is also one enter, so Java never hides the keyboard in between.
+    if self.autofill_focus != Some(kind) || clicked {
+      self.autofill_focus = Some(kind);
+      self.autofill_value = value.clone();
+      self.autofill_rect = Some(px);
+      let _ = crate::android_jni::autofill_enter(kind.id(), px[0], px[1], px[2], px[3], &value);
+    } else {
+      if self.autofill_rect != Some(px) {
+        self.autofill_rect = Some(px);
+        let _ = crate::android_jni::autofill_bounds(kind.id(), px[0], px[1], px[2], px[3]);
+      }
+      if self.autofill_value != value {
+        self.autofill_value = value.clone();
+        let _ = crate::android_jni::autofill_value(kind.id(), &value);
+      }
+    }
+  }
+
+  /// Long press on a credential field pastes the system clipboard into it.
+  ///
+  /// The field holds one value, so the pasted text replaces what is there
+  /// instead of being inserted at a caret the user cannot see on a phone.
+  fn paste_sync(&mut self, ui: &egui::Ui, id: egui::Id, kind: AutofillKind, rect: egui::Rect) {
+    if !self.paste.poll(ui, rect) {
+      return;
+    }
+    let Some(text) = crate::android_jni::clipboard_text() else {
+      return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+      return;
+    }
+    let limit = match kind {
+      AutofillKind::User => ACCOUNT_MAX_CHARS,
+      AutofillKind::Password => PASSWORD_MAX_CHARS,
+    };
+    let text: String = text.chars().take(limit).collect();
+    match kind {
+      AutofillKind::User => self.user_edit = text.to_owned(),
+      AutofillKind::Password => self.pass_edit = text.to_owned(),
+    }
+    self.toast = None;
+    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+  }
+}
+
 /// Width of the label column in front of those inputs.
 ///
 /// Measured from the two labels in the current language instead of fixed:
@@ -3053,6 +3934,76 @@ impl egui::plugin::Plugin for LogCopyClick {
       true
     });
   }
+}
+
+/// The log row's menu: a right click on the desktop, a long press on a phone.
+///
+/// [`egui::Response::context_menu`] only opens on `secondary_clicked`, and a
+/// touch hold is a *primary* click in egui (`long_touched`, which also sets
+/// `clicked`), so the popup is opened here for both triggers instead.
+///
+/// `pick` is the range a second hold reached; when it spans more than one line
+/// the menu copies those lines instead of the one the popup belongs to, and
+/// `picked` builds that text only if the button is actually pressed.
+#[allow(clippy::too_many_arguments)]
+fn log_menu(
+  resp: &egui::Response,
+  t: &Texts,
+  text: &str,
+  everything: &str,
+  copy_request: &mut Option<String>,
+  held: bool,
+  armed: bool,
+  spot: Option<egui::Pos2>,
+  pick: Option<(usize, usize)>,
+  picked: &dyn Fn(usize, usize) -> String,
+) {
+  let mut popup =
+    egui::Popup::menu(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+  if resp.secondary_clicked() || resp.long_touched() || held || (armed && resp.clicked()) {
+    // `armed` is the release of the press that opened this menu. It is still a
+    // click in egui (the press was shorter than 0.8 s), and `Popup::menu`
+    // toggles on clicks, so the release has to be forced back to "open".
+    popup = popup.open_memory(Some(egui::SetOpenCommand::Bool(true)));
+  } else if resp.clicked() {
+    // A plain tap or click on the row closes the menu, exactly as
+    // `context_menu` does.
+    popup = popup.open_memory(Some(egui::SetOpenCommand::Bool(false)));
+  }
+  // The menu is anchored at the press point, never at the pointer: opening a
+  // `PointerFixed` popup re-reads the pointer position, and a lifted finger
+  // reports none, so the release frame would leave the menu open but unpainted.
+  popup = match spot {
+    Some(pos) => popup.at_position(pos),
+    None => popup.at_pointer_fixed(),
+  };
+  popup.show(|ui| {
+    // A range gets one action: copy exactly those lines. "Copy all" beside it
+    // would only offer a way to overreach from a menu that exists to copy a
+    // selection.
+    let range = pick.filter(|(first, last)| last > first);
+    if let Some((first, last)) = range {
+      let label = format!("{} ({})", t.copy_selection, last - first + 1);
+      if ui.button(label).clicked() {
+        *copy_request = Some(picked(first, last));
+        ui.close();
+      }
+    } else {
+      if ui.button(t.copy_line).clicked() {
+        // A hold on one row copies that row; a desktop right click with no hold
+        // copies the row the popup belongs to.
+        *copy_request = Some(match pick {
+          Some((first, last)) => picked(first, last),
+          None => text.to_owned(),
+        });
+        ui.close();
+      }
+      if ui.button(t.copy_all).clicked() {
+        *copy_request = Some(everything.to_owned());
+        ui.close();
+      }
+    }
+  });
 }
 
 /// Log rows are laid out with `break_anywhere` so long unbroken text (paths,
@@ -3246,23 +4197,6 @@ mod tests {
       copied.contains("hello"),
       "copied text should be the selection, got {copied:?}"
     );
-  }
-
-  #[test]
-  fn tray_click_bursts_map_to_show_and_hide() {
-    // A lone click waits for the deadline before it shows anything.
-    assert_eq!(click_outcome(1, 0, 500), None);
-    assert_eq!(click_outcome(1, 499, 500), None);
-    assert_eq!(click_outcome(1, 500, 500), Some(true));
-    // A second click inside the deadline hides the window.
-    assert_eq!(click_outcome(2, 0, 500), Some(false));
-    assert_eq!(click_outcome(2, 499, 500), Some(false));
-    // Nothing pending.
-    assert_eq!(click_outcome(0, 900, 500), None);
-    // `0` means "no previous click", so the first click is never a double one.
-    assert!(!is_double_click(0, 10, 500));
-    assert!(is_double_click(10, 510, 500));
-    assert!(!is_double_click(10, 511, 500));
   }
 
   /// The three switches share one row in a fixed-width window, so the labels
@@ -3629,6 +4563,7 @@ mod tests {
       LoginEnv::NoNetwork,
       LoginEnv::OtherPortal,
       LoginEnv::NoPortal,
+      LoginEnv::OtherNetwork,
     ];
     for env in &blocked {
       assert!(!env.allows_login(), "{env:?}");
@@ -3672,6 +4607,20 @@ mod tests {
     // Online, the verdict is only worth a band where it says "nothing to do":
     // another operator's portal is not shown while a session is up.
     assert_eq!(tones(LoginEnv::OtherPortal, State::Online, None), vec![]);
+    // Direct internet behind the campus portal (the portal answers, but names
+    // no session) stays a warning: it is still the campus link, and a session
+    // is exactly what is missing.
+    assert_eq!(
+      tones(LoginEnv::NoPortal, State::Offline, None),
+      vec![BannerTone::Warn]
+    );
+    // A link that is not the campus network at all is not a warning: the
+    // machine is online, just not through the portal. Green, like 802.1X.
+    assert_eq!(
+      tones(LoginEnv::OtherNetwork, State::Offline, None),
+      vec![BannerTone::Ok]
+    );
+    assert_eq!(tones(LoginEnv::OtherNetwork, State::Online, None), vec![]);
     // An 802.1X network is amber until its session is up and green afterwards.
     let secure = || LoginEnv::EnterpriseWifi("Tsinghua-Secure".into());
     assert_eq!(
@@ -4103,6 +5052,7 @@ mod tests {
     let mut out = ctx.run_ui(input, |ui| {
       egui::CentralPanel::default().show(ui, |ui| {
         let mut open = true;
+        let mut copied = None;
         layout = Some(devices_list(
           ui,
           &devices,
@@ -4110,6 +5060,7 @@ mod tests {
           t,
           &mut open,
           false,
+          &mut copied,
         ));
       });
     });
@@ -4122,6 +5073,206 @@ mod tests {
     assert!(
       layout.used <= layout.planned + 0.5,
       "the body used more width than it planned: {layout:?}"
+    );
+  }
+
+  #[test]
+  fn disconnect_is_off_while_the_page_says_offline() {
+    // Nothing to end while offline, even if the core still wants to be online:
+    // an automatic attempt between retries keeps the state Offline, and both
+    // verbs lit up there is what the phone showed.
+    assert!(!can_stop(State::Offline, true));
+    // A login in flight can be called off.
+    assert!(can_stop(State::Authenticating, true));
+    assert!(can_stop(State::Online, true));
+    // A link this app does not manage never offers the verb, whatever the state.
+    assert!(!can_stop(State::Online, false));
+    assert!(!can_stop(State::Authenticating, false));
+  }
+
+  #[test]
+  fn a_phone_gives_the_device_list_more_room_than_a_desktop() {
+    // The desktop cap stays what it was.
+    assert_eq!(devices_scroll_max(890.0, false), DEVICES_SCROLL_MAX);
+    // A phone gets most of its screen, but not all of it, and never less than
+    // the desktop cap.
+    let phone = devices_scroll_max(890.0, true);
+    assert!(phone > DEVICES_SCROLL_MAX * 2.0, "{phone}");
+    assert!(phone < 890.0 * 0.75, "{phone}");
+    // A short phone screen still shows more than the desktop letterbox.
+    assert_eq!(devices_scroll_max(200.0, true), DEVICES_SCROLL_MAX);
+    // And the cap holds on a tablet.
+    assert_eq!(devices_scroll_max(2000.0, true), 620.0);
+  }
+
+  /// A second hold has to reach the other line, and the menu must act on the
+  /// whole span: that is the difference between "copy this line" and "copy
+  /// everything between the two rows I touched".
+  #[test]
+  fn a_second_hold_picks_the_lines_between() {
+    let mut pick = LogPick::default();
+    assert_eq!(pick.range(), None);
+    assert!(!pick.covers(7));
+
+    pick.hold(7);
+    assert_eq!(pick.range(), Some((7, 7)));
+    assert!(pick.covers(7));
+
+    // Downwards and upwards describe the same span.
+    pick.hold(3);
+    assert_eq!(pick.range(), Some((3, 7)));
+    assert!(pick.covers(3) && pick.covers(5) && pick.covers(7));
+    assert!(!pick.covers(2) && !pick.covers(8));
+
+    // A third hold moves the far end instead of starting over.
+    pick.hold(58);
+    assert_eq!(pick.range(), Some((7, 58)));
+
+    // Holding the anchor again collapses to that one line.
+    pick.hold(7);
+    assert_eq!(pick.range(), Some((7, 7)));
+
+    // Closing the menu forgets everything.
+    pick.clear();
+    assert_eq!(pick.range(), None);
+  }
+
+  /// Pressing the second row closes the first menu at once, and the hold that
+  /// extends the pick only matures half a second later: the pick has to survive
+  /// that gap, or the second hold starts over on its own row.
+  #[test]
+  fn a_pick_survives_the_first_menu_closing() {
+    let mut hold = LogHold::default();
+    hold.pick.hold(4);
+    hold.clear_if_closed(true, false);
+    assert_eq!(hold.pick.range(), Some((4, 4)), "an open menu keeps it");
+    hold.clear_if_closed(false, true);
+    assert_eq!(
+      hold.pick.range(),
+      Some((4, 4)),
+      "a press keeps it while the second hold matures"
+    );
+    hold.pick.hold(9);
+    assert_eq!(hold.pick.range(), Some((4, 9)));
+    // Lifting without a hold is a tap, and a tap is what deselects.
+    hold.clear_if_closed(false, false);
+    assert_eq!(hold.pick.range(), None);
+  }
+
+  /// A press is an aim, a pick is a decision: the two have to look different,
+  /// and neither may stand in for the other.
+  #[test]
+  fn a_press_and_a_pick_are_different_states() {
+    assert!(
+      PRESS_TINT_ALPHA < PICK_TINT_ALPHA,
+      "the aim has to be lighter than the selection"
+    );
+    let mut hold = LogHold::default();
+    hold.pick.hold(3);
+    hold.pick.hold(6);
+    hold.pressed = Some((9, 0.0));
+    assert!(hold.picked(3) && hold.picked(4) && hold.picked(6));
+    assert!(!hold.picked(9), "a press outside the range is not picked");
+    assert!(hold.pressed_at(9));
+    assert!(!hold.pressed_at(4), "a picked row carries no press");
+  }
+
+  /// A toast produced while a dialog is open has to be readable. A modal draws
+  /// its dimming backdrop as a `Foreground` layer, so a toast in that same order
+  /// lost to it - which is how the device list hid the "copied" confirmation it
+  /// had just produced. `Tooltip` is the one order nothing draws over.
+  #[test]
+  fn a_toast_is_drawn_above_a_dialog() {
+    let toast = Toast {
+      msg: "copied".into(),
+      at: Instant::now(),
+      kind: ToastKind::Ok,
+    };
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(400.0, 890.0),
+      )),
+      ..Default::default()
+    };
+    // Two frames: an area is registered the first time it runs, and the layer
+    // order of the second frame is the one that gets painted.
+    for _ in 0..2 {
+      let mut out = ctx.run_ui(input.clone(), |ui| {
+        let _ = egui::Modal::new(egui::Id::unique("devices")).show(ui.ctx(), |ui| {
+          ui.label("devices");
+        });
+        paint_toast(ui.ctx(), Some(&toast));
+      });
+      // Font and texture uploads belong to the renderer; epaint asserts when an
+      // unapplied delta is dropped.
+      out.textures_delta.clear();
+    }
+    // Back-to-front, so the last layer is the topmost one.
+    let layers: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    let top = *layers.last().expect("the frame registered a layer");
+    assert_eq!(
+      top.order,
+      egui::Order::Tooltip,
+      "the toast must be the topmost layer, above the modal backdrop"
+    );
+  }
+
+  #[test]
+  fn the_device_dialog_height_does_not_follow_itself() {
+    // A modal lays its content out with the height it had last frame. Reading
+    // `available_height()` and taking a fraction of it made the list converge
+    // to its own size, and on a phone it shrank frame after frame.
+    let t = crate::i18n::Lang::En.texts();
+    let devices: Vec<Device> = (0..20)
+      .map(|i| Device {
+        id: i.to_string(),
+        ip4: format!("192.0.2.{}", i + 1),
+        os: "AndroidOS".into(),
+        ..Default::default()
+      })
+      .collect();
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(400.0, 890.0),
+      )),
+      ..Default::default()
+    };
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+      let mut height = 0.0;
+      let mut out = ctx.run_ui(input.clone(), |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("devices")).show(ui.ctx(), |ui| {
+          let mut open = true;
+          let mut copied = None;
+          devices_list(
+            ui,
+            &devices,
+            devices.len(),
+            t,
+            &mut open,
+            false,
+            &mut copied,
+          );
+          ui.min_rect().height()
+        });
+        height = modal.inner;
+      });
+      out.textures_delta.clear();
+      heights.push(height);
+    }
+    // The first frame has no text metrics yet, so only the steady state has to
+    // hold still - the bug was that it kept changing after that.
+    assert!(
+      heights[1] == heights[2],
+      "the dialog changed height between frames: {heights:?}"
+    );
+    assert!(
+      heights[2] > DEVICES_SCROLL_MAX + 20.0,
+      "the rows did not take the cap: {heights:?}"
     );
   }
 
@@ -4219,6 +5370,13 @@ fn page_banners(
     match env {
       LoginEnv::EnterpriseWifi(ref ssid) if state == State::Online => {
         banners.push((BannerTone::Ok, t.secure_wifi_online.replacen("{}", ssid, 1)))
+      }
+      // The internet works without a portal in the way, and the link is not the
+      // campus network at all: home Wi-Fi, mobile data. Nothing to log in to is
+      // good news, so it gets the same green band as an 802.1X network instead
+      // of the amber "nothing to log in to" warning.
+      LoginEnv::OtherNetwork if state != State::Online => {
+        banners.push((BannerTone::Ok, t.online_no_portal.to_string()))
       }
       _ if state != State::Online => {
         if let Some(why) = env.blocked_reason(t) {
@@ -4323,6 +5481,83 @@ impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     if self.turtle.is_none() {
       self.turtle = load_turtle(ctx);
+    }
+    // A phone parks the event loop while the app is in the background and
+    // resumes it on return. The focus edge is the one local trace of that, and
+    // it is what makes "the session survived being hidden" visible in the log.
+    let focused = ctx.input(|i| i.focused);
+    if focused && !self.was_focused {
+      self.push_log(Line::debug("app: window focused"));
+    }
+    self.was_focused = focused;
+    // The autofill service answers from Java; wake the loop when it does and
+    // apply whichever fields it filled (a null side means "untouched").
+    #[cfg(target_os = "android")]
+    {
+      crate::android::remember_context(ctx);
+      if let Some((user, pass)) = crate::android::take_autofill_result() {
+        if let Some(user) = user {
+          self.user_edit = user.chars().take(ACCOUNT_MAX_CHARS).collect();
+        }
+        if let Some(pass) = pass {
+          self.pass_edit = pass.chars().take(PASSWORD_MAX_CHARS).collect();
+        }
+        self.toast = None;
+      }
+      // A field that is no longer on screen must not keep an autofill session
+      // (or a dropdown hovering over the status page) alive.
+      if self.page != Page::Settings && self.autofill_focus.is_some() {
+        self.autofill_focus = None;
+        self.autofill_value.clear();
+        self.autofill_rect = None;
+        let _ = crate::android_jni::autofill_leave();
+      }
+      // The soft keyboard talks to the Activity over an `InputConnection`;
+      // composition, commits and deletions arrive here and join egui's event
+      // stream, where the focused `TextEdit` applies them.
+      let ime = crate::android::take_ime_events();
+      if !ime.is_empty() {
+        ctx.input_mut(|input| input.events.extend(ime.into_iter().map(egui::Event::Ime)));
+      }
+    }
+    // The hold's tint follows its menu, so forget the picked lines once it
+    // closes - but not while a press is down, which is someone aiming at the
+    // other end of the range. This lives outside the platform block because the
+    // hold is the desktop's left button as well as a phone's finger.
+    let pointer_down = ctx.input(|i| i.pointer.primary_down());
+    self
+      .log_hold
+      .clear_if_closed(egui::Popup::is_any_open(ctx), pointer_down);
+    // The system back gesture (edge swipe, or the button) is answered by the
+    // window when there is a step to take: an open menu, the switch
+    // confirmation, the device list, or the settings page. Java asks once per
+    // gesture through `Native.backPressed`; a "no" leaves the task in the
+    // background, so the capability is published again every pass.
+    #[cfg(target_os = "android")]
+    {
+      // egui only notices a long touch (the log menu, the fields' paste) on a
+      // frame, and a finger held still produces no input events; without this
+      // pulse the release is simply too late to count as a click.
+      if ctx.input(|i| i.pointer.primary_down()) {
+        ctx.request_repaint_after(Duration::from_millis(100));
+      }
+      if crate::android::take_back() {
+        if egui::Popup::is_any_open(ctx) {
+          egui::Popup::close_all(ctx);
+        } else if self.confirm_switch.is_some() {
+          self.confirm_switch = None;
+        } else if self.devices_open {
+          self.devices_open = false;
+        } else if self.page == Page::Settings {
+          self.page = Page::Status;
+        }
+      }
+      crate::android::set_can_go_back(
+        egui::Popup::is_any_open(ctx)
+          || self.confirm_switch.is_some()
+          || self.devices_open
+          || self.page == Page::Settings,
+      );
     }
     // The stored theme is pushed here rather than in `App::new`, which runs
     // before there is a context to apply it to. `applied_theme` remembers what
@@ -4547,6 +5782,29 @@ impl eframe::App for App {
     if Instant::now() >= self.next_uplink {
       self.next_uplink = Instant::now() + Duration::from_secs(2);
       self.uplink = crate::srun::link_kind();
+      // The address the machine holds on that link. Two route lookups, no
+      // packet sent; cheap enough for the same tick the link kind is read on.
+      self.local_ip4 = crate::srun::link_id()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+      self.local_ip6 = crate::srun::link_id6()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+      // The Activity rewrites the night mode when the system theme changes;
+      // re-reading it on the same slow tick keeps the per-frame theme check
+      // free of file access.
+      #[cfg(target_os = "android")]
+      crate::theme::refresh(ctx);
+      // The keep-alive state is owned by the Activity (the permission dialog
+      // answers asynchronously), so the rows follow the files, not the click.
+      #[cfg(target_os = "android")]
+      {
+        self.background = crate::background::Mode::read();
+        self.background_denied = crate::background::denied();
+        self.background_allowed = crate::background::allowed();
+        self.background_power = crate::background::power_ok();
+        self.secure_detection = crate::secure_wifi::enabled();
+      }
     }
 
     // Ask the service about itself now and then; the row it fills is advisory,
@@ -4554,16 +5812,6 @@ impl eframe::App for App {
     if self.link.as_ref().is_some_and(Link::alive) && Instant::now() >= self.next_core_query {
       self.next_core_query = Instant::now() + Duration::from_secs(30);
       self.send(Cmd::CoreInfo);
-    }
-
-    // A left click on the tray icon shows the window, a double click hides it.
-    // Windows only: the Linux backend delivers no click event at all, so there
-    // the tray menu is the only way in (and out).
-    #[cfg(windows)]
-    match tray_click() {
-      Some(true) => self.show_window(ctx),
-      Some(false) => self.hide_window(ctx),
-      None => {}
     }
 
     self.handle_menu(ctx);
@@ -4581,7 +5829,7 @@ impl eframe::App for App {
     if ctx.input(|i| i.viewport().close_requested()) {
       if self.quitting {
         // Programmatic close from the tray "Quit" item: let it through.
-      } else if self.tray.is_some() {
+      } else if self.tray.available() {
         // Closing the window only hides it to the tray.
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.hide_window(ctx);
@@ -4614,9 +5862,7 @@ impl eframe::App for App {
     let (label, rgb) = self.state_display(t);
     if self.tray_rgb != Some(rgb) {
       self.tray_rgb = Some(rgb);
-      if let Some(tray) = &self.tray {
-        let _ = tray.set_icon(Some(make_icon(rgb)));
-      }
+      self.tray.set_color(rgb);
     }
     // The tooltip is Windows-only: `set_tooltip` is a no-op in the Linux
     // backend, so there it would just build a string nobody reads.
@@ -4630,16 +5876,12 @@ impl eframe::App for App {
         ),
         _ => format!("{} · {label}", app_name()),
       };
-      if let Some(tray) = &self.tray {
-        let _ = tray.set_tooltip(Some(&tip));
-      }
+      self.tray.set_tooltip(&tip);
     }
-    self
-      .connect_item
-      .set_enabled(self.state != State::Online && self.env.allows_login());
-    self
-      .disconnect_item
-      .set_enabled(self.state == State::Online && self.portal_verbs());
+    self.tray.set_enabled(
+      self.state != State::Online && self.env.allows_login(),
+      self.state == State::Online && self.can_disconnect(),
+    );
 
     // When hidden, wake up often enough to pick up a second launch quickly.
     // The turtle walks a short track, so the status page needs a finer tick
@@ -4659,6 +5901,10 @@ impl eframe::App for App {
     self.sync_window_height(ui.ctx());
     paint_toast(ui.ctx(), self.toast.as_ref());
     self.paint_switch_confirm(ui.ctx());
+    // Last: every copy this pass produced (the log menu, a label selection,
+    // any `clipboard::copy`) leaves through the system clipboard here.
+    #[cfg(target_os = "android")]
+    crate::clipboard::flush(ui.ctx());
   }
 }
 
@@ -4760,8 +6006,13 @@ fn paint_toast(ctx: &egui::Context, toast: Option<&Toast>) {
   // Give it the window width (minus a margin) so short messages stay on one
   // line and only genuinely long ones wrap or get clipped at the edge.
   let max_w = (ctx.content_rect().width() - 32.0).max(120.0);
+  // Above a modal, not merely above the page: a modal's dimming backdrop is a
+  // `Foreground` layer too, and with the toast in that same order the winner is
+  // whichever layer was created first - which is why a dialog hid the "copied"
+  // confirmation it had just produced. `Tooltip` is the only order nothing draws
+  // over, and a toast takes no input, so nothing is lost by putting it there.
   egui::Area::new(egui::Id::unique("thunet_toast"))
-    .order(egui::Order::Foreground)
+    .order(egui::Order::Tooltip)
     .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
     .default_width(max_w)
     .show(ctx, |ui| {
@@ -4792,6 +6043,11 @@ fn install_fonts(ctx: &egui::Context) -> Option<&'static str> {
     // Linux
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    // Android
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/NotoSansCJKsc-Regular.otf",
+    "/system/fonts/NotoSansSC-Regular.otf",
+    "/system/fonts/DroidSansFallbackFull.ttf",
   ];
 
   for path in CANDIDATES {
@@ -4942,105 +6198,26 @@ fn wayland_without_x11() -> bool {
   }
 }
 
-/// Left clicks counted in the current burst: 0 = nothing pending, 1 = one click
-/// waiting for the double-click deadline, 2 = a double click.
-#[cfg(windows)]
-static CLICKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// When the latest left click arrived, in ms since `STARTED`; 0 = no click yet.
-#[cfg(windows)]
-static LAST_CLICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(windows)]
-fn now_ms() -> u64 {
-  // 0 is the "no click yet" sentinel, so the clock starts at 1.
-  STARTED
-    .get()
-    .map_or(0, |s| s.elapsed().as_millis() as u64 + 1)
-}
-
-/// A second left click inside this window counts as a double click. 300 ms is
-/// snappier than the 500 ms most desktops use; the delay is a compromise, since
-/// a single click can only be acted on once no second click can follow.
-#[cfg(windows)]
-const DOUBLE_CLICK_MS: u64 = 300;
-
-/// Does the click at `now` follow `previous` closely enough to be the second
-/// half of a double click? `previous == 0` means there was no click.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_double_click(previous: u64, now: u64, deadline: u64) -> bool {
-  previous != 0 && now.saturating_sub(previous) <= deadline
-}
-
-/// What a pending click burst means: `None` waits for the deadline to pass,
-/// `Some(true)` shows the window, `Some(false)` hides it.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn click_outcome(clicks: u8, since_last: u64, deadline: u64) -> Option<bool> {
-  match clicks {
-    2 => Some(false),
-    1 if since_last >= deadline => Some(true),
-    _ => None,
-  }
-}
-
-/// Consume the pending left click, if it can be resolved already.
-#[cfg(windows)]
-fn tray_click() -> Option<bool> {
-  use std::sync::atomic::Ordering;
-
-  let since_last = now_ms().saturating_sub(LAST_CLICK.load(Ordering::Relaxed));
-  let outcome = click_outcome(CLICKS.load(Ordering::Relaxed), since_last, DOUBLE_CLICK_MS);
-  if outcome.is_some() {
-    CLICKS.store(0, Ordering::Relaxed);
-  }
-  outcome
-}
-
-/// Tray callbacks arrive on another thread. Without a handler every event waits
-/// for the next tick of the (deliberately slow) repaint loop, which makes a
-/// click on the icon feel dead; the handler records the click and wakes egui.
-/// It must be registered before the icon exists, because the crate ignores a
-/// late registration once an event has gone through the default channel.
-///
-/// Windows only: the Linux backend never emits a `TrayIconEvent`, so there is
-/// nothing to handle.
-#[cfg(windows)]
-fn install_tray_events(ctx: &egui::Context) {
-  use std::sync::atomic::Ordering;
-
-  let ctx = ctx.clone();
-  TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-    if !matches!(
-      event,
-      TrayIconEvent::Click {
-        button: MouseButton::Left,
-        button_state: MouseButtonState::Up,
-        ..
-      }
-    ) {
-      return;
-    }
-    // `TrayIconEvent::DoubleClick` never arrives: tray-icon registers its window
-    // class without `CS_DBLCLKS`, so Windows never posts `WM_LBUTTONDBLCLK`.
-    // Count the clicks here instead.
-    let now = now_ms();
-    let previous = LAST_CLICK.swap(now, Ordering::Relaxed);
-    let deadline = DOUBLE_CLICK_MS;
-    let double = is_double_click(previous, now, deadline);
-    CLICKS.store(if double { 2 } else { 1 }, Ordering::Relaxed);
-    // A single click is only acted on once the deadline has passed: acting at
-    // once would show the window on the first click of a double click and hide
-    // it again on the second, which looks like a flash.
-    ctx.request_repaint_after(Duration::from_millis(deadline));
-    ctx.request_repaint();
-  }));
-}
-
 /// OpenGL first (smallest footprint), then wgpu. Virtual machines and RDP
 /// sessions often expose only OpenGL 1.1, where `egui_glow` refuses to start and
 /// the process used to die with exit code 1 before any window appeared;
 /// `THUNET_RENDERER=wgpu` skips straight to the fallback.
+#[cfg(target_os = "android")]
+type AndroidApp = winit::platform::android::activity::AndroidApp;
+#[cfg(not(target_os = "android"))]
+type AndroidApp = ();
+
+#[cfg(target_os = "android")]
+pub fn run(cfg: Config, minimized: bool, android_app: AndroidApp) -> Result<(), String> {
+  run_all(cfg, minimized, android_app)
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
+  run_all(cfg, minimized, ())
+}
+
+fn run_all(cfg: Config, minimized: bool, android_app: AndroidApp) -> Result<(), String> {
   STARTED.get_or_init(Instant::now);
   #[cfg(windows)]
   if crate::ipc::portable() {
@@ -5056,7 +6233,7 @@ pub fn run(cfg: Config, minimized: bool) -> Result<(), String> {
   };
   let mut last = String::from("no renderer available");
   for renderer in attempts {
-    match run_with(cfg.clone(), minimized, *renderer) {
+    match run_with(cfg.clone(), minimized, *renderer, android_app.clone()) {
       Ok(()) => return Ok(()),
       Err(e) => last = format!("{}: {e}", renderer_name(renderer)),
     }
@@ -5104,22 +6281,44 @@ fn set_portable_app_id() {
   let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
 }
 
-fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<(), String> {
-  // Mutated only by the X11 block below; other platforms build it as is.
+fn run_with(
+  cfg: Config,
+  minimized: bool,
+  renderer: eframe::Renderer,
+  android_app: AndroidApp,
+) -> Result<(), String> {
+  #[allow(unused_mut)]
+  let mut viewport = egui::ViewportBuilder::default()
+    .with_visible(!minimized)
+    .with_icon(std::sync::Arc::new(app_icon()))
+    .with_title(app_name());
+  // Android sizes the window to the screen; an inner size and a non-resizable
+  // hint only fight the system there.
+  #[cfg(not(target_os = "android"))]
+  {
+    viewport = viewport
+      .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])
+      .with_resizable(false);
+  }
+  // Mutated only by the X11 block below and the Android app handle; other
+  // platforms build it as is.
   #[allow(unused_mut)]
   let mut options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default()
-      .with_inner_size([DEFAULT_WIDTH, WINDOW_HEIGHT])
-      .with_resizable(false)
-      .with_visible(!minimized)
-      .with_icon(std::sync::Arc::new(app_icon()))
-      .with_title(app_name()),
+    viewport,
     // The window size is fixed by the layout, so a stale persisted size (or a
     // previous position off-screen) must not override it on the next launch.
     persist_window: false,
     renderer,
     ..Default::default()
   };
+  #[cfg(target_os = "android")]
+  {
+    options.android_app = Some(android_app);
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let _ = android_app;
+  }
 
   // Wayland cannot hide a toplevel: winit's `set_visible` is a no-op there
   // ("Not possible on Wayland"), so *Hide window* and closing the window to the
@@ -5150,8 +6349,7 @@ fn run_with(cfg: Config, minimized: bool, renderer: eframe::Renderer) -> Result<
       // instead of drawing one frame dark and switching afterwards.
       crate::theme::watch(cc.egui_ctx.clone());
       let font = install_fonts(&cc.egui_ctx);
-      #[cfg(windows)]
-      install_tray_events(&cc.egui_ctx);
+      crate::tray::install_events(&cc.egui_ctx);
       cc.egui_ctx.add_plugin(LogCopyClick::default());
       Ok(Box::new(App::new(cfg, minimized, font)))
     }),

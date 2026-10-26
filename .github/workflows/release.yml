@@ -1,12 +1,17 @@
 name: Release
 
-# Pushing a tag such as v0.1.0 builds the Windows MSI and the Linux deb/tarball,
-# publishes all of them as release assets (the MSI together with the generated
-# winget manifests), and (when the WINGET_TOKEN secret is present) opens the
-# manifest PR against microsoft/winget-pkgs.
+# Pushing a tag builds all three packages and publishes them as release assets.
+# The MSI carries the generated winget manifests too, and (when the WINGET_TOKEN
+# secret is present) the manifests are submitted to microsoft/winget-pkgs.
 #
-# Manual runs use the tag if started from one, otherwise the Cargo.toml version.
-# Pushes to main never run this workflow: only tags and manual runs do.
+# A beta tag is `vX.Y.Z-something` (for example `v0.1.6-beta.1`): Cargo.toml keeps
+# the base version, the suffix only names the files, the release is marked as a
+# pre-release so it never takes the "Latest" badge, and winget is left alone -
+# a beta has no business in a package manager. A plain `vX.Y.Z` tag is the
+# release that does.
+#
+# A manual run (no tag) is a build check: the packages are built and nothing is
+# published. Pushes to main never run this workflow.
 on:
   push:
     tags: ["v*"]
@@ -28,23 +33,34 @@ jobs:
 
       # The tag is the source of truth for the release, but Cargo.toml has to
       # agree with it: the MSI version and the winget version both come from it.
+      # A beta tag keeps its suffix out of every packaged version (WiX refuses
+      # one), so only the base is compared.
       - name: Resolve and check version
         id: version
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          if ($tag -match '^v\d+\.\d+\.\d+') {
-            $version = $tag.Substring(1)
-          } else {
-            Write-Host "not a release tag ($tag); falling back to Cargo.toml"
-            $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          }
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -match '^v(\d+\.\d+\.\d+)(-.*)?$') {
+            $version = $Matches[1]
+            $suffix = $Matches[2]
+          } else {
+            Write-Host "not a release tag ($tag); using the Cargo.toml version"
+            $version = $cargo
+            $suffix = ""
+          }
           if ($cargo -ne $version) {
             throw "Cargo.toml says $cargo but the release is $version; bump Cargo.toml first."
           }
+          # Only a tag publishes; a manual run from a branch is a build check.
+          $publish = if ("${{ github.ref_type }}" -eq 'tag') { 'true' } else { 'false' }
+          $prerelease = if ([string]::IsNullOrEmpty($suffix)) { 'false' } else { 'true' }
           "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=v$version" >> $env:GITHUB_OUTPUT
+          "label=$version$suffix" >> $env:GITHUB_OUTPUT
+          "tag=v$version$suffix" >> $env:GITHUB_OUTPUT
+          "suffix=$suffix" >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease" >> $env:GITHUB_OUTPUT
+          "publish=$publish" >> $env:GITHUB_OUTPUT
 
       - uses: prefix-dev/setup-pixi@v0
         with:
@@ -55,9 +71,22 @@ jobs:
       - name: Build MSI
         run: pixi run -e package msi
 
+      # The packaged version stays numeric; the file name is what tells a beta
+      # apart from the release it precedes.
+      - name: Name the artifact
+        if: steps.version.outputs.suffix != ''
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ steps.version.outputs.suffix }}
+        run: |
+          Rename-Item "dist/thunet-$env:VERSION-x64.msi" "thunet-$env:VERSION$env:SUFFIX-x64.msi"
+
       # URL and hash must describe the exact bytes uploaded below, so the
       # manifests are generated from the freshly built MSI and never hand-edited.
+      # A pre-release never gets one: winget takes releases only.
       - name: Generate winget manifests
+        if: steps.version.outputs.prerelease == 'false'
         shell: pwsh
         run: |
           ./scripts/winget_manifest.ps1 `
@@ -65,13 +94,15 @@ jobs:
             -License MIT
 
       - name: Publish release
+        if: steps.version.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: THUnet ${{ steps.version.outputs.version }}
+          name: THUnet ${{ steps.version.outputs.label }}
           tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ steps.version.outputs.prerelease }}
           generate_release_notes: true
           files: |
-            dist/thunet-${{ steps.version.outputs.version }}-x64.msi
+            dist/thunet-*-x64*.msi
             dist/winget/*.yaml
 
       # Optional: needs a classic PAT with `public_repo` stored as WINGET_TOKEN.
@@ -89,7 +120,7 @@ jobs:
           "enabled=$($enabled.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
       - name: Submit manifests to winget-pkgs
-        if: steps.winget.outputs.enabled == 'true'
+        if: steps.winget.outputs.enabled == 'true' && steps.version.outputs.publish == 'true' && steps.version.outputs.prerelease == 'false'
         shell: pwsh
         env:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
@@ -124,18 +155,32 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
-          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            version="${tag#v}"
+          # A beta tag is `vX.Y.Z-something`. Every packaged version stays numeric
+          # (WiX refuses a suffix and the APK's versionCode is arithmetic on the
+          # parts), so the suffix only names files.
+          if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-.*)?$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            suffix="${BASH_REMATCH[2]}"
           else
-            echo "not a release tag ($tag); falling back to Cargo.toml"
+            echo "not a release tag ($tag); using the Cargo.toml version"
             version="$cargo_version"
+            suffix=""
           fi
           if [ "$cargo_version" != "$version" ]; then
             echo "Cargo.toml says $cargo_version but the release is $version; bump Cargo.toml first." >&2
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          # Only a tag publishes; a manual run from a branch is a build check.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then publish=true; else publish=false; fi
+          if [ -n "$suffix" ]; then prerelease=true; else prerelease=false; fi
+          {
+            echo "version=$version"
+            echo "label=$version$suffix"
+            echo "tag=v$version$suffix"
+            echo "suffix=$suffix"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
 
       # frozen: true pins the build to pixi.lock so CI never resolves newer
       # versions of the GTK/rust packages than the ones tested locally.
@@ -167,13 +212,228 @@ jobs:
             exit 1
           fi
 
+      # The packaged version stays numeric; the file name is what tells a beta
+      # apart from the release it precedes.
+      - name: Name the artifacts
+        if: steps.version.outputs.suffix != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ steps.version.outputs.suffix }}
+        run: |
+          set -euo pipefail
+          mv "dist/thunet_${VERSION}-1_amd64.deb" "dist/thunet_${VERSION}-1${SUFFIX}_amd64.deb"
+          mv "dist/thunet-${VERSION}-linux-x64.tar.gz" "dist/thunet-${VERSION}${SUFFIX}-linux-x64.tar.gz"
+
       # Appends to the release the Windows job creates (or creates it when this
       # job gets there first). No generate_release_notes here: the release body
       # is owned by the Windows job and two writers would overwrite each other.
       - name: Publish release assets
+        if: steps.version.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ steps.version.outputs.prerelease }}
           files: |
-            dist/thunet_${{ steps.version.outputs.version }}-1_amd64.deb
-            dist/thunet-${{ steps.version.outputs.version }}-linux-x64.tar.gz
+            dist/thunet_*_amd64.deb
+            dist/thunet-*-linux-x64.tar.gz
+
+  # ------------------------------------------------------------------ Android
+  # The APK is published **unsigned**: the signing key is a keystore kept outside
+  # the repository (`android/keystore.properties` is git-ignored), and signing
+  # with a throwaway key would produce an APK that no installed copy accepts as an
+  # update. Unsigned still buys the thing CI is for - the port builds from a clean
+  # checkout - and the file name matches what the README tells users to sideload
+  # once a real key signs it.
+  #
+  # Release carries `arm64-v8a` only (`android/app/build.gradle`), so the Rust side
+  # builds just `aarch64-linux-android`.
+  android-apk:
+    name: APK, arm64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same rule as the other two jobs: the tag is the source of truth and
+      # Cargo.toml has to agree, because `versionName` (and `versionCode` derived
+      # from it) is read from Cargo.toml by the Gradle build.
+      - name: Resolve and check version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          # A beta tag is `vX.Y.Z-something`. Every packaged version stays numeric
+          # (WiX refuses a suffix and the APK's versionCode is arithmetic on the
+          # parts), so the suffix only names files.
+          if [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-.*)?$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            suffix="${BASH_REMATCH[2]}"
+          else
+            echo "not a release tag ($tag); using the Cargo.toml version"
+            version="$cargo_version"
+            suffix=""
+          fi
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml says $cargo_version but the release is $version; bump Cargo.toml first." >&2
+            exit 1
+          fi
+          # Only a tag publishes; a manual run from a branch is a build check.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then publish=true; else publish=false; fi
+          if [ -n "$suffix" ]; then prerelease=true; else prerelease=false; fi
+          {
+            echo "version=$version"
+            echo "label=$version$suffix"
+            echo "tag=v$version$suffix"
+            echo "suffix=$suffix"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      # JDK 21 comes from the pixi `android` environment; the Gradle wrapper
+      # unpacks the exact Gradle it pins, so the environment's `gradle` is not
+      # what runs.
+      - uses: prefix-dev/setup-pixi@v0
+        with:
+          environments: android
+          frozen: true
+          cache: true
+
+      # `scripts/android_build.sh` calls `cargo ndk`, so the toolchain is the
+      # official one with the ABI target added next to it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      # cargo-ndk is not in the pixi environment (and not on conda-forge), so it
+      # is built from source here; the step is a few seconds on a warm registry
+      # cache and keeps the job independent of a third-party install action.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # Platform 36 and NDK 29 are newer than what the runner image ships, and
+      # `ndkVersion` in android/app/build.gradle pins that exact NDK: AGP looks it
+      # up under $ANDROID_HOME/ndk and fails the build when it is a different one.
+      # The runner image's default JDK is 11 and `sdkmanager` refuses anything
+      # below 17 ("Your version was detected as 11.0.32.1"). The pixi environment
+      # only exports JAVA_HOME inside `pixi run`, so the action that reads the SDK
+      # licenses needs a JDK of its own; this one is also what Gradle would pick
+      # up outside pixi.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          # The default package list starts with `tools`, which no longer exists in
+          # the SDK repository ("Failed to find package 'tools'"). Platform and
+          # NDK are installed by the step below.
+          packages: platform-tools
+
+      - name: Install SDK platform and NDK
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-36" "ndk;29.0.14206865"
+          # The Gradle build finds the SDK through ANDROID_HOME (see
+          # scripts/android_build.sh); the setup action exports ANDROID_SDK_ROOT.
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk" || { echo "no Android SDK root from setup-android" >&2; exit 1; }
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      # The wrapper download and the AGP/AndroidX artifacts are the slow part of
+      # a cold run; the NDK is left uncached because restoring it costs about as
+      # much as letting sdkmanager fetch it.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/app/build.gradle') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # `secrets` is not an allowed context in a step's `if:`, so whether a key
+      # exists is published as an output instead (same trick as WINGET_TOKEN).
+      - name: Check for the signing key
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "${KEYSTORE:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; building an unsigned APK."
+          fi
+
+      - name: Materialize the signing key
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          # `storeFile` is resolved relative to the :app project, so it has to be
+          # absolute here or Gradle looks under android/app/.
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$RUNNER_TEMP/release.jks" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" \
+            > android/keystore.properties
+
+      - name: Build APK
+        run: pixi run -e android apk-release
+
+      - name: Name the artifact
+        id: apk
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ steps.version.outputs.suffix }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          # `-unsigned` is the second half of the name, so a file that cannot be
+          # installed never carries the name of one that can.
+          suffix="$SUFFIX"
+          [ "$SIGNED" = 'true' ] || suffix="$suffix-unsigned"
+          # Signed builds land in `app-release.apk`, unsigned ones in
+          # `app-release-unsigned.apk`; taking whatever is there covers both.
+          out="android/app/build/outputs/apk/release"
+          apk="$(find "$out" -maxdepth 1 -name '*.apk' -print -quit)"
+          if [ -z "$apk" ]; then
+            echo "no APK under $out" >&2
+            find android/app/build/outputs -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+          mkdir -p dist
+          file="dist/thunet-${VERSION}${suffix}-arm64.apk"
+          cp "$apk" "$file"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          ls -l "$file"
+
+      - name: Check the signature
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          FILE: ${{ steps.apk.outputs.file }}
+        run: |
+          set -euo pipefail
+          signer="$(ls -1 "$ANDROID_HOME"/build-tools/*/apksigner | tail -n1)"
+          "$signer" verify --print-certs "$FILE"
+
+      # An unsigned APK cannot be installed at all, so it is not attached to the
+      # release; the job still succeeds, with a warning that says why.
+      - name: Say why no APK was published
+        if: steps.signing.outputs.enabled != 'true'
+        run: echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; the APK is unsigned, so it stays out of the release."
+
+      # Appends to the release the Windows job creates, exactly like the Linux
+      # job; no generate_release_notes here for the same reason.
+      - name: Publish release assets
+        if: steps.signing.outputs.enabled == 'true' && steps.version.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: dist/thunet-*-arm64.apk
