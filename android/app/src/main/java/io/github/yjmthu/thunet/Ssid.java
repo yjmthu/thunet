@@ -47,11 +47,22 @@ final class Ssid {
 
   /** Refresh {@code ssid.txt}; empty when the setting is off or the permission is missing. */
   static void update(Context context) {
-    if (!enabled(context) || !permitted(context)) {
-      write(context, SSID_FILE, "");
-      return;
+    String next = (!enabled(context) || !permitted(context)) ? "" : current(context);
+    String previous = null;
+    try {
+      previous =
+          new String(
+              Files.readAllBytes(new File(context.getFilesDir(), SSID_FILE).toPath()),
+              StandardCharsets.UTF_8);
+    } catch (Throwable ignored) {
+      // Missing file: the first write is a change by definition.
     }
-    write(context, SSID_FILE, current(context));
+    // Only a real change is written and announced: the core re-probes when told
+    // to, instead of reading the file on every pass.
+    if (previous == null || !next.equals(previous.trim())) {
+      write(context, SSID_FILE, next);
+      Native.ssidChanged();
+    }
   }
 
   /** The connected SSID without quotes; empty when it cannot be read. */

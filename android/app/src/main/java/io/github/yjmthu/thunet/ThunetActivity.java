@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Rect;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.text.InputType;
 import android.util.Log;
 import android.util.SparseArray;
@@ -45,8 +46,6 @@ import android.window.OnBackInvokedDispatcher;
  * The link row is maintained by {@link ThunetApp}, which outlives this Activity.
  */
 public class ThunetActivity extends android.app.NativeActivity {
-  /** Logcat tag shared with the rest of the Java side. */
-  private static final String TAG = Wake.TAG;
   /** Request code for the notification permission. */
   private static final int NOTIFY_REQUEST = 1001;
   /** Request code for the location permission (Wi-Fi name detection). */
@@ -58,6 +57,11 @@ public class ThunetActivity extends android.app.NativeActivity {
   private AutofillHost autofillHost;
   /** Virtual id of the credential field with the focus, if any. */
   private int focusedAutofillId = View.NO_ID;
+  /**
+   * The battery dialog was just opened, so the next resume should continue to
+   * the OEM page that carries the autostart and power-policy toggles.
+   */
+  private boolean openOemAfterPower;
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
@@ -120,6 +124,46 @@ public class ThunetActivity extends android.app.NativeActivity {
     } else {
       Ssid.update(this);
     }
+    if (openOemAfterPower) {
+      // The dialog has been answered; the OEM toggles are the other half, and
+      // sending the user there now saves them from hunting for it.
+      openOemAfterPower = false;
+      Wake.openOemSettings(this);
+    }
+  }
+
+  /**
+   * Called from Rust ({@code src/background.rs}) by the "allow background" row.
+   *
+   * The battery dialog comes first; the OEM page follows on the next resume, so
+   * one tap covers both halves of what the wake-up needs to survive a swipe.
+   */
+  public void requestBackground(String ignored) {
+    runOnUiThread(
+        () -> {
+          if (Wake.requestPower(this)) {
+            openOemAfterPower = true;
+          } else {
+            Wake.openOemSettings(this);
+          }
+        });
+  }
+
+  /** Called from Rust ({@code src/background.rs}) when the user's own
+   * "already set" confirmation moves. */
+  public void setBackgroundAllowed(boolean on) {
+    Wake.setAllowed(this, on);
+  }
+
+  /**
+   * Called from Rust ({@code src/background.rs}) on every settings tick.
+   *
+   * Without this exemption the system blocks the app's background network, so
+   * the answer decides whether the wake-up level can sign in at all.
+   */
+  public boolean backgroundPower() {
+    PowerManager power = getSystemService(PowerManager.class);
+    return power != null && power.isIgnoringBatteryOptimizations(getPackageName());
   }
 
   /**
@@ -250,7 +294,6 @@ public class ThunetActivity extends android.app.NativeActivity {
    * password manager's dropdown appear over it.
    */
   public void autofillEnter(int id, int x, int y, int w, int h, String value) {
-    Log.d(TAG, "autofill enter id=" + id + " rect=" + x + "," + y + " " + w + "x" + h);
     runOnUiThread(
         () -> {
           if (afm == null || autofillHost == null) {
@@ -269,7 +312,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
   /** The text of the focused field changed; the save prompt depends on this. */
   public void autofillValue(int id, String value) {
-    Log.d(TAG, "autofill value id=" + id + " len=" + value.length());
     runOnUiThread(
         () -> {
           if (afm == null || autofillHost == null) {
@@ -286,7 +328,6 @@ public class ThunetActivity extends android.app.NativeActivity {
    * is what moves the layout in the first place.
    */
   public void autofillBounds(int id, int x, int y, int w, int h) {
-    Log.d(TAG, "autofill bounds id=" + id + " rect=" + x + "," + y);
     runOnUiThread(
         () -> {
           if (autofillHost != null) {
@@ -297,7 +338,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
   /** No credential field has the focus any more. */
   public void autofillLeave() {
-    Log.d(TAG, "autofill leave");
     runOnUiThread(
         () -> {
           if (afm == null || autofillHost == null || focusedAutofillId == View.NO_ID) {
@@ -386,8 +426,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
     private final SparseArray<Rect> rects = new SparseArray<>();
     private final SparseArray<String> values = new SparseArray<>();
-    /** How many input connections the IME has asked for; shown in the log. */
-    private int connections = 0;
     /** The field the keyboard is attached to, or {@link View#NO_ID}. */
     private int focusedFieldId = View.NO_ID;
 
@@ -448,14 +486,6 @@ public class ThunetActivity extends android.app.NativeActivity {
       String text = values.get(focusedFieldId, "");
       outAttrs.initialSelStart = text.length();
       outAttrs.initialSelEnd = text.length();
-      Log.d(
-          TAG,
-          "ime connection #"
-              + (++connections)
-              + " for "
-              + focusedFieldId
-              + " type=0x"
-              + Integer.toHexString(outAttrs.inputType));
       return new ThunetInputConnection(this);
     }
 
@@ -489,9 +519,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
       @Override
       public boolean commitText(CharSequence text, int newCursorPosition) {
-        Log.d(
-            TAG,
-            "ime commit len=" + (text == null ? 0 : text.length()) + " pos=" + newCursorPosition);
         composing = "";
         Native.imeCommit(text == null ? "" : text.toString());
         return true;
@@ -499,7 +526,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
       @Override
       public boolean setComposingText(CharSequence text, int newCursorPosition) {
-        Log.d(TAG, "ime preedit len=" + (text == null ? 0 : text.length()));
         composing = text == null ? "" : text.toString();
         Native.imePreedit(composing);
         return true;
@@ -509,7 +535,6 @@ public class ThunetActivity extends android.app.NativeActivity {
       public boolean finishComposingText() {
         String pending = composing;
         composing = "";
-        Log.d(TAG, "ime finish pending=" + pending.length());
         if (pending.isEmpty()) {
           Native.imePreedit("");
         } else {
@@ -525,7 +550,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
       @Override
       public boolean deleteSurroundingText(int beforeLength, int afterLength) {
-        Log.d(TAG, "ime delete " + beforeLength + "/" + afterLength);
         if (beforeLength > 0 || afterLength > 0) {
           Native.imeDelete(beforeLength, afterLength);
         }
@@ -550,14 +574,12 @@ public class ThunetActivity extends android.app.NativeActivity {
 
       @Override
       public boolean setSelection(int start, int end) {
-        Log.d(TAG, "ime selection " + start + ".." + end);
         return true;
       }
 
       @Override
       public boolean sendKeyEvent(KeyEvent event) {
         int key = event.getKeyCode();
-        Log.d(TAG, "ime key " + key + " action=" + event.getAction());
         // A soft keyboard may delete with a key event instead of
         // `deleteSurroundingText` (Sogou does, depending on what it last
         // committed), so the two delete keys are translated here. Only the
@@ -580,7 +602,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
     @Override
     public void onProvideAutofillVirtualStructure(ViewStructure structure, int flags) {
-      Log.d(TAG, "autofill provide");
       AutofillId parent = structure.getAutofillId();
       if (parent == null) {
         return;
@@ -629,7 +650,6 @@ public class ThunetActivity extends android.app.NativeActivity {
 
     @Override
     public void autofill(SparseArray<AutofillValue> filled) {
-      Log.d(TAG, "autofill fill n=" + filled.size());
       String user = null;
       String pass = null;
       for (int i = 0; i < filled.size(); i++) {

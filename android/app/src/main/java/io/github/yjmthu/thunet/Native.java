@@ -40,4 +40,10 @@ final class Native {
 
   /** Delete this many characters before and after the cursor. */
   static native void imeDelete(int before, int after);
+
+  /**
+   * The connected Wi-Fi name in {@code files/ssid.txt} changed. The core reads
+   * the file again and re-probes instead of polling it.
+   */
+  static native void ssidChanged();
 }

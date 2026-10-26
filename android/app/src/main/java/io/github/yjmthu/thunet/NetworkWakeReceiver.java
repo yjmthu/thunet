@@ -26,9 +26,9 @@ public class NetworkWakeReceiver extends BroadcastReceiver {
                 // kept alive by its service, and "off" asked for nothing.
                 if (Wake.MODE_WAKE.equals(Wake.mode(app))) {
                   Native.ensureOnline(dir);
-                  if (!Wake.wifiAvailable(app)) {
-                    Wake.arm(app);
-                  }
+                  // The network that just woke us is up, so this normally
+                  // declines; it arms only if it has already dropped again.
+                  Wake.arm(app);
                 }
               } finally {
                 pending.finish();

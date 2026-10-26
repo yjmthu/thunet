@@ -40,6 +40,10 @@ static CAN_GO_BACK: AtomicBool = AtomicBool::new(false);
 /// Java asked for one back step; the window consumes it on its next pass.
 static BACK_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Java wrote a different Wi-Fi name to `files/ssid.txt`. The core re-reads it
+/// and re-probes on its next pass instead of polling the file every second.
+static SSID_CHANGED: AtomicBool = AtomicBool::new(false);
+
 /// IME events from the Activity's `InputConnection`: composition, commits and
 /// deletions the soft keyboard sends. Written from the Java UI thread, drained
 /// by the window on its next pass and handed to egui as `Event::Ime`.
@@ -248,6 +252,25 @@ pub extern "system" fn Java_io_github_yjmthu_thunet_Native_backPressed(
     ctx.request_repaint();
   }
   jni::sys::JNI_TRUE
+}
+
+/// `Native.ssidChanged()`: the connected Wi-Fi name changed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yjmthu_thunet_Native_ssidChanged(
+  _env: jni::JNIEnv,
+  _class: jni::objects::JClass,
+) {
+  crate::android::ssid_changed();
+}
+
+/// Record that the Wi-Fi name changed; consumed by the core's link watch.
+pub(crate) fn ssid_changed() {
+  SSID_CHANGED.store(true, Ordering::Relaxed);
+}
+
+/// Take the pending change, if any.
+pub(crate) fn take_ssid_change() -> bool {
+  SSID_CHANGED.swap(false, Ordering::Relaxed)
 }
 
 /// Publish whether the window can take a back step; called from `logic`.

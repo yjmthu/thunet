@@ -42,7 +42,7 @@ impl LoginEnv {
       LoginEnv::EnterpriseWifi(ssid) => Some(t.secure_wifi.replacen("{}", ssid, 1)),
       LoginEnv::NoNetwork => Some(t.network_unavailable.to_string()),
       LoginEnv::OtherPortal => Some(t.not_campus_network.to_string()),
-      LoginEnv::NoPortal => Some(t.no_login_needed.to_string()),
+      LoginEnv::NoPortal | LoginEnv::OtherNetwork => Some(t.no_login_needed.to_string()),
     }
   }
 }
@@ -508,6 +508,11 @@ pub struct App {
   /// session rides on is the first thing to check when it comes and goes.
   uplink: LinkKind,
   next_uplink: Instant,
+  /// The addresses this machine holds on the current link. The portal row wins
+  /// while the portal answers; these fill in on mobile data, another network,
+  /// or a campus link without a session, where the portal has nothing to say.
+  local_ip4: String,
+  local_ip6: String,
   state: State,
   info: Info,
   /// When the last status answer arrived. The turtle beside the state label
@@ -526,6 +531,14 @@ pub struct App {
   /// so the effective level is lower and the row says why.
   #[cfg(target_os = "android")]
   background_denied: bool,
+  /// The user confirmed the OEM toggles that let the wake-up survive a swipe.
+  /// They cannot be read, so this is their answer, not a guess.
+  #[cfg(target_os = "android")]
+  background_allowed: bool,
+  /// The system's battery exemption is in place. This one is readable, and it
+  /// is what decides whether the app has a background network at all.
+  #[cfg(target_os = "android")]
+  background_power: bool,
   /// The Android SSID-detection setting; without the location permission it
   /// stays off and the network probes decide.
   #[cfg(target_os = "android")]
@@ -547,6 +560,9 @@ pub struct App {
   /// Long-press detection for the log menu, and the line it marks.
   #[cfg(target_os = "android")]
   log_hold: LogHold,
+  /// Long-press detection for the status row's connect/disconnect menu.
+  #[cfg(target_os = "android")]
+  status_hold: LogHold,
   /// The failure the red banner shows. Stored as a kind rather than as words,
   /// so the banner is re-worded by a language switch instead of keeping the
   /// language it arrived in.
@@ -775,6 +791,8 @@ impl App {
       core_version_warned: false,
       uplink: crate::srun::link_kind(),
       next_uplink: Instant::now(),
+      local_ip4: String::new(),
+      local_ip6: String::new(),
       state: State::Offline,
       info: Info::default(),
       last_heartbeat: None,
@@ -785,6 +803,10 @@ impl App {
       background: crate::background::Mode::read(),
       #[cfg(target_os = "android")]
       background_denied: crate::background::denied(),
+      #[cfg(target_os = "android")]
+      background_allowed: crate::background::allowed(),
+      #[cfg(target_os = "android")]
+      background_power: crate::background::power_ok(),
       #[cfg(target_os = "android")]
       secure_detection: crate::secure_wifi::enabled(),
       #[cfg(target_os = "android")]
@@ -797,6 +819,8 @@ impl App {
       paste: PasteHold::default(),
       #[cfg(target_os = "android")]
       log_hold: LogHold::default(),
+      #[cfg(target_os = "android")]
+      status_hold: LogHold::default(),
       last_error: None,
       banner_height: 0.0,
       window_extra: 0.0,
@@ -1598,6 +1622,17 @@ impl App {
     !matches!(self.env, LoginEnv::EnterpriseWifi(_))
   }
 
+  /// Can *Disconnect* act on anything?
+  ///
+  /// The verb belongs to the portal. On a link that is not the campus portal
+  /// (mobile data, another network) or behind someone else's captive portal
+  /// there is no session of ours to end, so the button is greyed out exactly as
+  /// it is on an 802.1X network. The account form stays enabled: editing the
+  /// saved credential does not touch the portal.
+  fn can_disconnect(&self) -> bool {
+    self.portal_verbs() && !matches!(self.env, LoginEnv::OtherNetwork | LoginEnv::OtherPortal)
+  }
+
   /// Words and colour for the state line, and for the tray icon with them.
   ///
   /// One helper because the two drifted apart: the window showed "online" for
@@ -1611,6 +1646,12 @@ impl App {
       // which is the opposite of what the probe just measured.
       State::Offline if self.env == LoginEnv::NoPortal => {
         (t.online_without_portal, app_fill(State::Online))
+      }
+      // Same reading, different cause: the link is not the campus network at
+      // all (home Wi-Fi, mobile data). It is named separately so the label does
+      // not claim a campus session that never existed.
+      State::Offline if self.env == LoginEnv::OtherNetwork => {
+        (t.online_other_network, app_fill(State::Online))
       }
       State::Offline => (t.offline, app_fill(State::Offline)),
     }
@@ -1685,11 +1726,19 @@ impl App {
         self.push_log(Line::info(format!("connected to the {kind} core")));
       }
       match ev {
-        Ev::State(s) => self.state = s,
+        Ev::State(s) => {
+          if s != self.state {
+            // A new state starts a new poll cadence (15 s online, 10 s offline),
+            // so the last cycle's position cannot be carried into it: a Turtle
+            // at the old period's end would sit still until the next beat.
+            self.last_heartbeat = Some(Instant::now());
+          }
+          self.state = s;
+        }
         Ev::Info(v) => {
           self.info = info_from(&v);
-          self.last_heartbeat = Some(Instant::now());
         }
+        Ev::Beat => self.last_heartbeat = Some(Instant::now()),
         Ev::Log(line) => self.push_log(line),
         Ev::Error(e) => self.last_error = e,
         Ev::Notify { msg, kind } => {
@@ -1824,14 +1873,15 @@ impl App {
           self.banner_height = height + BANNER_GAP;
         }
 
-        ui.horizontal(|ui| {
+        let state_row = ui.horizontal(|ui| {
+          let mut state_text = None;
           if self.page == Page::Status {
             ui.label(
               egui::RichText::new("●")
                 .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
                 .size(18.0),
             );
-            ui.label(egui::RichText::new(label).size(18.0).strong());
+            state_text = Some(ui.label(egui::RichText::new(label).size(18.0).strong()));
             ui.add_space(6.0);
             status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
           } else {
@@ -1896,7 +1946,64 @@ impl App {
               }
             }
           });
+          state_text
         });
+
+        if let Some(text) = state_row.inner {
+          // Right click on a desktop, a held finger on a phone: the two verbs
+          // without hunting for the buttons at the bottom of the page. Only the
+          // state text itself is the target - the eye and gear at the other end
+          // of the row stay ordinary buttons.
+          #[cfg(target_os = "android")]
+          let held = self.status_hold.poll(ui, 0, text.rect);
+          #[cfg(not(target_os = "android"))]
+          let held = false;
+          #[cfg(target_os = "android")]
+          let armed = self.status_hold.fired();
+          #[cfg(not(target_os = "android"))]
+          let armed = false;
+          #[cfg(target_os = "android")]
+          let spot = self.status_hold.spot();
+          #[cfg(not(target_os = "android"))]
+          let spot = None;
+          let hit = text.interact(egui::Sense::click());
+          let mut menu =
+            egui::Popup::menu(&hit).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+          if hit.secondary_clicked() || hit.long_touched() || held || (armed && hit.clicked()) {
+            menu = menu.open_memory(Some(egui::SetOpenCommand::Bool(true)));
+          } else if hit.clicked() {
+            menu = menu.open_memory(Some(egui::SetOpenCommand::Bool(false)));
+          }
+          // Anchored at the press point: a lifted finger leaves no pointer to
+          // read, and the menu would be open but unpainted.
+          menu = match spot {
+            Some(pos) => menu.at_position(pos),
+            None => menu.at_pointer(),
+          };
+          let online = self.state == State::Online;
+          let blocked = self.env.blocked_reason(t);
+          let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
+          let can_connect = !online && blocked.is_none();
+          let can_disconnect = (online || wanted) && self.can_disconnect();
+          menu.show(|ui| {
+            if ui
+              .add_enabled(can_connect, egui::Button::new(t.connect))
+              .clicked()
+            {
+              self.send(Cmd::Connect);
+              self.next_core_query = Instant::now();
+              ui.close();
+            }
+            if ui
+              .add_enabled(can_disconnect, egui::Button::new(t.disconnect))
+              .clicked()
+            {
+              self.send(Cmd::Disconnect);
+              self.next_core_query = Instant::now();
+              ui.close();
+            }
+          });
+        }
 
         ui.add_space(8.0);
 
@@ -1925,15 +2032,29 @@ impl App {
               ui.label(t.link);
               ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
               ui.end_row();
+              // The portal's address while it has an answer, otherwise the one
+              // this machine holds on the current link: mobile data and other
+              // networks have no portal row, and "—" would hide the only
+              // address there is to copy.
+              let ip4 = if self.info.ip4.is_empty() {
+                self.local_ip4.clone()
+              } else {
+                self.info.ip4.clone()
+              };
+              let ip6 = if self.info.ip6.is_empty() {
+                self.local_ip6.clone()
+              } else {
+                self.info.ip6.clone()
+              };
               ui.label(t.ipv4);
-              if address_cell(ui, private_value(&self.info.ip4, self.cfg.privacy), t) {
-                crate::clipboard::copy(ui.ctx(), &self.info.ip4);
+              if address_cell(ui, private_value(&ip4, self.cfg.privacy), t) {
+                crate::clipboard::copy(ui.ctx(), &ip4);
                 self.toast_ok(t.copied.to_string());
               }
               ui.end_row();
               ui.label(t.ipv6);
-              if address_cell(ui, private_value(&self.info.ip6, self.cfg.privacy), t) {
-                crate::clipboard::copy(ui.ctx(), &self.info.ip6);
+              if address_cell(ui, private_value(&ip6, self.cfg.privacy), t) {
+                crate::clipboard::copy(ui.ctx(), &ip6);
                 self.toast_ok(t.copied.to_string());
               }
               ui.end_row();
@@ -2030,7 +2151,7 @@ impl App {
             let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
             if ui
               .add_enabled(
-                (online || wanted) && self.portal_verbs(),
+                (online || wanted) && self.can_disconnect(),
                 egui::Button::new(t.disconnect),
               )
               .on_disabled_hover_text(
@@ -2262,6 +2383,55 @@ impl App {
               )
               .wrap(),
             );
+            // Asking for this is what turns "wakes on the next Wi-Fi" into
+            // something that survives a swipe: without the exemption the ROM
+            // may force-stop the app, which cancels the registration too.
+            //
+            // The two toggles that matter on MIUI are unreadable and are not
+            // the same switch as the AOSP whitelist the dialog below changes,
+            // so the row never claims an authorisation of its own: it opens the
+            // right screens and keeps the user's confirmation.
+            if self.background != Mode::Off {
+              let mut authorize = false;
+              ui.horizontal(|ui| {
+                ui.label(t.background_power);
+                authorize = ui.button(t.background_authorize).clicked();
+              });
+              // Readable, and it is the switch the firewall follows: without it
+              // the system drops this app's packets in the background.
+              let (state, color) = if self.background_power {
+                (t.background_power_ok, ui.visuals().weak_text_color())
+              } else {
+                (t.background_power_missing, ui.visuals().warn_fg_color)
+              };
+              ui.add(egui::Label::new(egui::RichText::new(state).small().color(color)).wrap());
+              let mut allowed = self.background_allowed;
+              if ui
+                .checkbox(&mut allowed, t.background_power_check)
+                .changed()
+              {
+                self.background_allowed = allowed;
+                if let Err(e) = crate::background::set_allowed(allowed) {
+                  self.toast_err(e);
+                }
+              }
+              let hint = if self.background_allowed {
+                t.background_power_ready
+              } else {
+                t.background_power_hint
+              };
+              ui.add(
+                egui::Label::new(
+                  egui::RichText::new(hint)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+              );
+              if authorize && let Err(e) = crate::background::request_power() {
+                self.toast_err(e);
+              }
+            }
           }
           ui.add_space(2.0);
           ui.horizontal(|ui| {
@@ -2379,7 +2549,14 @@ impl App {
               if focused {
                 field_focus = Some((AutofillKind::User, resp.rect, resp.clicked()));
               }
-              self.paste_sync(ui, id, AutofillKind::User, resp.rect);
+              if credentials_live {
+                self.paste_sync(ui, id, AutofillKind::User, resp.rect);
+              } else {
+                // A disabled box is not a paste target: the form refuses the
+                // credential on this network (802.1X), so a finger resting on
+                // it must not put the clipboard into it either.
+                self.paste.forget();
+              }
             }
             if stored.username {
               unsaved_marker(ui, t);
@@ -2413,7 +2590,11 @@ impl App {
               if focused {
                 field_focus = Some((AutofillKind::Password, resp.rect, resp.clicked()));
               }
-              self.paste_sync(ui, id, AutofillKind::Password, resp.rect);
+              if credentials_live {
+                self.paste_sync(ui, id, AutofillKind::Password, resp.rect);
+              } else {
+                self.paste.forget();
+              }
             }
             if stored.password {
               unsaved_marker(ui, t);
@@ -2549,17 +2730,25 @@ impl App {
                     };
                     let text = masked_log(line.render(), &accounts, hidden);
                     let resp = ui.add(log_entry(ui, text.clone(), color));
+                    // The hold target is the whole row, glyphs or not: a short
+                    // line leaves most of the width empty, and a finger resting
+                    // on that blank part is still aiming at this line.
+                    #[cfg(target_os = "android")]
+                    let row = egui::Rect::from_min_max(
+                      egui::pos2(ui.max_rect().left(), resp.rect.top()),
+                      egui::pos2(ui.max_rect().right(), resp.rect.bottom()),
+                    );
                     // A finger on a line is tinted from the moment it lands, so
                     // the target of the long press is never a guess.
                     #[cfg(target_os = "android")]
                     let held = {
-                      let fired = self.log_hold.poll(ui, index, resp.rect);
+                      let fired = self.log_hold.poll(ui, index, row);
                       if self.log_hold.marked(index) {
                         let bg = ui.visuals().selection.bg_fill;
                         let tint =
                           egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 56);
                         ui.painter().rect_filled(
-                          resp.rect.expand(1.0),
+                          row.expand(1.0),
                           egui::CornerRadius::same(3),
                           tint,
                         );
@@ -3253,6 +3442,13 @@ impl PasteHold {
     }
     self.fired = true;
     true
+  }
+
+  /// Drop a hold in progress, e.g. because the field under the finger was
+  /// disabled while it was being held.
+  fn forget(&mut self) {
+    self.started = None;
+    self.fired = false;
   }
 }
 
@@ -4220,6 +4416,7 @@ mod tests {
       LoginEnv::NoNetwork,
       LoginEnv::OtherPortal,
       LoginEnv::NoPortal,
+      LoginEnv::OtherNetwork,
     ];
     for env in &blocked {
       assert!(!env.allows_login(), "{env:?}");
@@ -4263,6 +4460,20 @@ mod tests {
     // Online, the verdict is only worth a band where it says "nothing to do":
     // another operator's portal is not shown while a session is up.
     assert_eq!(tones(LoginEnv::OtherPortal, State::Online, None), vec![]);
+    // Direct internet behind the campus portal (the portal answers, but names
+    // no session) stays a warning: it is still the campus link, and a session
+    // is exactly what is missing.
+    assert_eq!(
+      tones(LoginEnv::NoPortal, State::Offline, None),
+      vec![BannerTone::Warn]
+    );
+    // A link that is not the campus network at all is not a warning: the
+    // machine is online, just not through the portal. Green, like 802.1X.
+    assert_eq!(
+      tones(LoginEnv::OtherNetwork, State::Offline, None),
+      vec![BannerTone::Ok]
+    );
+    assert_eq!(tones(LoginEnv::OtherNetwork, State::Online, None), vec![]);
     // An 802.1X network is amber until its session is up and green afterwards.
     let secure = || LoginEnv::EnterpriseWifi("Tsinghua-Secure".into());
     assert_eq!(
@@ -4813,6 +5024,13 @@ fn page_banners(
       LoginEnv::EnterpriseWifi(ref ssid) if state == State::Online => {
         banners.push((BannerTone::Ok, t.secure_wifi_online.replacen("{}", ssid, 1)))
       }
+      // The internet works without a portal in the way, and the link is not the
+      // campus network at all: home Wi-Fi, mobile data. Nothing to log in to is
+      // good news, so it gets the same green band as an 802.1X network instead
+      // of the amber "nothing to log in to" warning.
+      LoginEnv::OtherNetwork if state != State::Online => {
+        banners.push((BannerTone::Ok, t.online_no_portal.to_string()))
+      }
       _ if state != State::Online => {
         if let Some(why) = env.blocked_reason(t) {
           banners.push((BannerTone::Warn, why));
@@ -4956,6 +5174,9 @@ impl eframe::App for App {
       }
       // The hold's tint follows its menu, so forget the line once it closes.
       self.log_hold.clear_if_closed(egui::Popup::is_any_open(ctx));
+      self
+        .status_hold
+        .clear_if_closed(egui::Popup::is_any_open(ctx));
     }
     // The system back gesture (edge swipe, or the button) is answered by the
     // window when there is a step to take: an open menu, the switch
@@ -5211,6 +5432,14 @@ impl eframe::App for App {
     if Instant::now() >= self.next_uplink {
       self.next_uplink = Instant::now() + Duration::from_secs(2);
       self.uplink = crate::srun::link_kind();
+      // The address the machine holds on that link. Two route lookups, no
+      // packet sent; cheap enough for the same tick the link kind is read on.
+      self.local_ip4 = crate::srun::link_id()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+      self.local_ip6 = crate::srun::link_id6()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
       // The Activity rewrites the night mode when the system theme changes;
       // re-reading it on the same slow tick keeps the per-frame theme check
       // free of file access.
@@ -5222,6 +5451,8 @@ impl eframe::App for App {
       {
         self.background = crate::background::Mode::read();
         self.background_denied = crate::background::denied();
+        self.background_allowed = crate::background::allowed();
+        self.background_power = crate::background::power_ok();
         self.secure_detection = crate::secure_wifi::enabled();
       }
     }
@@ -5299,7 +5530,7 @@ impl eframe::App for App {
     }
     self.tray.set_enabled(
       self.state != State::Online && self.env.allows_login(),
-      self.state == State::Online && self.portal_verbs(),
+      self.state == State::Online && self.can_disconnect(),
     );
 
     // When hidden, wake up often enough to pick up a second launch quickly.

@@ -28,6 +28,23 @@ public class BootReceiver extends BroadcastReceiver {
     } else if (Wake.MODE_WAKE.equals(mode)) {
       Wake.scheduleBackstop(app);
       Wake.arm(app);
+      // Booting straight onto a Wi-Fi leaves nothing to arm (the shot would be
+      // consumed at once) and the backstop may be a quarter of an hour away, so
+      // sign in now. With no Wi-Fi the arm above is what covers the next join.
+      if (Wake.wifiAvailable(app)) {
+        PendingResult pending = goAsync();
+        String dir = app.getFilesDir().getAbsolutePath();
+        new Thread(
+                () -> {
+                  try {
+                    Native.ensureOnline(dir);
+                  } finally {
+                    pending.finish();
+                  }
+                },
+                "thunet-boot")
+            .start();
+      }
     }
     // Off means off: no service, no wake-up, no periodic job.
   }

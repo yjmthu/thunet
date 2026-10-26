@@ -33,6 +33,12 @@ public class ThunetApp extends Application {
     watchDefault();
     // No-op at the "off" level; idempotent otherwise.
     Wake.scheduleBackstop(this);
+    // A process started on mobile data (or by the backstop) never sees a
+    // `wifi lost`, so the one-shot has to be armed here to cover the next join.
+    // With a Wi-Fi already up this declines silently.
+    if (Wake.MODE_WAKE.equals(Wake.mode(this))) {
+      Wake.arm(this);
+    }
   }
 
   /**
@@ -94,13 +100,23 @@ public class ThunetApp extends Application {
             public void onLost(Network network) {
               Log.i(Wake.TAG, "link: wifi lost " + network);
               // Back to the system default: without this the process would stay
-              // bound to a network that no longer exists.
+              // bound to a network that no longer exists. Deliberately no
+              // `bindWifi()` here: the system can still list the network that
+              // was just lost for a moment, and re-binding to it leaves every
+              // socket (DNS included) on a dead link until the app is restarted.
+              // The next `onAvailable` binds a replacement Wi-Fi instead.
               if (network.equals(boundWifi)) {
                 manager.bindProcessToNetwork(null);
                 boundWifi = null;
-                bindWifi();
               }
-              Wake.arm(ThunetApp.this);
+              refreshLink();
+              // Not a single `arm()`: the system still lists the network that
+              // just went away, so one attempt here usually reads "a wifi is
+              // up" and leaves the app without a shot for the next join.
+              // Only the middle level acts on the shot; "off" asked for nothing.
+              if (Wake.MODE_WAKE.equals(Wake.mode(ThunetApp.this))) {
+                Wake.armSoon(ThunetApp.this);
+              }
             }
           };
       manager.registerNetworkCallback(request, wifiCallback);
@@ -126,7 +142,9 @@ public class ThunetApp extends Application {
             @Override
             public void onLost(Network network) {
               refreshLink();
-              Wake.arm(ThunetApp.this);
+              if (Wake.MODE_WAKE.equals(Wake.mode(ThunetApp.this))) {
+                Wake.arm(ThunetApp.this);
+              }
             }
           };
       manager.registerDefaultNetworkCallback(defaultCallback);
@@ -146,6 +164,13 @@ public class ThunetApp extends Application {
     // The Wi-Fi name changes with the link, and the optional SSID detection
     // must follow it; the call is a no-op without the permission.
     Ssid.update(this);
+    // A binding the system no longer knows is not a link: drop it here too, so
+    // a lost `onLost` cannot leave the row and the core describing a network
+    // that is gone.
+    if (boundWifi != null && manager.getNetworkCapabilities(boundWifi) == null) {
+      manager.bindProcessToNetwork(null);
+      boundWifi = null;
+    }
     if (boundWifi != null) {
       write("wlan");
       return;
@@ -158,6 +183,10 @@ public class ThunetApp extends Application {
       write("wlan");
     } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
       write("ethernet");
+    } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+      // The one link this app falls back to on a phone: named so the status
+      // page says "mobile data" instead of the useless "other".
+      write("mobile");
     } else {
       write("other");
     }

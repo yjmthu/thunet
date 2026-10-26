@@ -1,5 +1,6 @@
 package io.github.yjmthu.thunet;
 
+import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
@@ -7,6 +8,11 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.Log;
 import androidx.work.Constraints;
 import androidx.work.ExistingPeriodicWorkPolicy;
@@ -34,6 +40,8 @@ import java.util.concurrent.TimeUnit;
 final class Wake {
   static final String MODE_FILE = "background.txt";
   static final String DENIED_FILE = "background.denied";
+  /** The user confirmed the OEM toggles that the app cannot read. */
+  static final String ALLOWED_FILE = "background.allowed";
   static final String MODE_OFF = "off";
   static final String MODE_WAKE = "wake";
   static final String MODE_SERVICE = "service";
@@ -44,6 +52,19 @@ final class Wake {
   static final String CHANNEL = "thunet-keepalive";
   static final int NOTIFICATION_ID = 0x5448; // "TH"
   private static final String WORK = "thunet-wake";
+  /** Waits before each attempt to arm the one-shot after a Wi-Fi is lost. */
+  private static final long[] ARM_RETRY_MS = {0, 1000, 3000, 8000};
+  private static final Handler MAIN = new Handler(Looper.getMainLooper());
+
+  /** What one arming attempt did. */
+  enum Arm {
+    /** The registration is in the system and will wake us on the next join. */
+    Armed,
+    /** A matching Wi-Fi is up, so the shot has nothing left to cover. */
+    WifiUp,
+    /** The system refused the registration. */
+    Failed,
+  }
 
   private Wake() {}
 
@@ -68,6 +89,81 @@ final class Wake {
   /** True when the last request for the resident level lost the permission. */
   static boolean denied(Context context) {
     return new File(context.getFilesDir(), DENIED_FILE).exists();
+  }
+
+  /**
+   * Record the user's confirmation for the OEM toggles.
+   *
+   * MIUI's autostart and power policy have no readable state and are not the
+   * AOSP battery whitelist, so the app keeps the user's own answer instead of
+   * guessing.
+   */
+  static void setAllowed(Context context, boolean on) {
+    File marker = new File(context.getFilesDir(), ALLOWED_FILE);
+    if (on) {
+      write(context, ALLOWED_FILE, "1");
+    } else {
+      marker.delete();
+    }
+  }
+
+  /**
+   * Ask the system to exempt this app from battery optimisation.
+   *
+   * Returns false when it is already exempt (or the ROM has no such dialog), so
+   * the caller can go straight to the OEM page.
+   */
+  static boolean requestPower(Activity activity) {
+    PowerManager power = activity.getSystemService(PowerManager.class);
+    if (power == null || power.isIgnoringBatteryOptimizations(activity.getPackageName())) {
+      return false;
+    }
+    Intent intent =
+        new Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + activity.getPackageName()))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+    try {
+      activity.startActivity(intent);
+      return true;
+    } catch (Throwable error) {
+      Log.i(TAG, "background: no battery dialog: " + error);
+      return false;
+    }
+  }
+
+  /**
+   * Open where the ROM keeps the toggles this app cannot set itself: MIUI's
+   * autostart and its power policy.
+   *
+   * The OEM actions are not public API and differ by ROM, so each one is tried
+   * in turn and the app's own info page - which carries both toggles on the
+   * ROMs we know - is the last resort.
+   */
+  static void openOemSettings(Context context) {
+    String pkg = context.getPackageName();
+    for (String action :
+        new String[] {"miui.intent.action.OP_AUTO_START", "miui.intent.action.APP_PERM_EDITOR"}) {
+      Intent intent =
+          new Intent(action)
+              .addCategory(Intent.CATEGORY_DEFAULT)
+              .putExtra("extra_pkgname", pkg)
+              .putExtra("extra_package_name", pkg)
+              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      try {
+        context.startActivity(intent);
+        return;
+      } catch (Throwable ignored) {
+        // Not this ROM; try the next.
+      }
+    }
+    try {
+      context.startActivity(
+          new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg))
+              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    } catch (Throwable ignored) {
+      // Nothing left to open; the hint still says where to look.
+    }
   }
 
   static void setDenied(Context context, boolean denied) {
@@ -95,6 +191,8 @@ final class Wake {
     }
     scheduleBackstop(context);
     if (MODE_WAKE.equals(mode)) {
+      // Nothing on the system's books yet: arm now if there is no Wi-Fi to
+      // cover. `onLost` is what re-arms after the network goes away.
       arm(context);
     }
   }
@@ -125,24 +223,62 @@ final class Wake {
   /**
    * Arm the one-shot wake-up, but only while no matching Wi-Fi is available.
    *
-   * Android spends a {@code PendingIntent} registration on the first
-   * availability and refuses every later one, so arming while the network is
-   * already up burns the shot.
+   * Measured on a phone (Android 16, `dumpsys connectivity`): a registration
+   * made while the network is already up is delivered immediately - the
+   * broadcast arrives within the same second - and the system releases the
+   * request about five seconds later (`RELEASE ... to trigger PendingIntent`).
+   * Keeping one armed permanently is therefore impossible: it would fire at
+   * once, be released, and re-registering would just repeat that in a loop
+   * instead of covering the next join.
    */
-  static void arm(Context context) {
+  static Arm arm(Context context) {
     if (wifiAvailable(context)) {
-      return;
+      return Arm.WifiUp;
     }
     ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
     if (manager == null) {
-      return;
+      return Arm.Failed;
     }
     try {
       manager.registerNetworkCallback(request(), wakeIntent(context));
       Log.i(TAG, "wake: one-shot armed");
-    } catch (Throwable ignored) {
+      return Arm.Armed;
+    } catch (Throwable error) {
       // Too many registrations or a refused request: the backstop still runs.
+      Log.i(TAG, "wake: arm failed: " + error);
+      return Arm.Failed;
     }
+  }
+
+  /**
+   * Arm once the Wi-Fi that just went away has left the system's network list.
+   *
+   * `onLost` runs while the system still lists the network, so a single attempt
+   * there reads {@link #wifiAvailable} as true and silently leaves the app
+   * without its one-shot; the next join is then noticed only by the 15-minute
+   * backstop. Retrying is what makes "drop the Wi-Fi, kill the app, rejoin"
+   * work instead of being a coin toss.
+   */
+  static void armSoon(Context context) {
+    armAttempt(context.getApplicationContext(), 0);
+  }
+
+  private static void armAttempt(Context context, int step) {
+    if (step == ARM_RETRY_MS.length) {
+      Log.i(TAG, "wake: not armed: a wifi network is still listed");
+      return;
+    }
+    MAIN.postDelayed(
+        () -> {
+          switch (arm(context)) {
+            case Armed, Failed -> {}
+            case WifiUp -> {
+              Log.i(TAG, "wake: wifi still listed, retrying");
+              armAttempt(context, step + 1);
+            }
+          }
+        },
+        ARM_RETRY_MS[step]);
   }
 
   /** Drop the one-shot when the level no longer wants it. */

@@ -61,6 +61,14 @@ pub fn call_bool(method: &str, value: bool) -> Result<(), String> {
   })
 }
 
+/// Call `ThunetActivity.<method>() -> boolean`.
+pub fn call_bool_get(method: &str) -> Result<bool, String> {
+  with_env(|env, activity| {
+    let value = env.call_method(activity, method, "()Z", &[])?;
+    Ok(value.z().unwrap_or(false))
+  })
+}
+
 /// Tell the Activity which credential field has the focus, where it sits (in
 /// physical pixels) and what it holds. This is what opens the autofill
 /// dropdown for a field that only exists on the egui surface.

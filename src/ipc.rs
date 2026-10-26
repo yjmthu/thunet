@@ -250,7 +250,12 @@ impl Hub {
       Ev::Log(line) => crate::diag::line(&line.render()),
       // Replies to one-off requests belong to the client that asked; they are
       // not part of the state a late frontend needs.
-      Ev::Notify { .. } | Ev::Status(_) | Ev::Core(_) | Ev::Credentials(_) | Ev::AcId(_) => {}
+      Ev::Notify { .. }
+      | Ev::Beat
+      | Ev::Status(_)
+      | Ev::Core(_)
+      | Ev::Credentials(_)
+      | Ev::AcId(_) => {}
     }
     // Only log lines are replayed: a toast belongs to the action that raised
     // it, and replaying one to a fresh frontend would look like news.

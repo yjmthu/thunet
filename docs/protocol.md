@@ -38,7 +38,7 @@ Two shortcuts are applied first:
 Two local facts only ever *upgrade* the "nothing answers" case, where the login is the only way forward:
 
 - **Campus SSID.** Every other `Tsinghua…` SSID (`Tsinghua`, `Tsinghua-IPv4`) keeps the portal, so the name makes a login meaningful there. The name is read from `netsh`, or from the connected network profiles when `netsh` is refused.
-- **The portal knows this address.** `/cgi-bin/rad_user_info` reports the caller's own address (`client_ip`). On the campus network it equals the address this machine holds on its default route, because nothing is NATed in between; from any other network the two differ. That separates "the campus gateway just is not intercepting" from "this is not our network at all", so a hotel Wi-Fi never gets a login attempt.
+- **The portal knows this address.** `/cgi-bin/rad_user_info` reports the caller's own address — as `client_ip` on the older answers and as `online_ip` on the current portal, which has no `client_ip` field at all. On the campus network it equals the address this machine holds on its default route, because nothing is NATed in between; from any other network the two differ. That separates "the campus gateway just is not intercepting" from "this is not our network at all", so a hotel Wi-Fi never gets a login attempt.
 
 A link that already reaches the internet is **not** upgraded, even when the name says campus: there is nothing to log in to, and `ac_id` is per access network — an id borrowed from the link this machine came from makes the portal answer `E2808` or `INFO failed, BAS respond timeout`. Those two answers are classified as "this `ac_id` cannot be used here", which stops the retry loop instead of hammering the portal (see §10).
 

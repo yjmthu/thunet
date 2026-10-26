@@ -130,6 +130,25 @@ pub struct Texts {
   /// was refused, so the effective level is "network changes".
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
   pub background_denied: &'static str,
+  /// Android: the battery-optimisation exemption that lets the wake-up survive
+  /// a swipe on ROMs that otherwise force-stop the app.
+  ///
+  /// The OEM toggles behind it are unreadable, so the row states only what the
+  /// user confirms; it never claims an authorisation it cannot see.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_ok: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_missing: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_authorize: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_check: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_hint: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_power_ready: &'static str,
   /// Connect was pressed while no account/password is available at all.
   pub no_credentials: &'static str,
   /// Prefix of the compile-time stamp next to the version.
@@ -181,6 +200,8 @@ pub struct Texts {
   pub link: &'static str,
   pub link_ethernet: &'static str,
   pub link_wlan: &'static str,
+  pub link_mobile: &'static str,
+  pub link_usb: &'static str,
   pub link_none: &'static str,
   pub link_other: &'static str,
   /// Tooltip of the heartbeat ring beside the state label.
@@ -233,6 +254,10 @@ pub struct Texts {
   pub ac_unreachable: &'static str,
   /// State label: the link reaches the internet without a portal session.
   pub online_without_portal: &'static str,
+  /// State label: the link is not the campus network at all.
+  pub online_other_network: &'static str,
+  /// Status banner: that other network needs no login, and that is good news.
+  pub online_no_portal: &'static str,
   pub refresh_failed: &'static str,
   pub disconnect_failed: &'static str,
   pub autostart_failed: &'static str,
@@ -283,6 +308,8 @@ impl crate::proto::LinkKind {
       LinkKind::None => t.link_none,
       LinkKind::Ethernet => t.link_ethernet,
       LinkKind::Wlan => t.link_wlan,
+      LinkKind::Mobile => t.link_mobile,
+      LinkKind::Usb => t.link_usb,
       LinkKind::Other => t.link_other,
     }
   }
@@ -337,6 +364,13 @@ static ZH: Texts = Texts {
   background_wake_hint: "Wi-Fi 变化时唤醒并登录（无通知）；其余情况由 15 分钟一次的后台任务兜底。",
   background_service_hint: "前台服务 + 静默通知：划掉任务后会话仍在线，并在开机时自动启动。",
   background_denied: "常驻后台需要通知权限；当前按“网络变化”运行。",
+  background_power: "允许后台唤醒",
+  background_power_ok: "系统电量限制已解除",
+  background_power_missing: "系统电量限制未解除：后台网络会被封锁",
+  background_authorize: "去设置",
+  background_power_check: "已在系统设置中开启自启动、省电策略设为“无限制”",
+  background_power_hint: "未解除时系统会封锁后台网络，唤醒后也登录不了；另需在系统设置里打开“自启动”。",
+  background_power_ready: "划掉应用后，下次连上 Wi-Fi 仍会被唤醒。",
   no_credentials: "没有可用的账号或密码",
   built: "构建于",
   on: "已开启",
@@ -368,12 +402,16 @@ static ZH: Texts = Texts {
   lang_en: "English",
   online: "在线",
   online_without_portal: "已联网（未登录）",
+  online_other_network: "在线（其他网络）",
+  online_no_portal: "当前网络不是校园网，可直接上网，无需门户登录",
   authenticating: "认证中",
   offline: "离线",
   account: "账号",
   link: "网络",
   link_ethernet: "以太网",
   link_wlan: "WLAN",
+  link_mobile: "移动数据",
+  link_usb: "USB 共享",
   link_none: "未连接",
   link_other: "其他",
   heartbeat_hint: "在线每 15 秒、离线每 10 秒查询一次门户状态",
@@ -468,6 +506,13 @@ static EN: Texts = Texts {
   background_wake_hint: "Wakes on a Wi-Fi change and signs in, with no notification; a 15-minute job covers the rest.",
   background_service_hint: "A foreground service with a silent notification: the session survives a swipe and starts at boot.",
   background_denied: "Resident needs the notification permission; running on Wi-Fi change instead.",
+  background_power: "Background wake-up",
+  background_power_ok: "Battery restriction lifted",
+  background_power_missing: "Battery restriction in place: background network is blocked",
+  background_authorize: "Open settings",
+  background_power_check: "Autostart is on and the power policy is unrestricted",
+  background_power_hint: "While the restriction is in place the system blocks this app's background network, so a wake-up cannot sign in; autostart has to be allowed as well.",
+  background_power_ready: "A swiped-away app is still woken on the next Wi-Fi.",
   no_credentials: "No account or password saved",
   built: "Built at",
   on: "On",
@@ -499,12 +544,16 @@ static EN: Texts = Texts {
   lang_en: "English",
   online: "Online",
   online_without_portal: "Online (unauthenticated)",
+  online_other_network: "Online (other network)",
+  online_no_portal: "This is not the campus network; the internet works directly, so no portal login is needed",
   authenticating: "Authenticating",
   offline: "Offline",
   account: "Account",
   link: "Link",
   link_ethernet: "Ethernet",
   link_wlan: "WLAN",
+  link_mobile: "Mobile data",
+  link_usb: "USB tethering",
   link_none: "No link",
   link_other: "Other",
   heartbeat_hint: "Portal status is polled every 15 s online and 10 s offline",

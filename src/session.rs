@@ -62,7 +62,11 @@ fn error_msg(v: &serde_json::Value) -> String {
 #[allow(dead_code)] // some accessors are consumed only by the tray/UI layer
 impl Session {
   pub fn new(mut cfg: Config) -> Self {
-    let client = Client::new(&cfg.host, cfg.https, Duration::from_secs(5));
+    // Three seconds: a portal poll that has not answered by then is treated as
+    // silent, and waiting any longer only holds up the core's own loop. Logins
+    // use `LOGIN_TIMEOUT` instead (see `Client::new`), so the challenge round
+    // trip is not cut short by this.
+    let client = Client::new(&cfg.host, cfg.https, Duration::from_secs(3));
     // `auto` must be resolved once: the AC id changes with the network.
     let auto_ac = cfg.ac_id.is_empty() || cfg.ac_id == "auto";
     let mut warnings = Vec::new();

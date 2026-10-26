@@ -110,6 +110,11 @@ impl NetError {
           // WSAECONNABORTED / WSAECONNRESET.
           Some(10053 | 10054) => NetCause::Lost,
           Some(10049 | 10050 | 10051 | 10065) => NetCause::Unreachable,
+          // Android (bionic) hands `getaddrinfo` failures over as an
+          // uncategorized error with no errno, so the wording is the only
+          // signal left. Without this a blocked background network - which the
+          // system reports exactly this way - looked like a rejected login.
+          _ if looks_unresolved(&io.to_string()) => NetCause::Resolve,
           _ => NetCause::Other,
         },
       },
@@ -126,6 +131,25 @@ impl std::fmt::Display for NetError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str(&self.detail)
   }
+}
+
+/// Does this OS error text mean the name could not be resolved?
+///
+/// Only Android and macOS need it: Linux reports `EAI_AGAIN`/`EAI_NONAME` as
+/// plain `io::Error`s too, and bionic gives them no errno at all, so the message
+/// is all there is. It is worth the substring test because a blocked background
+/// network on a phone arrives exactly this way.
+fn looks_unresolved(text: &str) -> bool {
+  let text = text.to_ascii_lowercase();
+  [
+    "lookup address information",
+    "no address associated",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+  ]
+  .iter()
+  .any(|needle| text.contains(needle))
 }
 
 #[derive(Debug)]
@@ -398,7 +422,12 @@ impl Client {
     let url = self.url("/cgi-bin/rad_user_info", &[]);
     let body = self.get(&url).ok()?;
     let v = Self::jsonp(&body).ok()?;
+    // The portal speaks two shapes: the older answers carry `client_ip`, the
+    // current one reports the same address as `online_ip` (and has no
+    // `client_ip` at all). Reading only the former made every campus link look
+    // like "another network" on the real portal.
     v.get("client_ip")
+      .or_else(|| v.get("online_ip"))
       .and_then(Value::as_str)
       .filter(|ip| !ip.trim().is_empty())
       .map(|ip| ip.trim().to_string())
@@ -821,6 +850,20 @@ pub fn link_up() -> bool {
   link_id().is_some()
 }
 
+/// The IPv6 counterpart of [`link_id`].
+///
+/// The same route-lookup trick, aimed at a public v6 host: the address the
+/// kernel would send from is the one this machine holds on the link. `None`
+/// when there is no v6 route at all (an IPv4-only network).
+pub fn link_id6() -> Option<std::net::Ipv6Addr> {
+  let socket = std::net::UdpSocket::bind("[::]:0").ok()?;
+  socket.connect("[2400:3200::1]:53").ok()?;
+  match socket.local_addr().ok()?.ip() {
+    std::net::IpAddr::V6(addr) => Some(addr),
+    std::net::IpAddr::V4(_) => None,
+  }
+}
+
 /// Which kind of link carries that route: a cable, Wi-Fi, or neither.
 ///
 /// The window shows it next to the account, because a laptop can have both a
@@ -882,9 +925,12 @@ mod link_imp {
   const MAX_LIST_BYTES: u32 = 4 * 1024 * 1024;
 
   pub fn link_kind() -> LinkKind {
-    match best_index().and_then(if_type) {
-      Some(IF_TYPE_ETHERNET_CSMACD) => LinkKind::Ethernet,
-      Some(IF_TYPE_IEEE80211) => LinkKind::Wlan,
+    match best_index().and_then(adapter_info) {
+      // A phone sharing its connection over USB is an ordinary Ethernet
+      // adapter to Windows; only its driver description says otherwise.
+      Some((IF_TYPE_ETHERNET_CSMACD, true)) => LinkKind::Usb,
+      Some((IF_TYPE_ETHERNET_CSMACD, false)) => LinkKind::Ethernet,
+      Some((IF_TYPE_IEEE80211, _)) => LinkKind::Wlan,
       // A route that exists but belongs to some other adapter (a tunnel, a
       // virtual switch) still is not "no link".
       Some(_) => LinkKind::Other,
@@ -913,9 +959,10 @@ mod link_imp {
     (rc == 0 && index != 0).then_some(index)
   }
 
-  /// `IfType` of the adapter with that index, or `None` when the list cannot be
-  /// read (which is a different case from "not found" only for the log).
-  fn if_type(index: u32) -> Option<u32> {
+  /// `IfType` of the adapter with that index and whether it is a phone on the
+  /// end of a USB cable, or `None` when the list cannot be read (which is a
+  /// different case from "not found" only for the log).
+  fn adapter_info(index: u32) -> Option<(u32, bool)> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut size = 16 * 1024u32;
     loop {
@@ -940,12 +987,43 @@ mod link_imp {
         let adapter = unsafe { &*entry };
         let this = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
         if this == index {
-          return Some(adapter.IfType);
+          return Some((adapter.IfType, is_tethered(&description(adapter))));
         }
         entry = adapter.Next;
       }
       return None;
     }
+  }
+
+  /// The driver's own name for the adapter, as a NUL-terminated wide string.
+  fn description(adapter: &IP_ADAPTER_ADDRESSES_LH) -> String {
+    let ptr = adapter.Description;
+    if ptr.is_null() {
+      return String::new();
+    }
+    let mut len = 0usize;
+    unsafe {
+      while *ptr.add(len) != 0 {
+        len += 1;
+      }
+      String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+  }
+
+  /// Names the tethering drivers use: RNDIS/NDIS generally, and the phone
+  /// vendors' own Ethernet-over-USB entries. A plain USB Ethernet dongle is
+  /// deliberately not matched - it is not a phone.
+  fn is_tethered(description: &str) -> bool {
+    let name = description.to_ascii_lowercase();
+    [
+      "ndis",
+      "tethering",
+      "iphone",
+      "android",
+      "apple mobile device",
+    ]
+    .iter()
+    .any(|key| name.contains(key))
   }
 }
 
@@ -965,10 +1043,51 @@ mod link_imp {
       return LinkKind::Wlan;
     }
     match std::fs::read_to_string(sys.join("type")) {
-      // ARPHRD_ETHER is what a wired NIC reports; a tunnel reports 65534.
-      Ok(kind) if kind.trim() == "1" => LinkKind::Ethernet,
+      // ARPHRD_ETHER is what a wired NIC reports; a tunnel reports 65534. A
+      // phone sharing its connection over USB shows up as an ordinary
+      // Ethernet adapter, and only sysfs knows that the adapter hangs off a
+      // USB bus.
+      Ok(kind) if kind.trim() == "1" => {
+        if usb_backed(&sys) {
+          LinkKind::Usb
+        } else {
+          LinkKind::Ethernet
+        }
+      }
       Ok(_) => LinkKind::Other,
       Err(_) => LinkKind::Other,
+    }
+  }
+
+  /// Is this interface attached over USB?
+  ///
+  /// `device` points at the parent device in sysfs; a USB function's path runs
+  /// through a `usbN` hub (`.../usb1/1-2/1-2:1.0`), while an onboard NIC stops
+  /// at its PCI function.
+  fn usb_backed(sys: &std::path::Path) -> bool {
+    std::fs::read_link(sys.join("device"))
+      .map(|path| usb_target(&path))
+      .unwrap_or(false)
+  }
+
+  /// The rule itself, without the file system: a parent under a USB hub.
+  fn usb_target(path: &std::path::Path) -> bool {
+    path.to_string_lossy().contains("/usb")
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::usb_target;
+    use std::path::Path;
+
+    #[test]
+    fn a_device_path_through_usb_is_tethered() {
+      assert!(usb_target(Path::new(
+        "../../devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0"
+      )));
+      assert!(!usb_target(Path::new(
+        "../../devices/pci0000:00/0000:00:1f.6"
+      )));
     }
   }
 }
@@ -987,6 +1106,8 @@ mod link_imp {
       Ok(text) => match text.trim() {
         "wlan" => LinkKind::Wlan,
         "ethernet" => LinkKind::Ethernet,
+        "mobile" => LinkKind::Mobile,
+        "usb" => LinkKind::Usb,
         "other" => LinkKind::Other,
         "none" => LinkKind::None,
         // A word this build does not know: fall through to the route check
@@ -1087,6 +1208,17 @@ fn expanded_device_detail(value: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_lookup_failure_without_an_errno_is_a_resolve_failure() {
+    // What bionic says when the system blocks this app's DNS, and what glibc
+    // says for the same thing on a desktop.
+    assert!(looks_unresolved(
+      "failed to lookup address information: No address associated with hostname"
+    ));
+    assert!(looks_unresolved("Temporary failure in name resolution"));
+    assert!(!looks_unresolved("Connection reset by peer"));
+  }
 
   #[test]
   fn ac_id_scrape() {
