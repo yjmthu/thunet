@@ -394,7 +394,11 @@ fn human_uptime(secs: u64) -> String {
 
 fn level_color(level: Level, visuals: &egui::Visuals) -> egui::Color32 {
   match level {
-    Level::Debug => egui::Color32::from_gray(135),
+    // `gray(135)` sat within five levels of the dark theme's body text
+    // (`gray(140)`), so debug looked like info. The theme's own weak colour is
+    // dimmer than the body text in both themes, which is the point of the
+    // level.
+    Level::Debug => visuals.weak_text_color(),
     Level::Info => visuals.text_color(),
     Level::Warn => egui::Color32::from_rgb(216, 160, 48),
     Level::Error => egui::Color32::from_rgb(228, 112, 112),
