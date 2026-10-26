@@ -248,7 +248,7 @@ jobs:
   # Release carries `arm64-v8a` only (`android/app/build.gradle`), so the Rust side
   # builds just `aarch64-linux-android`.
   android-apk:
-    name: APK, arm64, unsigned
+    name: APK, arm64
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
