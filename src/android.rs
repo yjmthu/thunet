@@ -143,7 +143,12 @@ pub extern "system" fn Java_io_github_yjmthu_thunet_Native_startCore(
   }
 }
 
-/// `Native.disconnect(dir)`: ask the running core to log out.
+/// `Native.disconnect(dir)`: ask the running core to log out, or do it here.
+///
+/// A launcher shortcut, or the notification's action, can arrive when no core
+/// is running - the portable core lives in the window's process - so the same
+/// one-shot pattern `ensureOnline` uses applies: prefer the core, otherwise
+/// send a single logout request.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_yjmthu_thunet_Native_disconnect(
   mut env: jni::JNIEnv,
@@ -154,12 +159,33 @@ pub extern "system" fn Java_io_github_yjmthu_thunet_Native_disconnect(
     return 2;
   };
   prepare(&dir);
-  match crate::ipc::open() {
-    Some(link) => {
-      link.send(crate::proto::Cmd::Disconnect);
+  logout()
+}
+
+fn logout() -> i32 {
+  let _guard = LOGIN
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(link) = crate::ipc::open() {
+    link.send(crate::proto::Cmd::Disconnect);
+    crate::diag::line("logout: asked the running core to disconnect");
+    return 0;
+  }
+  let cfg = crate::config::Config::load();
+  if cfg.username.trim().is_empty() {
+    crate::diag::line("logout: no account to log out");
+    return 1;
+  }
+  let mut session = crate::session::Session::new(cfg);
+  match session.logout() {
+    Ok(msg) => {
+      crate::diag::line(&format!("logout: {msg}"));
       0
     }
-    None => 1,
+    Err(err) => {
+      crate::diag::line(&format!("logout: failed: {err}"));
+      1
+    }
   }
 }
 

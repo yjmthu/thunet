@@ -25,6 +25,7 @@ import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.Toast;
 import android.window.OnBackInvokedDispatcher;
 
 /**
@@ -63,8 +64,28 @@ public class ThunetActivity extends android.app.NativeActivity {
    */
   private boolean openOemAfterPower;
 
+  /**
+   * Set by the first window this process hosted.
+   *
+   * winit's event loop can only be created once per process, so a second
+   * Activity gets a surface but no loop and stays on the splash screen forever.
+   * That is what a grey, empty window is; leaving is better than pretending.
+   */
+  private static boolean windowHosted;
+
   @Override
   protected void onCreate(Bundle savedInstanceState) {
+    if (windowHosted) {
+      super.onCreate(savedInstanceState);
+      Toast.makeText(this, R.string.window_restart, Toast.LENGTH_SHORT).show();
+      finishAndRemoveTask();
+      // The core may still be alive in this process, but nothing can draw here
+      // again; a fresh launch gets a new process and a working window.
+      new android.os.Handler(android.os.Looper.getMainLooper())
+          .postDelayed(() -> Runtime.getRuntime().exit(0), 400);
+      return;
+    }
+    windowHosted = true;
     getWindow().getDecorView().setOnApplyWindowInsetsListener((view, insets) -> {
       int bars = WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout();
       write(

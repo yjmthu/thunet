@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="shortcut_connect">连接</string>
+  <string name="shortcut_disconnect">断开</string>
+  <string name="shortcut_connected">已连接</string>
+  <string name="shortcut_disconnected">已断开</string>
+  <string name="shortcut_failed">没有变化，打开 THUnet 查看原因</string>
+  <string name="window_restart">正在重新打开 THUnet</string>
+</resources>

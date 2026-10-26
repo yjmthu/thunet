@@ -185,7 +185,7 @@ Under *Wi-Fi change* and *Resident* sits one more row, **Allow background wake-u
 - **Secure detection.** Off by default, next to *Hide private info*: it reads the Wi-Fi name to recognise `Tsinghua-Secure` and skip the portal. A Wi-Fi name needs the location permission, which the switch asks for; without it the app simply falls back to the network probes.
 - **Password managers.** The account and password fields are drawn by the app, but they are registered with Android's autofill support, so Bitwarden and others offer to fill them and to save a new pair.
 - **Battery savers.** Some vendors (MIUI, EMUI, ColorOS …) stop background apps aggressively, and by default also cut their background network. *Wi-Fi change* and *Resident* only work once the battery restriction is lifted from the row above and autostart is allowed; *Force stop* always wins until you open the app again.
-- **Quick menu.** Hold the *online/offline* line on the status page (on a phone) or right-click it (desktop): the menu offers **Connect / Disconnect**, enabled under the same conditions as the buttons below.
+- **Launcher shortcuts.** Long-press the THUnet icon on the home screen to pick **Connect** or **Disconnect** without opening the window: a toast reports the outcome, and the request is served even when the app is not running.
 - **Updates.** Download the new APK and tap it over the old one: settings and the saved password are kept, as long as the signing key is the same. A debug build and a release build use different keys, so switching between them means uninstalling first.
 - **One file per phone.** Releases are `arm64-v8a` only; older 32-bit phones cannot install them.
 

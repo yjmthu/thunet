@@ -28,14 +28,34 @@
       android:name=".ThunetActivity"
       android:exported="true"
       android:configChanges="orientation|keyboardHidden|screenSize|uiMode"
+      android:launchMode="singleTask"
+      android:alwaysRetainTaskState="true"
       android:windowSoftInputMode="adjustResize"
       android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
       <meta-data android:name="android.app.lib_name" android:value="thunet" />
+      <meta-data
+          android:name="android.app.shortcuts"
+          android:resource="@xml/shortcuts" />
       <intent-filter>
         <action android:name="android.intent.action.MAIN" />
         <category android:name="android.intent.category.LAUNCHER" />
       </intent-filter>
     </activity>
+
+    <!-- The launcher can only start an Activity, so the two long-press
+         shortcuts land here: it signs in or out and finishes, without opening
+         the window.
+         Its own process and its own task on purpose: a window cannot be hosted
+         twice in one process, so this Activity must never share the process (or
+         the task) of the real window. -->
+    <activity
+      android:name=".ShortcutActivity"
+      android:exported="true"
+      android:excludeFromRecents="true"
+      android:noHistory="true"
+      android:process=":shortcut"
+      android:taskAffinity="io.github.yjmthu.thunet.shortcut"
+      android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
     <!-- `specialUse` has no daily quota; `dataSync` would hit the Android 15
          six-hour cap. The subtype is what the Play policy would read. -->

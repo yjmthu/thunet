@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long-press shortcuts on the launcher icon. Each one starts the translucent
+     ShortcutActivity, which signs in or out and finishes without opening the
+     window. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+  <shortcut
+      android:enabled="true"
+      android:icon="@drawable/ic_shortcut_connect"
+      android:shortcutId="connect"
+      android:shortcutLongLabel="@string/shortcut_connect"
+      android:shortcutShortLabel="@string/shortcut_connect">
+    <intent
+        android:action="io.github.yjmthu.thunet.shortcut.CONNECT"
+        android:targetClass="io.github.yjmthu.thunet.ShortcutActivity"
+        android:targetPackage="io.github.yjmthu.thunet" />
+  </shortcut>
+  <shortcut
+      android:enabled="true"
+      android:icon="@drawable/ic_shortcut_disconnect"
+      android:shortcutId="disconnect"
+      android:shortcutLongLabel="@string/shortcut_disconnect"
+      android:shortcutShortLabel="@string/shortcut_disconnect">
+    <intent
+        android:action="io.github.yjmthu.thunet.shortcut.DISCONNECT"
+        android:targetClass="io.github.yjmthu.thunet.ShortcutActivity"
+        android:targetPackage="io.github.yjmthu.thunet" />
+  </shortcut>
+</shortcuts>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="shortcut_connect">Connect</string>
+  <string name="shortcut_disconnect">Disconnect</string>
+  <string name="shortcut_connected">Signed in</string>
+  <string name="shortcut_disconnected">Signed out</string>
+  <string name="shortcut_failed">Nothing changed; open THUnet for details</string>
+  <string name="window_restart">Reopening THUnet</string>
+</resources>

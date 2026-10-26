@@ -447,6 +447,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     while let Ok(c) = rx.try_recv() {
       match c {
         Cmd::Connect => {
+          tx.send(Ev::Log(Line::debug("intent: online by request")))
+            .ok();
           // A manual connect is the user's intent whatever state the machine is
           // in, and it is what lifts a rejected password.
           want_online = true;
@@ -484,6 +486,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           }
         }
         Cmd::Disconnect => {
+          tx.send(Ev::Log(Line::debug("intent: offline by request")))
+            .ok();
           // The session on an 802.1X network belongs to the OS; ending the
           // portal's copy of it is a change this app has no business making,
           // whether the request comes from the window or from `thunet logout`.
@@ -773,6 +777,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             // so it sets the intent regardless of `auto_connect`; the startup
             // window is not needed either, since this is a manual attempt.
             if ready && session.state != State::Online {
+              tx.send(Ev::Log(Line::debug("intent: online by credentials")))
+                .ok();
               want_online = true;
               next_attempt = Instant::now();
               failures = 0;

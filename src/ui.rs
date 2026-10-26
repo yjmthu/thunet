@@ -560,9 +560,6 @@ pub struct App {
   /// Long-press detection for the log menu, and the line it marks.
   #[cfg(target_os = "android")]
   log_hold: LogHold,
-  /// Long-press detection for the status row's connect/disconnect menu.
-  #[cfg(target_os = "android")]
-  status_hold: LogHold,
   /// The failure the red banner shows. Stored as a kind rather than as words,
   /// so the banner is re-worded by a language switch instead of keeping the
   /// language it arrived in.
@@ -819,8 +816,6 @@ impl App {
       paste: PasteHold::default(),
       #[cfg(target_os = "android")]
       log_hold: LogHold::default(),
-      #[cfg(target_os = "android")]
-      status_hold: LogHold::default(),
       last_error: None,
       banner_height: 0.0,
       window_extra: 0.0,
@@ -1873,15 +1868,14 @@ impl App {
           self.banner_height = height + BANNER_GAP;
         }
 
-        let state_row = ui.horizontal(|ui| {
-          let mut state_text = None;
+        ui.horizontal(|ui| {
           if self.page == Page::Status {
             ui.label(
               egui::RichText::new("●")
                 .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
                 .size(18.0),
             );
-            state_text = Some(ui.label(egui::RichText::new(label).size(18.0).strong()));
+            ui.label(egui::RichText::new(label).size(18.0).strong());
             ui.add_space(6.0);
             status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
           } else {
@@ -1946,64 +1940,7 @@ impl App {
               }
             }
           });
-          state_text
         });
-
-        if let Some(text) = state_row.inner {
-          // Right click on a desktop, a held finger on a phone: the two verbs
-          // without hunting for the buttons at the bottom of the page. Only the
-          // state text itself is the target - the eye and gear at the other end
-          // of the row stay ordinary buttons.
-          #[cfg(target_os = "android")]
-          let held = self.status_hold.poll(ui, 0, text.rect);
-          #[cfg(not(target_os = "android"))]
-          let held = false;
-          #[cfg(target_os = "android")]
-          let armed = self.status_hold.fired();
-          #[cfg(not(target_os = "android"))]
-          let armed = false;
-          #[cfg(target_os = "android")]
-          let spot = self.status_hold.spot();
-          #[cfg(not(target_os = "android"))]
-          let spot = None;
-          let hit = text.interact(egui::Sense::click());
-          let mut menu =
-            egui::Popup::menu(&hit).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-          if hit.secondary_clicked() || hit.long_touched() || held || (armed && hit.clicked()) {
-            menu = menu.open_memory(Some(egui::SetOpenCommand::Bool(true)));
-          } else if hit.clicked() {
-            menu = menu.open_memory(Some(egui::SetOpenCommand::Bool(false)));
-          }
-          // Anchored at the press point: a lifted finger leaves no pointer to
-          // read, and the menu would be open but unpainted.
-          menu = match spot {
-            Some(pos) => menu.at_position(pos),
-            None => menu.at_pointer(),
-          };
-          let online = self.state == State::Online;
-          let blocked = self.env.blocked_reason(t);
-          let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
-          let can_connect = !online && blocked.is_none();
-          let can_disconnect = (online || wanted) && self.can_disconnect();
-          menu.show(|ui| {
-            if ui
-              .add_enabled(can_connect, egui::Button::new(t.connect))
-              .clicked()
-            {
-              self.send(Cmd::Connect);
-              self.next_core_query = Instant::now();
-              ui.close();
-            }
-            if ui
-              .add_enabled(can_disconnect, egui::Button::new(t.disconnect))
-              .clicked()
-            {
-              self.send(Cmd::Disconnect);
-              self.next_core_query = Instant::now();
-              ui.close();
-            }
-          });
-        }
 
         ui.add_space(8.0);
 
@@ -2145,15 +2082,14 @@ impl App {
               // drawn from it: ask before the 30 s round is due.
               self.next_core_query = Instant::now();
             }
-            // A core that still wants to be online is trying or waiting: this
-            // button is how the user calls that off, so it has to work while
-            // the machine is offline too.
-            let wanted = self.core.as_ref().is_some_and(|c| c.wanted_online);
+            // A core that still wants to be online is trying or waiting: while a
+            // login attempt is in flight the state is *Authenticating* and this
+            // button calls it off. Between attempts the page says *Offline*, and
+            // there is no session to end - leaving the button lit there read as
+            // "both verbs are available with nothing connected".
+            let can_stop = can_stop(self.state, self.can_disconnect());
             if ui
-              .add_enabled(
-                (online || wanted) && self.can_disconnect(),
-                egui::Button::new(t.disconnect),
-              )
+              .add_enabled(can_stop, egui::Button::new(t.disconnect))
               .on_disabled_hover_text(
                 self
                   .env
@@ -3000,6 +2936,32 @@ struct DevicesLayout {
   grid: f32,
 }
 
+/// How tall the rows inside the device dialog may be.
+///
+/// A desktop window is short, so a fixed cap is right there. A phone is tall and
+/// portrait: most of the modal, but never the whole screen, so the page behind
+/// still shows around it. The screen height is passed in rather than read from
+/// the dialog, because a modal lays its content out with the size that content
+/// had last frame - a fraction of that is a feedback loop, not a measurement.
+fn devices_scroll_max(screen_h: f32, phone: bool) -> f32 {
+  if phone {
+    (screen_h * 0.6).clamp(DEVICES_SCROLL_MAX, 620.0)
+  } else {
+    DEVICES_SCROLL_MAX
+  }
+}
+
+/// May the *Disconnect* button act right now?
+///
+/// Only a state above *Offline* has a session to end. The core's intent flag is
+/// deliberately not part of this: while an automatic attempt is between retries
+/// the page says *Offline*, and a lit-up *Disconnect* there looked like "both
+/// verbs are available with nothing connected". A login that is actually in
+/// flight shows *Authenticating*, which is where cancelling belongs.
+fn can_stop(state: State, verbs: bool) -> bool {
+  state != State::Offline && verbs
+}
+
 /// Draw the dialog body: the title row with its close button, then the rows.
 ///
 /// The width is measured before anything is laid out. The title row, the rule
@@ -3061,8 +3023,15 @@ fn devices_list(
   // no-op here, because a vertical layout with a centred cross axis makes every
   // widget fill the *available* width (`Layout::next_frame`), so the title row
   // and the separator kept stretching to the panel's width.
+  //
+  // The height may not come from this dialog either: a modal lays its content
+  // out with the size that content had *last frame* as the max rect, so
+  // `available_height()` here is the list's own previous height and any fraction
+  // of it converges to itself (on a phone it shrank frame by frame). The screen
+  // is the only honest bound.
   let avail = ui.available_rect_before_wrap();
-  let body_rect = egui::Rect::from_min_size(avail.min, egui::vec2(width, avail.height()));
+  let screen = ui.ctx().content_rect();
+  let body_rect = egui::Rect::from_min_size(avail.min, egui::vec2(width, screen.height()));
   let row_h = ui
     .text_style_height(&egui::TextStyle::Body)
     .max(ui.text_style_height(&egui::TextStyle::Monospace))
@@ -3088,11 +3057,7 @@ fn devices_list(
     // and portrait, and a 180 pt letterbox in the middle of the screen reads
     // badly: the list takes most of the modal instead, while `auto_shrink`
     // still keeps a two-row list from stretching.
-    let scroll_max = if cfg!(target_os = "android") {
-      (avail.height() * 0.8).clamp(DEVICES_SCROLL_MAX, 620.0)
-    } else {
-      DEVICES_SCROLL_MAX
-    };
+    let scroll_max = devices_scroll_max(screen.height(), cfg!(target_os = "android"));
     egui::ScrollArea::vertical()
       .max_height(scroll_max)
       .auto_shrink([false, true])
@@ -4930,6 +4895,92 @@ mod tests {
   }
 
   #[test]
+  fn disconnect_is_off_while_the_page_says_offline() {
+    // Nothing to end while offline, even if the core still wants to be online:
+    // an automatic attempt between retries keeps the state Offline, and both
+    // verbs lit up there is what the phone showed.
+    assert!(!can_stop(State::Offline, true));
+    // A login in flight can be called off.
+    assert!(can_stop(State::Authenticating, true));
+    assert!(can_stop(State::Online, true));
+    // A link this app does not manage never offers the verb, whatever the state.
+    assert!(!can_stop(State::Online, false));
+    assert!(!can_stop(State::Authenticating, false));
+  }
+
+  #[test]
+  fn a_phone_gives_the_device_list_more_room_than_a_desktop() {
+    // The desktop cap stays what it was.
+    assert_eq!(devices_scroll_max(890.0, false), DEVICES_SCROLL_MAX);
+    // A phone gets most of its screen, but not all of it, and never less than
+    // the desktop cap.
+    let phone = devices_scroll_max(890.0, true);
+    assert!(phone > DEVICES_SCROLL_MAX * 2.0, "{phone}");
+    assert!(phone < 890.0 * 0.75, "{phone}");
+    // A short phone screen still shows more than the desktop letterbox.
+    assert_eq!(devices_scroll_max(200.0, true), DEVICES_SCROLL_MAX);
+    // And the cap holds on a tablet.
+    assert_eq!(devices_scroll_max(2000.0, true), 620.0);
+  }
+
+  #[test]
+  fn the_device_dialog_height_does_not_follow_itself() {
+    // A modal lays its content out with the height it had last frame. Reading
+    // `available_height()` and taking a fraction of it made the list converge
+    // to its own size, and on a phone it shrank frame after frame.
+    let t = crate::i18n::Lang::En.texts();
+    let devices: Vec<Device> = (0..20)
+      .map(|i| Device {
+        id: i.to_string(),
+        ip4: format!("192.0.2.{}", i + 1),
+        os: "AndroidOS".into(),
+        ..Default::default()
+      })
+      .collect();
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(400.0, 890.0),
+      )),
+      ..Default::default()
+    };
+    let mut heights = Vec::new();
+    for _ in 0..3 {
+      let mut height = 0.0;
+      let mut out = ctx.run_ui(input.clone(), |ui| {
+        let modal = egui::Modal::new(egui::Id::new("devices")).show(ui.ctx(), |ui| {
+          let mut open = true;
+          let mut copied = None;
+          devices_list(
+            ui,
+            &devices,
+            devices.len(),
+            t,
+            &mut open,
+            false,
+            &mut copied,
+          );
+          ui.min_rect().height()
+        });
+        height = modal.inner;
+      });
+      out.textures_delta.clear();
+      heights.push(height);
+    }
+    // The first frame has no text metrics yet, so only the steady state has to
+    // hold still - the bug was that it kept changing after that.
+    assert!(
+      heights[1] == heights[2],
+      "the dialog changed height between frames: {heights:?}"
+    );
+    assert!(
+      heights[2] > DEVICES_SCROLL_MAX + 20.0,
+      "the rows did not take the cap: {heights:?}"
+    );
+  }
+
+  #[test]
   fn only_a_newer_core_build_restarts_the_window() {
     // Same build (manual stop/start, plain restart): leave the window alone.
     assert!(!should_restart(100, 100, true));
@@ -5174,9 +5225,6 @@ impl eframe::App for App {
       }
       // The hold's tint follows its menu, so forget the line once it closes.
       self.log_hold.clear_if_closed(egui::Popup::is_any_open(ctx));
-      self
-        .status_hold
-        .clear_if_closed(egui::Popup::is_any_open(ctx));
     }
     // The system back gesture (edge swipe, or the button) is answered by the
     // window when there is a step to take: an open menu, the switch
