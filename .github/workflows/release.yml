@@ -1,9 +1,9 @@
 name: Release
 
-# Pushing a tag such as v0.1.0 builds the Windows MSI and the Linux deb/tarball,
-# publishes all of them as release assets (the MSI together with the generated
-# winget manifests), and (when the WINGET_TOKEN secret is present) opens the
-# manifest PR against microsoft/winget-pkgs.
+# Pushing a tag such as v0.1.0 builds the Windows MSI, the Linux deb/tarball and
+# the Android APK, publishes all of them as release assets (the MSI together with
+# the generated winget manifests), and (when the WINGET_TOKEN secret is present)
+# opens the manifest PR against microsoft/winget-pkgs.
 #
 # Manual runs use the tag if started from one, otherwise the Cargo.toml version.
 # Pushes to main never run this workflow: only tags and manual runs do.
@@ -177,3 +177,116 @@ jobs:
           files: |
             dist/thunet_${{ steps.version.outputs.version }}-1_amd64.deb
             dist/thunet-${{ steps.version.outputs.version }}-linux-x64.tar.gz
+
+  # ------------------------------------------------------------------ Android
+  # The APK is published **unsigned**: the signing key is a keystore kept outside
+  # the repository (`android/keystore.properties` is git-ignored), and signing
+  # with a throwaway key would produce an APK that no installed copy accepts as an
+  # update. Unsigned still buys the thing CI is for - the port builds from a clean
+  # checkout - and the file name matches what the README tells users to sideload
+  # once a real key signs it.
+  #
+  # Release carries `arm64-v8a` only (`android/app/build.gradle`), so the Rust side
+  # builds just `aarch64-linux-android`.
+  android-apk:
+    name: APK, arm64, unsigned
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same rule as the other two jobs: the tag is the source of truth and
+      # Cargo.toml has to agree, because `versionName` (and `versionCode` derived
+      # from it) is read from Cargo.toml by the Gradle build.
+      - name: Resolve and check version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            version="${tag#v}"
+          else
+            echo "not a release tag ($tag); falling back to Cargo.toml"
+            version="$cargo_version"
+          fi
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml says $cargo_version but the release is $version; bump Cargo.toml first." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      # JDK 21 comes from the pixi `android` environment; the Gradle wrapper
+      # unpacks the exact Gradle it pins, so the environment's `gradle` is not
+      # what runs.
+      - uses: prefix-dev/setup-pixi@v0
+        with:
+          environments: android
+          frozen: true
+          cache: true
+
+      # `scripts/android_build.sh` calls `cargo ndk`, so the toolchain is the
+      # official one with the ABI target added next to it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      # cargo-ndk is not in the pixi environment (and not on conda-forge), so it
+      # is built from source here; the step is a few seconds on a warm registry
+      # cache and keeps the job independent of a third-party install action.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # Platform 36 and NDK 29 are newer than what the runner image ships, and
+      # `ndkVersion` in android/app/build.gradle pins that exact NDK: AGP looks it
+      # up under $ANDROID_HOME/ndk and fails the build when it is a different one.
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform and NDK
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-36" "ndk;29.0.14206865"
+          # The Gradle build finds the SDK through ANDROID_HOME (see
+          # scripts/android_build.sh); the setup action exports ANDROID_SDK_ROOT.
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk" || { echo "no Android SDK root from setup-android" >&2; exit 1; }
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      # The wrapper download and the AGP/AndroidX artifacts are the slow part of
+      # a cold run; the NDK is left uncached because restoring it costs about as
+      # much as letting sdkmanager fetch it.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/app/build.gradle') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build APK
+        run: pixi run -e android apk-release
+
+      - name: Name the artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$apk" ]; then
+            echo "$apk was not produced" >&2
+            find android/app/build/outputs -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$apk" "dist/thunet-${VERSION}-arm64.apk"
+          ls -l "dist/thunet-${VERSION}-arm64.apk"
+
+      # Appends to the release the Windows job creates, exactly like the Linux
+      # job; no generate_release_notes here for the same reason.
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: dist/thunet-${{ steps.version.outputs.version }}-arm64.apk

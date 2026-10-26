@@ -1,0 +1,95 @@
+name: Android
+
+# A build check, not a release. This workflow compiles the APK and leaves it as a
+# workflow artifact, so the port can be exercised without cutting a tag, creating
+# a release, or touching the winget submission the `Release` workflow owns.
+#
+# The artifact is unsigned on purpose: the signing key is a keystore kept outside
+# the repository, and an APK signed with a throwaway key would be an update no
+# installed copy accepts.
+#
+# Keep these build steps in step with the `android-apk` job in release.yml.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/android.yml"
+      - "android/**"
+      - "scripts/android_build.sh"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pixi.toml"
+      - "pixi.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: APK, arm64, unsigned
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 21 comes from the pixi `android` environment; the wrapper unpacks the
+      # exact Gradle it pins, so the environment's `gradle` is not what runs.
+      - uses: prefix-dev/setup-pixi@v0
+        with:
+          environments: android
+          frozen: true
+          cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform and NDK
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-36" "ndk;29.0.14206865"
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$sdk" || { echo "no Android SDK root from setup-android" >&2; exit 1; }
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/app/build.gradle') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build APK
+        run: pixi run -e android apk-release
+
+      - name: Name the artifact
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          apk="android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$apk" ]; then
+            echo "$apk was not produced" >&2
+            find android/app/build/outputs -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$apk" "dist/thunet-${version}-arm64.apk"
+          ls -l "dist/thunet-${version}-arm64.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thunet-arm64-apk
+          path: dist/thunet-*-arm64.apk
+          if-no-files-found: error
+          retention-days: 14
