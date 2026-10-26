@@ -879,6 +879,18 @@ impl App {
     }
   }
 
+  /// Ask the core for a status answer, starting the turtle's walk over.
+  ///
+  /// The core restarts its own poll cadence when it handles this (`last_status`
+  /// in `core.rs`), so the track has to start over at the same moment: without
+  /// this the turtle kept the phase it had, walked to the right end and then sat
+  /// there until the next scheduled beat - which is exactly what a refresh that
+  /// "succeeded but did nothing" looked like.
+  fn refresh(&mut self, quiet: bool) {
+    self.last_heartbeat = Some(Instant::now());
+    self.send(Cmd::Refresh { quiet });
+  }
+
   fn next_event(&self) -> Option<Ev> {
     self.link.as_ref()?.try_recv()
   }
@@ -1275,7 +1287,7 @@ impl App {
     // An account that was refused is only reported until the user takes the
     // edit back; the stored pair is the one that works, so ask the portal again
     // and let that answer clear the banner.
-    self.send(Cmd::Refresh { quiet: true });
+    self.refresh(true);
   }
 
   /// Ask before an account switch that has nothing to fall back on.
@@ -2104,7 +2116,7 @@ impl App {
               self.next_core_query = Instant::now();
             }
             if ui.button(t.refresh).clicked() {
-              self.send(Cmd::Refresh { quiet: false });
+              self.refresh(false);
             }
           });
         } else {
