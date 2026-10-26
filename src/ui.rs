@@ -561,8 +561,7 @@ pub struct App {
   /// Long-press detection for the credential fields' clipboard paste.
   #[cfg(target_os = "android")]
   paste: PasteHold,
-  /// Long-press detection for the log menu, and the line it marks.
-  #[cfg(target_os = "android")]
+  /// Long-press detection for the log menu, and the lines it picks.
   log_hold: LogHold,
   /// The failure the red banner shows. Stored as a kind rather than as words,
   /// so the banner is re-worded by a language switch instead of keeping the
@@ -818,7 +817,6 @@ impl App {
       autofill_rect: None,
       #[cfg(target_os = "android")]
       paste: PasteHold::default(),
-      #[cfg(target_os = "android")]
       log_hold: LogHold::default(),
       last_error: None,
       banner_height: 0.0,
@@ -2641,20 +2639,16 @@ impl App {
           .filter(|l| l.level >= self.min_level)
           .collect();
         // Masking happens here rather than when the line is stored, so the
-        // toggle also reaches lines that were already in the pane.
-        // Android's log hold lives in `self`, so the masking names are owned
-        // there instead of borrowed: a `&self` borrow from this point would
-        // exclude the pane closure that drives the gesture.
-        #[cfg(target_os = "android")]
+        // toggle also reaches lines that were already in the pane. The names are
+        // owned because the hold lives in `self` and the pane closure below
+        // mutates it: a `&self` borrow from this point would exclude that
+        // closure.
         let accounts = self
           .accounts()
           .into_iter()
           .map(str::to_owned)
           .collect::<Vec<String>>();
-        #[cfg(target_os = "android")]
         let accounts = accounts.iter().map(String::as_str).collect::<Vec<_>>();
-        #[cfg(not(target_os = "android"))]
-        let accounts = self.accounts();
         let hidden = self.cfg.privacy;
         if self.page == Page::Status && !visible.is_empty() {
           ui.add_space(8.0);
@@ -2664,6 +2658,22 @@ impl App {
             .map(|l| masked_log(l.render(), &accounts, hidden))
             .collect::<Vec<_>>()
             .join("\n");
+          // The text of a picked range. Built only when the menu button is
+          // pressed: joining a long span of lines on every frame while the menu
+          // is open would be pure waste, and the range can change under it.
+          let picked = |first: usize, last: usize| -> String {
+            let end = match visible.len() {
+              0 => return String::new(),
+              n => n - 1,
+            };
+            let first = first.min(end);
+            let last = last.min(end).max(first);
+            visible[first..=last]
+              .iter()
+              .map(|line| masked_log(line.render(), &accounts, hidden))
+              .collect::<Vec<_>>()
+              .join("\n")
+          };
           // The context menu cannot call back into `self`, so record the
           // requested text and copy it once the scroll area has finished.
           let mut copy_request: Option<String> = None;
@@ -2680,8 +2690,6 @@ impl App {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                   for (index, line) in visible.iter().enumerate() {
-                    #[cfg(not(target_os = "android"))]
-                    let _ = index;
                     let color = {
                       let visuals = ui.visuals();
                       level_color(line.level, visuals)
@@ -2689,16 +2697,15 @@ impl App {
                     let text = masked_log(line.render(), &accounts, hidden);
                     let resp = ui.add(log_entry(ui, text.clone(), color));
                     // The hold target is the whole row, glyphs or not: a short
-                    // line leaves most of the width empty, and a finger resting
-                    // on that blank part is still aiming at this line.
-                    #[cfg(target_os = "android")]
+                    // line leaves most of the width empty, and a press on that
+                    // blank part is still aiming at this line.
                     let row = egui::Rect::from_min_max(
                       egui::pos2(ui.max_rect().left(), resp.rect.top()),
                       egui::pos2(ui.max_rect().right(), resp.rect.bottom()),
                     );
-                    // A finger on a line is tinted from the moment it lands, so
-                    // the target of the long press is never a guess.
-                    #[cfg(target_os = "android")]
+                    // A press on a line is tinted from the moment it lands, so
+                    // the target of the hold - a finger or the left button - is
+                    // never a guess.
                     let held = {
                       let fired = self.log_hold.poll(ui, index, row);
                       if self.log_hold.marked(index) {
@@ -2713,16 +2720,11 @@ impl App {
                       }
                       fired
                     };
-                    #[cfg(not(target_os = "android"))]
-                    let held = false;
-                    #[cfg(target_os = "android")]
                     let armed = self.log_hold.fired();
-                    #[cfg(not(target_os = "android"))]
-                    let armed = false;
-                    #[cfg(target_os = "android")]
                     let spot = self.log_hold.spot();
-                    #[cfg(not(target_os = "android"))]
-                    let spot = None;
+                    // Read after `poll`, so the row that was just held already
+                    // sees the range it extended.
+                    let pick = self.log_hold.range();
                     log_menu(
                       &resp,
                       t,
@@ -2732,6 +2734,8 @@ impl App {
                       held,
                       armed,
                       spot,
+                      pick,
+                      &picked,
                     );
                   }
                 });
@@ -3444,18 +3448,67 @@ impl PasteHold {
   }
 }
 
-/// A finger resting on a log line, for the copy menu.
+/// The log lines the copy menu acts on.
+///
+/// A hold marks one line; a second hold on another line reaches to it, so
+/// "everything between these two" is one gesture away without a text selection
+/// that touch cannot express. Kept apart from the gesture that feeds it, because
+/// the arithmetic is what a test can hold still.
+#[derive(Default)]
+struct LogPick {
+  /// The line the first hold marked, and the one the menu is anchored on.
+  anchor: Option<usize>,
+  /// The line a later hold reached, if there was one.
+  tip: Option<usize>,
+}
+
+impl LogPick {
+  /// A hold landed on `index`.
+  ///
+  /// The first hold opens the menu, a later one on another line extends the
+  /// pick to it, and holding the anchor again collapses back to that one line.
+  /// A third line moves the far end instead of starting over, which is what a
+  /// finger that slipped one row wants.
+  fn hold(&mut self, index: usize) {
+    match self.anchor {
+      None => self.anchor = Some(index),
+      Some(first) if first == index => self.tip = None,
+      Some(_) => self.tip = Some(index),
+    }
+  }
+
+  /// The lines to copy, `first..=last`, or `None` while nothing is picked.
+  fn range(&self) -> Option<(usize, usize)> {
+    let anchor = self.anchor?;
+    let tip = self.tip.unwrap_or(anchor);
+    Some((anchor.min(tip), anchor.max(tip)))
+  }
+
+  /// Whether line `index` belongs to the pick, for the tint.
+  fn covers(&self, index: usize) -> bool {
+    self
+      .range()
+      .is_some_and(|(first, last)| (first..=last).contains(&index))
+  }
+
+  fn clear(&mut self) {
+    self.anchor = None;
+    self.tip = None;
+  }
+}
+
+/// A press resting on a log line, for the copy menu.
 ///
 /// Shorter than egui's own 0.8 s long touch: a log line is a small target and
-/// the menu is the only thing a hold can do. The line under the finger is
-/// tinted so the target is obvious, and the hold ticks the phone.
-#[cfg(target_os = "android")]
+/// the menu is the only thing a hold can do. It is the left button on the
+/// desktop and a finger on a phone; either way the line it landed on is tinted
+/// so the target is obvious, and a phone ticks.
 #[derive(Default)]
 struct LogHold {
   /// Line index under the finger, and when it first landed there.
   pressed: Option<(usize, f64)>,
-  /// The line whose menu is open (or just opened).
-  kept: Option<usize>,
+  /// The lines the open menu acts on.
+  pick: LogPick,
   /// Where the press that opened the menu landed, in points. The popup is
   /// anchored here: `at_pointer_fixed` has no pointer to read on the release
   /// frame (a finger leaves no hover), and the menu would be open but unpainted.
@@ -3464,7 +3517,6 @@ struct LogHold {
   fired: bool,
 }
 
-#[cfg(target_os = "android")]
 impl LogHold {
   /// How long a finger stays on a line before its menu opens.
   const HOLD: f64 = 0.45;
@@ -3523,8 +3575,9 @@ impl LogHold {
       return false;
     }
     self.fired = true;
-    self.kept = Some(index);
+    self.pick.hold(index);
     self.spot = Some(origin);
+    #[cfg(target_os = "android")]
     let _ = crate::android_jni::haptic();
     true
   }
@@ -3534,9 +3587,14 @@ impl LogHold {
     self.spot
   }
 
+  /// The lines the open menu acts on.
+  fn range(&self) -> Option<(usize, usize)> {
+    self.pick.range()
+  }
+
   /// Should line `index` be tinted right now?
   fn marked(&self, index: usize) -> bool {
-    self.kept == Some(index) || self.pressed.is_some_and(|(on, _)| on == index)
+    self.pick.covers(index) || self.pressed.is_some_and(|(on, _)| on == index)
   }
 
   /// Did the press that is (or just was) down open a menu?
@@ -3544,10 +3602,10 @@ impl LogHold {
     self.fired
   }
 
-  /// Forget the kept line once its menu has closed.
+  /// Forget the kept lines once their menu has closed.
   fn clear_if_closed(&mut self, any_popup_open: bool) {
     if !any_popup_open {
-      self.kept = None;
+      self.pick.clear();
       self.spot = None;
     }
   }
@@ -3818,6 +3876,11 @@ impl egui::plugin::Plugin for LogCopyClick {
 /// [`egui::Response::context_menu`] only opens on `secondary_clicked`, and a
 /// touch hold is a *primary* click in egui (`long_touched`, which also sets
 /// `clicked`), so the popup is opened here for both triggers instead.
+///
+/// `pick` is the range a second hold reached; when it spans more than one line
+/// the menu copies those lines instead of the one the popup belongs to, and
+/// `picked` builds that text only if the button is actually pressed.
+#[allow(clippy::too_many_arguments)]
 fn log_menu(
   resp: &egui::Response,
   t: &Texts,
@@ -3827,6 +3890,8 @@ fn log_menu(
   held: bool,
   armed: bool,
   spot: Option<egui::Pos2>,
+  pick: Option<(usize, usize)>,
+  picked: &dyn Fn(usize, usize) -> String,
 ) {
   let mut popup =
     egui::Popup::menu(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
@@ -3848,9 +3913,32 @@ fn log_menu(
     None => popup.at_pointer_fixed(),
   };
   popup.show(|ui| {
-    if ui.button(t.copy_line).clicked() {
-      *copy_request = Some(text.to_owned());
-      ui.close();
+    match pick {
+      // A range: the second hold reached another line, so the menu copies the
+      // rows between them rather than only the one under the finger.
+      Some((first, last)) if last > first => {
+        let label = format!("{} ({})", t.copy_selection, last - first + 1);
+        if ui.button(label).clicked() {
+          *copy_request = Some(picked(first, last));
+          ui.close();
+        }
+      }
+      // One line picked by a hold. The text comes from the pick, not from this
+      // row, so the two cannot disagree when the popup sits on the anchor of a
+      // range that was just collapsed.
+      Some((first, last)) => {
+        if ui.button(t.copy_line).clicked() {
+          *copy_request = Some(picked(first, last));
+          ui.close();
+        }
+      }
+      // A right click with no hold (the desktop): the row's own text.
+      None => {
+        if ui.button(t.copy_line).clicked() {
+          *copy_request = Some(text.to_owned());
+          ui.close();
+        }
+      }
     }
     if ui.button(t.copy_all).clicked() {
       *copy_request = Some(everything.to_owned());
@@ -4958,6 +5046,38 @@ mod tests {
     assert_eq!(devices_scroll_max(2000.0, true), 620.0);
   }
 
+  /// A second hold has to reach the other line, and the menu must act on the
+  /// whole span: that is the difference between "copy this line" and "copy
+  /// everything between the two rows I touched".
+  #[test]
+  fn a_second_hold_picks_the_lines_between() {
+    let mut pick = LogPick::default();
+    assert_eq!(pick.range(), None);
+    assert!(!pick.covers(7));
+
+    pick.hold(7);
+    assert_eq!(pick.range(), Some((7, 7)));
+    assert!(pick.covers(7));
+
+    // Downwards and upwards describe the same span.
+    pick.hold(3);
+    assert_eq!(pick.range(), Some((3, 7)));
+    assert!(pick.covers(3) && pick.covers(5) && pick.covers(7));
+    assert!(!pick.covers(2) && !pick.covers(8));
+
+    // A third hold moves the far end instead of starting over.
+    pick.hold(58);
+    assert_eq!(pick.range(), Some((7, 58)));
+
+    // Holding the anchor again collapses to that one line.
+    pick.hold(7);
+    assert_eq!(pick.range(), Some((7, 7)));
+
+    // Closing the menu forgets everything.
+    pick.clear();
+    assert_eq!(pick.range(), None);
+  }
+
   /// A toast produced while a dialog is open has to be readable. A modal draws
   /// its dimming backdrop as a `Foreground` layer, so a toast in that same order
   /// lost to it - which is how the device list hid the "copied" confirmation it
@@ -5300,9 +5420,11 @@ impl eframe::App for App {
       if !ime.is_empty() {
         ctx.input_mut(|input| input.events.extend(ime.into_iter().map(egui::Event::Ime)));
       }
-      // The hold's tint follows its menu, so forget the line once it closes.
-      self.log_hold.clear_if_closed(egui::Popup::is_any_open(ctx));
     }
+    // The hold's tint follows its menu, so forget the picked lines once it
+    // closes. This lives outside the platform block because the hold is the
+    // desktop's left button as well as a phone's finger.
+    self.log_hold.clear_if_closed(egui::Popup::is_any_open(ctx));
     // The system back gesture (edge swipe, or the button) is answered by the
     // window when there is a step to take: an open menu, the switch
     // confirmation, the device list, or the settings page. Java asks once per
