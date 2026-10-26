@@ -126,6 +126,12 @@ pub struct Texts {
   pub background_wake_hint: &'static str,
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
   pub background_service_hint: &'static str,
+  /// Android: shown under the resident level only. A swipe from recents is a
+  /// force-stop on ROMs that clean up aggressively, the foreground service
+  /// included, so the one thing that saves the session is not something the
+  /// app can do itself.
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_rom_hint: &'static str,
   /// Android: the resident level was asked for but the notification permission
   /// was refused, so the effective level is "network changes".
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -362,7 +368,8 @@ static ZH: Texts = Texts {
   background_service: "常驻",
   background_off_hint: "不在后台做任何事；关掉应用后再打开是唯一回来的方式。",
   background_wake_hint: "Wi-Fi 变化时唤醒并登录（无通知）；其余情况由 15 分钟一次的后台任务兜底。",
-  background_service_hint: "前台服务 + 静默通知：划掉任务后会话仍在线，并在开机时自动启动。",
+  background_service_hint: "前台服务 + 静默通知：会话持续在线，并在开机时自动启动。",
+  background_rom_hint: "MIUI/HyperOS 等系统会把“划掉任务”当成强制停止，前台服务也会一起被杀；在最近任务里锁住本应用卡片才能留在后台。",
   background_denied: "常驻后台需要通知权限；当前按“网络变化”运行。",
   background_power: "允许后台唤醒",
   background_power_ok: "系统电量限制已解除",
@@ -504,7 +511,8 @@ static EN: Texts = Texts {
   background_service: "Resident",
   background_off_hint: "Nothing stays behind; reopening the app is the only way back.",
   background_wake_hint: "Wakes on a Wi-Fi change and signs in, with no notification; a 15-minute job covers the rest.",
-  background_service_hint: "A foreground service with a silent notification: the session survives a swipe and starts at boot.",
+  background_service_hint: "A foreground service with a silent notification: the session stays up and starts at boot.",
+  background_rom_hint: "MIUI/HyperOS and similar ROMs turn a swipe from recents into a force-stop, service included; lock the card in recents to stay online.",
   background_denied: "Resident needs the notification permission; running on Wi-Fi change instead.",
   background_power: "Background wake-up",
   background_power_ok: "Battery restriction lifted",

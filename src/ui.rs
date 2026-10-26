@@ -2323,6 +2323,20 @@ impl App {
               )
               .wrap(),
             );
+            // A swipe from recents is a force-stop on aggressive ROMs, and it
+            // takes the foreground service with it. Only the recents card lock
+            // prevents that, so the level that is supposed to survive a swipe
+            // says what still needs doing on the device.
+            if self.background == Mode::Service {
+              ui.add(
+                egui::Label::new(
+                  egui::RichText::new(t.background_rom_hint)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+              );
+            }
             // Asking for this is what turns "wakes on the next Wi-Fi" into
             // something that survives a swipe: without the exemption the ROM
             // may force-stop the app, which cancels the registration too.
