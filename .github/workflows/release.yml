@@ -296,9 +296,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          apk="android/app/build/outputs/apk/release/app-release.apk"
-          if [ ! -f "$apk" ]; then
-            echo "$apk was not produced" >&2
+          # An unsigned release is what AGP names `app-release-unsigned.apk`;
+          # taking whatever sits in the directory also covers a signed build.
+          out="android/app/build/outputs/apk/release"
+          apk="$(find "$out" -maxdepth 1 -name '*.apk' -print -quit)"
+          if [ -z "$apk" ]; then
+            echo "no APK under $out" >&2
             find android/app/build/outputs -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
