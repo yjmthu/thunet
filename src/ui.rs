@@ -3602,9 +3602,16 @@ impl LogHold {
     self.fired
   }
 
-  /// Forget the kept lines once their menu has closed.
-  fn clear_if_closed(&mut self, any_popup_open: bool) {
-    if !any_popup_open {
+  /// Forget the picked lines once their menu has closed.
+  ///
+  /// A press that is still down holds the pick open: pressing another row closes
+  /// the first menu immediately (`CloseOnClickOutside`), and the hold that would
+  /// extend the pick only matures half a second later. Clearing on the closed
+  /// menu alone would restart the pick on that second row instead of reaching to
+  /// it. A tap - press and release with no hold - still ends it, which is how a
+  /// click elsewhere deselects.
+  fn clear_if_closed(&mut self, any_popup_open: bool, pointer_down: bool) {
+    if !any_popup_open && !pointer_down {
       self.pick.clear();
       self.spot = None;
     }
@@ -5078,6 +5085,28 @@ mod tests {
     assert_eq!(pick.range(), None);
   }
 
+  /// Pressing the second row closes the first menu at once, and the hold that
+  /// extends the pick only matures half a second later: the pick has to survive
+  /// that gap, or the second hold starts over on its own row.
+  #[test]
+  fn a_pick_survives_the_first_menu_closing() {
+    let mut hold = LogHold::default();
+    hold.pick.hold(4);
+    hold.clear_if_closed(true, false);
+    assert_eq!(hold.pick.range(), Some((4, 4)), "an open menu keeps it");
+    hold.clear_if_closed(false, true);
+    assert_eq!(
+      hold.pick.range(),
+      Some((4, 4)),
+      "a press keeps it while the second hold matures"
+    );
+    hold.pick.hold(9);
+    assert_eq!(hold.pick.range(), Some((4, 9)));
+    // Lifting without a hold is a tap, and a tap is what deselects.
+    hold.clear_if_closed(false, false);
+    assert_eq!(hold.pick.range(), None);
+  }
+
   /// A toast produced while a dialog is open has to be readable. A modal draws
   /// its dimming backdrop as a `Foreground` layer, so a toast in that same order
   /// lost to it - which is how the device list hid the "copied" confirmation it
@@ -5422,9 +5451,13 @@ impl eframe::App for App {
       }
     }
     // The hold's tint follows its menu, so forget the picked lines once it
-    // closes. This lives outside the platform block because the hold is the
-    // desktop's left button as well as a phone's finger.
-    self.log_hold.clear_if_closed(egui::Popup::is_any_open(ctx));
+    // closes - but not while a press is down, which is someone aiming at the
+    // other end of the range. This lives outside the platform block because the
+    // hold is the desktop's left button as well as a phone's finger.
+    let pointer_down = ctx.input(|i| i.pointer.primary_down());
+    self
+      .log_hold
+      .clear_if_closed(egui::Popup::is_any_open(ctx), pointer_down);
     // The system back gesture (edge swipe, or the button) is answered by the
     // window when there is a step to take: an open menu, the switch
     // confirmation, the device list, or the settings page. Java asks once per
