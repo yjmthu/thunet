@@ -18,8 +18,12 @@ fn main() {
   let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
   println!("cargo:rustc-env=THUNET_PROFILE={profile}");
 
-  #[cfg(windows)]
-  {
+  // The icon belongs to Windows binaries, and a build script is compiled for
+  // the *host*: `cfg(windows)` would also fire when a Windows machine
+  // cross-compiles for Android, where winresource refuses the target
+  // ("Can only compile resource file when target_env is \"gnu\" or \"msvc\"").
+  let target = std::env::var("TARGET").unwrap_or_default();
+  if target.starts_with("windows") {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/thunet.ico");
     res.set("ProductName", "THUnet");
