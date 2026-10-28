@@ -86,11 +86,23 @@ mod imp {
       self.disconnect.set_enabled(disconnect);
     }
 
+    /// Recolour the icon, reporting whether the shell took it.
+    ///
     /// `set_icon` rewrites a temp PNG and re-announces the indicator, so the
-    /// caller must only call this on an actual change.
-    pub fn set_color(&self, fill: [u8; 3]) {
-      if let Some(icon) = &self.icon {
-        let _ = icon.set_icon(Some(make_icon(fill)));
+    /// caller only calls this when the wanted colour differs from the one the
+    /// shell accepted.
+    ///
+    /// The notification area is rebuilt on resume and after an explorer
+    /// restart, and a `NIM_MODIFY` that lands in that window fails. The caller
+    /// retries on the next tick while this returns an error, so the colour
+    /// cannot get stuck on an old bitmap. No icon at all is not an error: the
+    /// platform refused to create one and there is nothing to recolour.
+    pub fn set_color(&self, fill: [u8; 3]) -> Result<(), String> {
+      match &self.icon {
+        None => Ok(()),
+        Some(icon) => icon
+          .set_icon(Some(make_icon(fill)))
+          .map_err(|e| e.to_string()),
       }
     }
 
@@ -266,7 +278,9 @@ mod imp {
 
     pub fn set_enabled(&self, _connect: bool, _disconnect: bool) {}
 
-    pub fn set_color(&self, _fill: [u8; 3]) {}
+    pub fn set_color(&self, _fill: [u8; 3]) -> Result<(), String> {
+      Ok(())
+    }
 
     #[allow(dead_code)]
     pub fn set_tooltip(&self, _tip: &str) {}

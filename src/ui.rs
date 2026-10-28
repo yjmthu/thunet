@@ -617,9 +617,15 @@ pub struct App {
   /// then stays window-only, so closing quits instead of hiding and a hidden
   /// start is not attempted.
   tray: Tray,
-  /// Colour of the icon currently installed in the tray; `set_icon` rewrites a
-  /// temp PNG and re-announces the indicator, so it must only run on a change.
+  /// Colour of the icon the shell accepted; `set_icon` rewrites a temp PNG and
+  /// re-announces the indicator, so it must only run on a change.
+  ///
+  /// A colour the shell refused is deliberately *not* recorded here: it stays
+  /// wanted, and the next tick tries it again.
   tray_rgb: Option<[u8; 3]>,
+  /// The failed recolour has already been reported, so a retry loop does not
+  /// fill the log pane with the same line.
+  tray_warned: bool,
   /// The gear in front of *Settings*, built on first paint: the egui context
   /// does not exist yet when `App::new` runs.
   gear: Option<egui::TextureHandle>,
@@ -844,6 +850,7 @@ impl App {
       portable,
       tray,
       tray_rgb: Some(color_for(State::Offline)),
+      tray_warned: false,
       gear: None,
       back_arrow: None,
       eye_open: None,
@@ -5860,12 +5867,30 @@ impl eframe::App for App {
     // `label` feeds the tooltip below only, and that is Windows-only.
     #[cfg_attr(not(windows), allow(unused_variables))]
     let (label, rgb) = self.state_display(t);
+    // `tray_rgb` holds the colour the shell accepted, so a refusal leaves the
+    // wanted one pending and the next tick tries again. This is what recovers
+    // from a notification area that was being rebuilt (resume, an explorer
+    // restart) when the state changed - the case where the icon used to stay
+    // grey while the tooltip said Online, with no way back until the state
+    // happened to change again. Retrying every tick rather than on a timer is
+    // safe: a `NIM_MODIFY` per tick is what the tooltip below already costs.
     if self.tray_rgb != Some(rgb) {
-      self.tray_rgb = Some(rgb);
-      self.tray.set_color(rgb);
+      match self.tray.set_color(rgb) {
+        Ok(()) => {
+          self.tray_rgb = Some(rgb);
+          self.tray_warned = false;
+        }
+        Err(e) => {
+          if !self.tray_warned {
+            self.tray_warned = true;
+            self.push_log(Line::warn(format!("tray: cannot recolour ({e}); retrying")));
+          }
+        }
+      }
     }
-    // The tooltip is Windows-only: `set_tooltip` is a no-op in the Linux
-    // backend, so there it would just build a string nobody reads.
+    // The tooltip is set on every tick on purpose, and is not cached: an
+    // unconditional write is what lets it recover from the same shell hiccup
+    // without state of its own. It rides the same tick as the turtle.
     #[cfg(windows)]
     {
       let tip = match self.state {

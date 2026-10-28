@@ -61,9 +61,14 @@ gradle = "*"
 # `pixi run -e android apk-debug` -> android/app/build/outputs/apk/debug/app-debug.apk
 # The Gradle build calls scripts/android_build.sh, so the APK always carries a
 # freshly built Rust core. A proxy needs GRADLE_OPTS (see README).
-apk-debug = { cmd = "./gradlew assembleDebug", cwd = "android" }
+#
+# `bash ./gradlew`: the wrapper is a shell script, which pixi runs as a child
+# process and therefore cannot launch on Windows ("not a valid Win32
+# application"). Bash is spelled out on both platforms - the Rust step already
+# needs it - so one definition serves Linux CI and a Windows machine alike.
+apk-debug = { cmd = "bash ./gradlew assembleDebug", cwd = "android" }
 # arm64 only, and unsigned until a release key exists (see README §10).
-apk-release = { cmd = "./gradlew assembleRelease", cwd = "android" }
+apk-release = { cmd = "bash ./gradlew assembleRelease", cwd = "android" }
 
 [feature.dev.tasks]
 # Refresh `.vscode/settings.json` and `.zed/settings.json` so rust-analyzer
