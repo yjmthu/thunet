@@ -3557,6 +3557,17 @@ const PRESS_TINT_ALPHA: u8 = 24;
 /// Tint of the rows the copy menu acts on.
 const PICK_TINT_ALPHA: u8 = 64;
 
+/// Did the press at `origin` land on this row, as far as the user can see?
+///
+/// Inside a scroll area the content is laid out above the viewport instead of
+/// being clipped in coordinates, so a line scrolled out of sight keeps a rect
+/// over the page drawn above the pane. Testing the row alone would let a hold
+/// there pick that line; the viewport test is the clipping egui itself applies
+/// to a widget's interaction rect.
+fn hold_hits(viewport: egui::Rect, row: egui::Rect, origin: egui::Pos2) -> bool {
+  viewport.contains(origin) && row.contains(origin)
+}
+
 /// A press resting on a log line, for the copy menu.
 ///
 /// Shorter than egui's own 0.8 s long touch: a log line is a small target and
@@ -3615,7 +3626,11 @@ impl LogHold {
     if ui.ctx().layer_id_at(origin) != Some(ui.layer_id()) {
       return false;
     }
-    if !rect.contains(origin) || (latest - origin).length() > Self::SLOP {
+    // The row's own rect is not enough: a scroll area moves the content above
+    // the viewport instead of clipping its coordinates, so the lines scrolled
+    // out of sight still cover the page above the pane, and a hold there would
+    // land on one of them. egui clips a widget's interaction rect the same way.
+    if !hold_hits(ui.clip_rect(), rect, origin) || (latest - origin).length() > Self::SLOP {
       return false;
     }
     if self.fired {
@@ -5182,6 +5197,33 @@ mod tests {
     assert!(!hold.picked(9), "a press outside the range is not picked");
     assert!(hold.pressed_at(9));
     assert!(!hold.pressed_at(4), "a picked row carries no press");
+  }
+
+  /// The scroll area keeps the rects of the lines it scrolled away: they lie
+  /// above the pane, over the status page. A hold there used to open the log
+  /// menu for one of those lines, which is also why the text it copied was old.
+  #[test]
+  fn a_press_above_the_pane_holds_no_row() {
+    let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(420.0, 700.0));
+    let scrolled = egui::Rect::from_min_max(egui::pos2(0.0, 240.0), egui::pos2(420.0, 253.0));
+    assert!(
+      !hold_hits(viewport, scrolled, egui::pos2(200.0, 250.0)),
+      "a line scrolled out of the pane takes no press"
+    );
+
+    let visible = egui::Rect::from_min_max(egui::pos2(0.0, 400.0), egui::pos2(420.0, 413.0));
+    assert!(hold_hits(viewport, visible, egui::pos2(200.0, 405.0)));
+    assert!(
+      !hold_hits(viewport, visible, egui::pos2(200.0, 500.0)),
+      "the pane's empty space below the last line belongs to no row"
+    );
+
+    let straddling = egui::Rect::from_min_max(egui::pos2(0.0, 290.0), egui::pos2(420.0, 303.0));
+    assert!(
+      !hold_hits(viewport, straddling, egui::pos2(200.0, 295.0)),
+      "the clipped part of a half-visible row takes no press either"
+    );
+    assert!(hold_hits(viewport, straddling, egui::pos2(200.0, 300.0)));
   }
 
   /// A toast produced while a dialog is open has to be readable. A modal draws
