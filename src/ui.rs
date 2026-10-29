@@ -571,9 +571,13 @@ pub struct App {
   /// The window grows by exactly this much, so the log pane keeps its size
   /// instead of being covered or squeezed.
   banner_height: f32,
-  /// Extra height last sent to the viewport; keeps the resize command from
-  /// being emitted on every frame.
-  window_extra: f32,
+  /// The client size last sent to the viewport, together with the inputs it
+  /// was converted with: pixels per point, monitor size (in points) and the
+  /// banner height it included. The size is fixed in points, so a new scale
+  /// factor or monitor is the same size in a different number of physical
+  /// pixels - which is why the command has to be sent again. `None` forces
+  /// the next pass to send it.
+  applied_size: Option<AppliedSize>,
   /// The missing-service warning is already in the log; keeps the two-second
   /// reconnect cadence from repeating it.
   service_warned: bool,
@@ -826,7 +830,7 @@ impl App {
       log_hold: LogHold::default(),
       last_error: None,
       banner_height: 0.0,
-      window_extra: 0.0,
+      applied_size: None,
       service_warned: false,
       core_stale: None,
       core_answered: false,
@@ -1544,6 +1548,10 @@ impl App {
       self.cloaked = false;
     }
     self.shown = true;
+    // A session that changed scale while the window was hidden (an unmapped
+    // window may keep the size it was last given) gets its fixed size back on
+    // the first pass after this.
+    self.applied_size = None;
     // Undo the Wayland fallback in `hide_window`, which left it minimised.
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2782,11 +2790,8 @@ impl App {
                       bg.b(),
                       PICK_TINT_ALPHA,
                     );
-                    ui.painter().rect_filled(
-                      band.expand(1.0),
-                      egui::CornerRadius::same(3),
-                      tint,
-                    );
+                    ui.painter()
+                      .rect_filled(band.expand(1.0), egui::CornerRadius::same(3), tint);
                   }
                 });
             },
@@ -5508,21 +5513,57 @@ fn banner(ui: &mut egui::Ui, text: impl Into<String>, tone: BannerTone) -> f32 {
 }
 
 impl App {
-  /// Grow or shrink the client area by the banner height.
+  /// Apply the fixed client size again when it no longer means what it did.
   ///
   /// Only the banner's own height is measured; measuring the whole page would
   /// feed the available height back into the layout (the reason the window is
   /// otherwise a fixed size). The width never changes, so the banner wraps the
   /// same way and the target stays stable instead of oscillating.
+  ///
+  /// The size is in points, while the window keeps whatever the compositor
+  /// last gave it: nothing but this function ever sets it. A scale factor that
+  /// changes after the window exists would therefore leave a 2x interface in a
+  /// 1x-sized window - which is what a remote desktop session does, since it
+  /// starts at 1x and switches to the client's scale once the client
+  /// connects, long after the autostarted window was created. So the size is
+  /// also re-applied whenever the scale factor or the monitor changes.
   fn sync_window_height(&mut self, ctx: &egui::Context) {
-    if (self.banner_height - self.window_extra).abs() < 0.5 {
+    let size = AppliedSize {
+      scale: ctx.pixels_per_point(),
+      monitor: ctx.input(|i| i.viewport().monitor_size),
+      extra: self.banner_height,
+    };
+    if self.applied_size.is_some_and(|last| last.same_as(size)) {
       return;
     }
-    self.window_extra = self.banner_height;
+    self.applied_size = Some(size);
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
       DEFAULT_WIDTH,
       WINDOW_HEIGHT + self.banner_height,
     )));
+  }
+}
+
+/// What [`App::sync_window_height`] last asked the viewport for, in the terms
+/// the request depends on. A request only lands on the same physical pixels
+/// when all three are unchanged.
+#[derive(Clone, Copy)]
+struct AppliedSize {
+  /// Pixels per point when the request was made.
+  scale: f32,
+  /// Monitor size in points, when the platform reports one.
+  monitor: Option<egui::Vec2>,
+  /// Banner height the request added to the fixed client height, in points.
+  extra: f32,
+}
+
+impl AppliedSize {
+  fn same_as(&self, other: Self) -> bool {
+    // The banner height is measured, so it keeps the tolerance the resize used
+    // to skip jitter; a scale or monitor change of any size is a real one.
+    (self.scale - other.scale).abs() < 0.001
+      && self.monitor == other.monitor
+      && (self.extra - other.extra).abs() < 0.5
   }
 }
 
@@ -5685,6 +5726,16 @@ impl eframe::App for App {
     // our window (which would desynchronise winit's cached visibility).
     if crate::single::show_requested() {
       self.show_window(ctx);
+    }
+
+    // eframe runs no `ui` pass while the window is hidden or minimized, and a
+    // remote desktop session switches its scale factor exactly then: the
+    // client connects after the session (and this window) already exist. The
+    // client area still has to follow the points it is fixed to, so the hidden
+    // case applies the size here. While the window paints, `ui` does it after
+    // the banner has been measured, which needs the painted height.
+    if !self.shown {
+      self.sync_window_height(ctx);
     }
 
     // The machine-wide request reaches windows in other sessions, and unlike
