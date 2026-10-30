@@ -302,9 +302,17 @@ impl Session {
       .client
       .login_logout(&username, None, &ip, &self.cfg.ac_id, true)?;
     if v.get("error").and_then(|e| e.as_str()) != Some("ok") {
-      return Err(NetError::msg(format!("logout rejected: {v}")));
+      // Do not put the whole portal answer in the log: it echoes client_ip and
+      // online_ip, which the privacy toggle does not hide.
+      let reason = v
+        .get("error_msg")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .or_else(|| v.get("error").and_then(|e| e.as_str()))
+        .unwrap_or("portal rejected the logout");
+      return Err(NetError::msg(format!("logout rejected: {reason}")));
     }
     self.state = State::Offline;
-    Ok(format!("{v}"))
+    Ok("ok".to_string())
   }
 }

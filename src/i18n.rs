@@ -148,7 +148,15 @@ pub struct Texts {
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
   pub background_power_missing: &'static str,
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_oem_power_ok: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_oem_power_limited: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_oem_power_unknown: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
   pub background_authorize: &'static str,
+  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+  pub background_battery_settings: &'static str,
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
   pub background_power_check: &'static str,
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -376,8 +384,12 @@ static ZH: Texts = Texts {
   background_power: "允许后台唤醒",
   background_power_ok: "系统电量限制已解除",
   background_power_missing: "系统电量限制未解除：后台网络会被封锁",
-  background_authorize: "去设置",
-  background_power_check: "已在系统设置中开启自启动、省电策略设为“无限制”",
+  background_oem_power_ok: "MIUI 省电策略：无限制",
+  background_oem_power_limited: "MIUI 省电策略：不在“无限制”列表",
+  background_oem_power_unknown: "MIUI 省电策略：无法读取",
+  background_authorize: "自启动设置",
+  background_battery_settings: "省电设置",
+  background_power_check: "已在系统设置中开启自启动",
   background_power_hint: "未解除时系统会封锁后台网络，唤醒后也登录不了；另需在系统设置里打开“自启动”。",
   background_power_ready: "划掉应用后，下次连上 Wi-Fi 仍会被唤醒。",
   no_credentials: "没有可用的账号或密码",
@@ -520,8 +532,12 @@ static EN: Texts = Texts {
   background_power: "Background wake-up",
   background_power_ok: "Battery restriction lifted",
   background_power_missing: "Battery restriction in place: background network is blocked",
-  background_authorize: "Open settings",
-  background_power_check: "Autostart is on and the power policy is unrestricted",
+  background_oem_power_ok: "MIUI power policy: unrestricted",
+  background_oem_power_limited: "MIUI power policy: not unrestricted",
+  background_oem_power_unknown: "MIUI power policy: unreadable",
+  background_authorize: "Autostart settings",
+  background_battery_settings: "Battery settings",
+  background_power_check: "Autostart is on in the system settings",
   background_power_hint: "While the restriction is in place the system blocks this app's background network, so a wake-up cannot sign in; autostart has to be allowed as well.",
   background_power_ready: "A swiped-away app is still woken on the next Wi-Fi.",
   no_credentials: "No account or password saved",

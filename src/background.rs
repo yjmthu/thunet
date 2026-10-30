@@ -52,6 +52,20 @@ impl Mode {
   }
 }
 
+/// The ROM's power policy, as far as the vendor exposes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OemPower {
+  /// The app is in MIUI's "unrestricted" list.
+  Unrestricted,
+  /// The list is readable and the app is not in it.
+  Restricted,
+  /// Not a MIUI/HyperOS ROM, so the vendor key does not apply at all.
+  NotMiui,
+  /// MIUI, but the key is missing or the read was refused: no claim either way.
+  #[default]
+  Unknown,
+}
+
 /// Did the last request for [`Mode::Service`] lose the notification permission?
 ///
 /// The effective level is then [`Mode::Wake`], and the row explains why instead
@@ -68,6 +82,22 @@ pub fn denied() -> bool {
 /// only known to the system, so it is asked for on every settings tick.
 pub fn power_ok() -> bool {
   crate::android_jni::call_bool_get("backgroundPower").unwrap_or(false)
+}
+
+/// Read the ROM's own power policy.
+///
+/// MIUI keeps the "unrestricted" apps in an undocumented `Settings.System`
+/// key; the Activity reads it and answers `unrestricted`, `restricted` or
+/// `unknown`; a non-MIUI ROM answers `absent`, which the window hides. Everything
+/// outside that vocabulary is [`OemPower::Unknown`], so the window never
+/// presents a guess as a system state.
+pub fn oem_power() -> OemPower {
+  match crate::android_jni::call_str_get("backgroundOemPower") {
+    Ok(text) if text == "unrestricted" => OemPower::Unrestricted,
+    Ok(text) if text == "restricted" => OemPower::Restricted,
+    Ok(text) if text == "absent" => OemPower::NotMiui,
+    _ => OemPower::Unknown,
+  }
 }
 
 /// Has the user confirmed the OEM toggles the app cannot read?
@@ -92,6 +122,11 @@ pub fn set_allowed(on: bool) -> Result<(), String> {
 /// keeps only the user's own confirmation ([`set_allowed`]).
 pub fn request_power() -> Result<(), String> {
   crate::android_jni::call_str("requestBackground", "")
+}
+
+/// Open the ROM's per-app battery page.
+pub fn request_power_settings() -> Result<(), String> {
+  crate::android_jni::call_str("requestPowerSettings", "")
 }
 
 /// Ask the Activity for a new level.

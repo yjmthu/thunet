@@ -163,10 +163,9 @@ fn mask_token(text: &str, needle: &str) -> String {
 
 /// Mask the account inside a rendered log line.
 ///
-/// The line itself is kept: the portal echoes the account in some answers
-/// (`logged out: {...}`) and the logout warning names both the reported and
-/// the saved one, so hiding the affected lines would cost the context that
-/// makes them useful. Only the names turn into dots.
+/// The line itself is kept: a portal answer or a logout warning can name the
+/// account, and hiding the affected lines would cost the context that makes
+/// them useful. Only the names turn into dots.
 fn masked_log(text: String, accounts: &[&str], hidden: bool) -> String {
   if !hidden {
     return text;
@@ -543,6 +542,9 @@ pub struct App {
   /// is what decides whether the app has a background network at all.
   #[cfg(target_os = "android")]
   background_power: bool,
+  /// The ROM's own power policy, read from the vendor settings when possible.
+  #[cfg(target_os = "android")]
+  background_oem_power: crate::background::OemPower,
   /// The Android SSID-detection setting; without the location permission it
   /// stays off and the network probes decide.
   #[cfg(target_os = "android")]
@@ -817,6 +819,8 @@ impl App {
       background_allowed: crate::background::allowed(),
       #[cfg(target_os = "android")]
       background_power: crate::background::power_ok(),
+      #[cfg(target_os = "android")]
+      background_oem_power: crate::background::oem_power(),
       #[cfg(target_os = "android")]
       secure_detection: crate::secure_wifi::enabled(),
       #[cfg(target_os = "android")]
@@ -2025,11 +2029,22 @@ impl App {
               }
               ui.end_row();
               ui.label(t.session_traffic);
-              ui.label(format!(
-                "↓ {}   ↑ {}",
-                human(self.info.bytes_in),
-                human(self.info.bytes_out)
-              ));
+              let height = ui.text_style_height(&egui::TextStyle::Body);
+              let gap = 12.0;
+              let down = traffic_job(ui, "↓", self.info.bytes_in, ui.visuals().hyperlink_color);
+              let up = traffic_job(ui, "↑", self.info.bytes_out, ui.visuals().warn_fg_color);
+              let down = ui.ctx().fonts_mut(|f| f.layout_job(down));
+              let up = ui.ctx().fonts_mut(|f| f.layout_job(up));
+              let width = down.size().x + gap + up.size().x;
+              ui.allocate_ui_with_layout(
+                egui::vec2(width, height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                  ui.spacing_mut().item_spacing.x = gap;
+                  ui.add(egui::Label::new(down));
+                  ui.add(egui::Label::new(up));
+                },
+              );
               ui.end_row();
               // The core is a separate process in service mode, so the row says
               // whether one is answering and which version it runs, and the
@@ -2372,9 +2387,11 @@ impl App {
             // right screens and keeps the user's confirmation.
             if self.background != Mode::Off {
               let mut authorize = false;
+              let mut battery = false;
+              ui.label(t.background_power);
               ui.horizontal(|ui| {
-                ui.label(t.background_power);
                 authorize = ui.button(t.background_authorize).clicked();
+                battery = ui.button(t.background_battery_settings).clicked();
               });
               // Readable, and it is the switch the firewall follows: without it
               // the system drops this app's packets in the background.
@@ -2384,6 +2401,27 @@ impl App {
                 (t.background_power_missing, ui.visuals().warn_fg_color)
               };
               ui.add(egui::Label::new(egui::RichText::new(state).small().color(color)).wrap());
+              // MIUI's own policy is a separate switch from the AOSP exemption.
+              // Only the vendor's "unrestricted" list is readable; a missing key
+              // stays unknown instead of being shown as "restricted".
+              let oem = match self.background_oem_power {
+                crate::background::OemPower::Unrestricted => {
+                  Some((t.background_oem_power_ok, ui.visuals().weak_text_color()))
+                }
+                crate::background::OemPower::Restricted => {
+                  Some((t.background_oem_power_limited, ui.visuals().warn_fg_color))
+                }
+                crate::background::OemPower::Unknown => Some((
+                  t.background_oem_power_unknown,
+                  ui.visuals().weak_text_color(),
+                )),
+                // Not a MIUI ROM: the vendor key does not apply, so the line
+                // would only be noise.
+                crate::background::OemPower::NotMiui => None,
+              };
+              if let Some((oem, oem_color)) = oem {
+                ui.add(egui::Label::new(egui::RichText::new(oem).small().color(oem_color)).wrap());
+              }
               let mut allowed = self.background_allowed;
               if ui
                 .checkbox(&mut allowed, t.background_power_check)
@@ -2408,6 +2446,9 @@ impl App {
                 .wrap(),
               );
               if authorize && let Err(e) = crate::background::request_power() {
+                self.toast_err(e);
+              }
+              if battery && let Err(e) = crate::background::request_power_settings() {
                 self.toast_err(e);
               }
             }
@@ -2819,7 +2860,18 @@ impl App {
           // taller than the text and centres it, which pushed the stamp back up
           // by half the difference.
           let text_h = ui.text_style_height(&egui::TextStyle::Small);
-          let strip = RULE_H + RULE_GAP + text_h;
+          // Android needs a second footer line for the build time: the full
+          // label does not fit beside the version at 412 pt. Reserve both lines
+          // so the rule stays pinned to the bottom edge.
+          #[cfg(target_os = "android")]
+          let footer_lines = 2.0;
+          #[cfg(not(target_os = "android"))]
+          let footer_lines = 1.0;
+          #[cfg(target_os = "android")]
+          let footer_gap = 2.0;
+          #[cfg(not(target_os = "android"))]
+          let footer_gap = 0.0;
+          let strip = RULE_H + RULE_GAP + text_h * footer_lines + footer_gap;
           let rest = ui.available_height() - strip;
           if rest > 0.0 {
             ui.add_space(rest);
@@ -2865,15 +2917,39 @@ impl App {
                     new_tab: true,
                   });
                 }
-                // The build stamp is desktop-width; on a 412 pt phone it
-                // overflows the strip. The version on the left still answers
-                // "which build is this".
+                // Campus-network self-service: online devices and account.
+                let usereg = footer_globe(ui).on_hover_text(USEREG_URL);
+                if usereg.hovered() {
+                  ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if usereg.clicked() {
+                  ui.ctx().open_url(egui::OpenUrl {
+                    url: USEREG_URL.to_owned(),
+                    new_tab: true,
+                  });
+                }
+                // Desktop keeps the build time on this row; the phone puts it
+                // on the line below because the full label does not fit at
+                // 412 pt.
                 #[cfg(not(target_os = "android"))]
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                   ui.label(egui::RichText::new(build_time_label(t)).small().weak());
                 });
               },
             );
+            // On the phone the build time gets its own right-aligned line under
+            // the version instead of sharing the strip with it.
+            #[cfg(target_os = "android")]
+            {
+              ui.add_space(footer_gap);
+              ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), text_h),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                  ui.label(egui::RichText::new(build_time_label(t)).small().weak());
+                },
+              );
+            }
           });
         }
         // Consume the leftover vertical space so the frame background reaches
@@ -4945,8 +5021,8 @@ mod tests {
   fn logs_mask_the_account_only_as_a_whole_token() {
     let accounts = ["1234567890", "alice"];
 
-    // The portal echoes the account in some answers; the line keeps its shape.
-    let echo = Line::info(r#"logged out: {"error":"ok","user_name":"1234567890"}"#);
+    // A portal answer can echo the account; the line keeps its shape.
+    let echo = Line::info(r#"portal: {"error":"ok","user_name":"1234567890"}"#);
     let plain = masked_log(echo.render(), &accounts, false);
     assert_eq!(
       plain,
@@ -5903,6 +5979,7 @@ impl eframe::App for App {
         self.background_denied = crate::background::denied();
         self.background_allowed = crate::background::allowed();
         self.background_power = crate::background::power_ok();
+        self.background_oem_power = crate::background::oem_power();
         self.secure_detection = crate::secure_wifi::enabled();
       }
     }
@@ -6050,6 +6127,9 @@ fn build_time() -> String {
   }
 }
 
+/// Tsinghua's campus-network self-service portal: online devices and account.
+const USEREG_URL: &str = "https://usereg.tsinghua.edu.cn/";
+
 /// Left half of the settings footer: name plus version.
 fn build_version() -> String {
   format!(
@@ -6087,6 +6167,75 @@ fn should_restart(core_epoch: u64, own_epoch: u64, file_changed: bool) -> bool {
 /// Right half of the settings footer: what the build time actually is.
 fn build_time_label(t: &Texts) -> String {
   format!("{} · {} {}", build_profile(), t.built, build_time())
+}
+
+/// One direction of the session traffic.
+///
+/// The arrow carries the direction colour and the number stays in the body
+/// colour. Each direction is a separate label on purpose: a single label made
+/// a double-click select both numbers, and the user cannot copy one side alone.
+fn traffic_job(
+  ui: &egui::Ui,
+  arrow: &str,
+  bytes: u64,
+  arrow_color: egui::Color32,
+) -> egui::text::LayoutJob {
+  let font = egui::TextStyle::Body.resolve(ui.style());
+  let mut job = egui::text::LayoutJob::default();
+  let add = |job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32| {
+    job.append(
+      text,
+      0.0,
+      egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+      },
+    );
+  };
+  add(&mut job, arrow, arrow_color);
+  add(
+    &mut job,
+    &format!(" {}", human(bytes)),
+    ui.visuals().text_color(),
+  );
+  job
+}
+
+/// Small monochrome globe for the usereg link.
+///
+/// Drawn instead of using a font glyph so it keeps the same stroke weight on
+/// every platform; the footer's GitHub mark is a font icon and the two must
+/// still read as a pair.
+fn footer_globe(ui: &mut egui::Ui) -> egui::Response {
+  let size = ui.text_style_height(&egui::TextStyle::Small);
+  let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+  if ui.is_rect_visible(rect) {
+    let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color());
+    let center = rect.center();
+    // Smaller than the line box so it reads at the GitHub glyph's visual
+    // weight; the whole square stays clickable.
+    let radius = size * 0.30;
+    let painter = ui.painter();
+    painter.circle_stroke(center, radius, stroke);
+    // Two latitude lines and one meridian: enough to read as a globe at this
+    // size without a font dependency.
+    for dy in [-radius * 0.45, radius * 0.45] {
+      let dx = (radius * radius - dy * dy).sqrt();
+      painter.line_segment(
+        [center + egui::vec2(-dx, dy), center + egui::vec2(dx, dy)],
+        stroke,
+      );
+    }
+    painter.line_segment(
+      [
+        center + egui::vec2(0.0, -radius),
+        center + egui::vec2(0.0, radius),
+      ],
+      stroke,
+    );
+  }
+  response
 }
 
 /// `Debug` or `Release`, from the profile Cargo used for this build.

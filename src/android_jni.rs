@@ -69,6 +69,21 @@ pub fn call_bool_get(method: &str) -> Result<bool, String> {
   })
 }
 
+/// Call `ThunetActivity.<method>() -> String`.
+pub fn call_str_get(method: &str) -> Result<String, String> {
+  with_env(|env, activity| {
+    let value = env
+      .call_method(activity, method, "()Ljava/lang/String;", &[])?
+      .l()?;
+    if value.is_null() {
+      return Ok(String::new());
+    }
+    let text = jni::objects::JString::from(value);
+    let text = env.get_string(&text)?;
+    Ok(text.to_string_lossy().into_owned())
+  })
+}
+
 /// Tell the Activity which credential field has the focus, where it sits (in
 /// physical pixels) and what it holds. This is what opens the autofill
 /// dropdown for a field that only exists on the egui surface.

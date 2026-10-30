@@ -15,6 +15,10 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
   <!-- WorkManager holds a wake lock while the periodic backstop runs. -->
   <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <!-- The "Background wake-up" row opens the system battery-optimisation
+       exemption dialog. Without this permission that intent is refused and the
+       app can never reach the power-save whitelist on its own. -->
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
   <application
     android:name=".ThunetApp"

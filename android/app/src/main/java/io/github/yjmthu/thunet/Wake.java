@@ -2,6 +2,7 @@ package io.github.yjmthu.thunet;
 
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.net.ConnectivityManager;
@@ -9,6 +10,7 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
@@ -110,8 +112,9 @@ final class Wake {
   /**
    * Ask the system to exempt this app from battery optimisation.
    *
-   * Returns false when it is already exempt (or the ROM has no such dialog), so
-   * the caller can go straight to the OEM page.
+   * Returns false when it is already exempt, or when neither the direct request
+   * nor the list page can be opened, so the caller can go straight to the OEM
+   * page.
    */
   static boolean requestPower(Activity activity) {
     PowerManager power = activity.getSystemService(PowerManager.class);
@@ -127,8 +130,17 @@ final class Wake {
       activity.startActivity(intent);
       return true;
     } catch (Throwable error) {
+      // A ROM may refuse the direct request; the list still lets the user find
+      // the app. Without the manifest permission the system refuses both.
       Log.i(TAG, "background: no battery dialog: " + error);
-      return false;
+      try {
+        activity.startActivity(
+            new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        return true;
+      } catch (Throwable ignored) {
+        return false;
+      }
     }
   }
 
@@ -164,6 +176,94 @@ final class Wake {
     } catch (Throwable ignored) {
       // Nothing left to open; the hint still says where to look.
     }
+  }
+
+  /**
+   * Open the ROM's per-app battery page.
+   *
+   * On HyperOS the AOSP action resolves to MIUI's `PowerDetailActivity`, the
+   * page that carries the power policy; the explicit component and the list
+   * page are fallbacks for ROMs that do not provide that filter.
+   */
+  static void openPowerSettings(Context context) {
+    String pkg = context.getPackageName();
+    Intent request =
+        new Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + pkg))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+    if (start(context, request, "battery")) {
+      return;
+    }
+    Intent detail =
+        new Intent(request)
+            .setComponent(
+                new ComponentName(
+                    "com.miui.securitycenter",
+                    "com.miui.powercenter.legacypowerrank.PowerDetailActivity"));
+    if (start(context, detail, "battery detail")) {
+      return;
+    }
+    start(
+        context,
+        new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        "battery list");
+  }
+
+  private static boolean start(Context context, Intent intent, String what) {
+    try {
+      context.startActivity(intent);
+      return true;
+    } catch (Throwable error) {
+      Log.i(TAG, "background: no " + what + " page: " + error);
+      return false;
+    }
+  }
+
+  /**
+   * The MIUI/HyperOS power policy as far as it is readable.
+   *
+   * `Settings.System.MILLET_NO_RESTRICT_APP` is the vendor's comma-separated
+   * list of apps whose power policy is "unrestricted". It is not public API:
+   * a missing key or a refused read is reported as `unknown` instead of being
+   * presented as a state. Other ROMs do not have the key.
+   */
+  static String oemPower(Context context) {
+    if (!isMiui()) {
+      return "absent";
+    }
+    try {
+      String list =
+          Settings.System.getString(context.getContentResolver(), "MILLET_NO_RESTRICT_APP");
+      if (list == null || list.trim().isEmpty()) {
+        return "unknown";
+      }
+      String pkg = context.getPackageName();
+      for (String item : list.split(",")) {
+        if (item.trim().equals(pkg)) {
+          return "unrestricted";
+        }
+      }
+      return "restricted";
+    } catch (Throwable error) {
+      Log.i(TAG, "background: cannot read the MIUI power policy: " + error);
+      return "unknown";
+    }
+  }
+
+  /** Xiaomi/Redmi/POCO builds are the only ones with the MIUI power list. */
+  private static boolean isMiui() {
+    String maker =
+        Build.MANUFACTURER == null
+            ? ""
+            : Build.MANUFACTURER.toLowerCase(java.util.Locale.ROOT);
+    String brand =
+        Build.BRAND == null ? "" : Build.BRAND.toLowerCase(java.util.Locale.ROOT);
+    return maker.contains("xiaomi")
+        || brand.contains("xiaomi")
+        || brand.contains("redmi")
+        || brand.contains("poco");
   }
 
   static void setDenied(Context context, boolean denied) {

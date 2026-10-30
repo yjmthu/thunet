@@ -170,6 +170,27 @@ public class ThunetActivity extends android.app.NativeActivity {
         });
   }
 
+  /**
+   * Called from Rust ({@code src/background.rs}) by the "battery settings" row.
+   *
+   * This is deliberately separate from {@link #requestBackground}: it always
+   * opens the ROM's per-app power page, whether or not the AOSP exemption is
+   * already in place.
+   */
+  public void requestPowerSettings(String ignored) {
+    runOnUiThread(() -> Wake.openPowerSettings(this));
+  }
+
+  /**
+   * Called from Rust ({@code src/background.rs}) on every settings tick.
+   *
+   * Returns `unrestricted`, `restricted` or `unknown`; the vendor key is not
+   * public API, so the window only shows what this reports.
+   */
+  public String backgroundOemPower() {
+    return Wake.oemPower(this);
+  }
+
   /** Called from Rust ({@code src/background.rs}) when the user's own
    * "already set" confirmation moves. */
   public void setBackgroundAllowed(boolean on) {

@@ -577,8 +577,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             } else {
               match session.logout() {
                 Ok(m) => {
-                  tx.send(Ev::Log(Line::info(format!("logged out: {m}"))))
-                    .ok();
+                  tx.send(Ev::Log(Line::info(format!("logout: {m}")))).ok();
                   tx.send(Ev::Notify {
                     msg: t.disconnected.into(),
                     kind: ToastKind::Ok,
