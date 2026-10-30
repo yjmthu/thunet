@@ -36,6 +36,19 @@ pub(crate) const POLL_OFFLINE: Duration = Duration::from_secs(10);
 /// an answer, which is not a session the window should keep showing as up.
 const STATUS_FAILURES: u32 = 2;
 
+/// How often the same unanswered status poll is logged again, in wall time.
+/// The failure repeats verbatim for as long as the machine sits on a link
+/// where the portal is unreachable: log the first one, then a reminder this
+/// often, so a long outage leaves a breadcrumb instead of owning the file
+/// (159 identical lines were 57% of one session's log).
+const STATUS_LOG_REPEAT: Duration = Duration::from_secs(600);
+
+/// How long a route change has to hold before it counts while a session is up.
+/// A DHCP renew or a Wi-Fi roam flips the local address for about a second;
+/// acting on that took the window offline and started a fresh login for
+/// nothing.
+const LINK_SETTLE: Duration = Duration::from_millis(1500);
+
 /// How long the core keeps trying to establish a session when nothing keeps it
 /// online afterwards, measured in time the link is actually usable.
 ///
@@ -260,6 +273,18 @@ fn failure_of(label: &str, e: &NetError) -> Failure {
   }
 }
 
+/// Send whatever the last attempt had to say about the path to the portal.
+///
+/// A re-detected ac_id (`ac_id changed 240 -> 21, retrying`) describes the
+/// *first*, failed attempt of the same call that then succeeded, so it belongs
+/// in the log **before** the outcome line. Printed afterwards by the end of the
+/// loop, the two lines read like the client logged in twice.
+fn drain_warnings(tx: &Sink, session: &mut Session) {
+  for w in session.take_warnings() {
+    tx.send(Ev::Log(w)).ok();
+  }
+}
+
 /// Replace the live session with one created by `next`, or leave it alone.
 ///
 /// The portal hands out one session per address and proves a password only by
@@ -310,7 +335,9 @@ fn switch_account(
 
   session.set_credentials(username.to_string(), password.to_string());
   session.cfg_mut().remember_password = remember;
-  match session.ensure_online() {
+  let outcome = session.ensure_online();
+  drain_warnings(tx, session);
+  match outcome {
     Ok(m) => {
       tx.send(Ev::Log(Line::info(format!("account switched: {m}"))))
         .ok();
@@ -347,6 +374,29 @@ fn switch_account(
   }
 }
 
+/// One stable, short line for a status poll that got no answer.
+///
+/// The transport error's own text is often a whole paragraph: rustls appends a
+/// docs URL to every `close_notify` report, and that single message was 57% of
+/// one session's log. Known cases get a sentence; anything else is cut at its
+/// first URL and capped, because the window needs the reason, not the link.
+fn status_error_text(e: &(impl std::fmt::Display + ?Sized)) -> String {
+  const CLOSE_NOTIFY: &str = "without sending TLS close_notify";
+
+  let raw = e.to_string();
+  if raw.contains(CLOSE_NOTIFY) {
+    return "status: the portal closed the connection without close_notify".to_string();
+  }
+
+  let cut = raw
+    .find(" https://")
+    .or_else(|| raw.find(" http://"))
+    .unwrap_or(raw.len());
+  let mut text = String::from("status: ");
+  text.extend(raw[..cut].trim_end().chars().take(160));
+  text
+}
+
 pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
   let mut lang = Lang::from_setting(&cfg.lang);
@@ -378,8 +428,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   let mut last_status = Instant::now() - Duration::from_secs(60);
   // Consecutive status polls that got no answer at all.
   let mut status_failures = 0u32;
-  // Whether the current run of failures has been logged already.
-  let mut status_logged = false;
+  // The last no-answer message and when it was logged, so a run of identical
+  // failures is one line (plus the occasional reminder) rather than one per
+  // poll.
+  let mut last_status_log: Option<(String, Instant)> = None;
   // Ask the portal again in this pass: a new link or a new Wi-Fi name can
   // invalidate the answer the window is showing before the next period is due.
   let mut force_status = false;
@@ -407,6 +459,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // pulled, Wi-Fi joined, a new address - the verdict describes a network the
   // machine has already left, so it is re-probed even while the session is up.
   let mut last_link: Option<std::net::IpAddr> = None;
+  // The route change being watched: the address and when it first appeared.
+  // Only used to hold a move while a session is up.
+  let mut pending_link: Option<(Option<std::net::IpAddr>, Instant)> = None;
   // Android: the transport is written to `files/link.txt` by the Activity, and
   // that write can land a moment after the route changed. A verdict computed in
   // between would describe the link the machine just left, so the kind itself
@@ -926,7 +981,34 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     if Instant::now() >= next_link_check {
       next_link_check = Instant::now() + Duration::from_secs(1);
       let id = crate::srun::link_id();
-      if id != last_link {
+      // A route change only counts once it holds: a DHCP renew or a Wi-Fi roam
+      // flips the local address for a second, and acting on that took the
+      // window offline and started a fresh login for nothing. While a session
+      // is up the move waits for LINK_SETTLE; with nothing to protect it is
+      // taken at once, so a fresh link still logs in within the first second.
+      let settled = if id == last_link {
+        pending_link = None;
+        false
+      } else if session.state != State::Online {
+        pending_link = None;
+        true
+      } else {
+        match pending_link {
+          Some((pending, since)) if pending == id => {
+            if since.elapsed() >= LINK_SETTLE {
+              pending_link = None;
+              true
+            } else {
+              false
+            }
+          }
+          _ => {
+            pending_link = Some((id, Instant::now()));
+            false
+          }
+        }
+      };
+      if settled {
         last_link = id;
         // The portal session belonged to the link just left: its address is
         // gone, so the window must not keep claiming it is online. Whatever
@@ -1155,7 +1237,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         continue;
       }
 
-      match session.ensure_online() {
+      let outcome = session.ensure_online();
+      drain_warnings(&tx, &mut session);
+      match outcome {
         Ok(m) => {
           failures = 0;
           last_failure.clear();
@@ -1266,16 +1350,21 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       match &answer {
         Ok(_) => {
           status_failures = 0;
-          status_logged = false;
+          last_status_log = None;
         }
         Err(e) => {
           // The portal did not answer at all: no route, a dead link, or a host
-          // that stopped responding. Only the first failure of a run is logged:
-          // while the machine sits on a network with no portal, every poll
-          // fails the same way and would fill the log.
-          if !status_logged {
-            tx.send(Ev::Log(Line::debug(format!("status: {e}")))).ok();
-            status_logged = true;
+          // that stopped responding. While the machine sits on such a link
+          // every poll fails the same way, so a message is logged once and then
+          // only again when it changes or STATUS_LOG_REPEAT has passed.
+          let text = status_error_text(e);
+          let repeat_due = match &last_status_log {
+            Some((last, at)) => last != &text || at.elapsed() >= STATUS_LOG_REPEAT,
+            None => true,
+          };
+          if repeat_due {
+            tx.send(Ev::Log(Line::debug(text.clone()))).ok();
+            last_status_log = Some((text, Instant::now()));
           }
           if session.state == State::Online {
             status_failures = status_failures.saturating_add(1);
@@ -1361,5 +1450,27 @@ mod tests {
     assert!(!portal_verbs(&LoginEnv::EnterpriseWifi(
       "Tsinghua-Secure 2".into()
     )));
+  }
+
+  #[test]
+  fn status_error_text_stays_one_short_line() {
+    // The rustls form: a sentence plus a docs URL that used to be written out
+    // verbatim on every poll.
+    let rustls = "io: peer closed connection without sending TLS close_notify: \
+                  https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+    assert_eq!(
+      status_error_text(rustls),
+      "status: the portal closed the connection without close_notify"
+    );
+
+    // Anything else keeps its own words, minus any URL.
+    assert_eq!(
+      status_error_text("io: something https://example.com/a/b"),
+      "status: io: something"
+    );
+    assert_eq!(
+      status_error_text("io: timeout: global"),
+      "status: io: timeout: global"
+    );
   }
 }
