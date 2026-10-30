@@ -559,10 +559,10 @@ fn spawn_connection(stream: Stream, cmds: &Sender<Cmd>, hub: &Hub) {
   {
     let peer = peer_of(&stream);
     crate::diag::line(&format!(
-      "core: accepted connection from {} (interactive={})",
-      peer.label, peer.interactive
+      "core: accepted connection from {} (authorized={})",
+      peer.label, peer.authorized
     ));
-    if !peer.interactive {
+    if !peer.authorized {
       // Fail closed, but tell the frontend why instead of letting it reconnect
       // every two seconds with no explanation.
       let (_, mut out) = stream.halves();
@@ -617,10 +617,10 @@ fn handle_windows_connection(mut stream: Stream, cmds: Sender<Cmd>, hub: Hub) {
   };
   let peer = peer_of(&stream);
   crate::diag::line(&format!(
-    "core: accepted connection from {} (interactive={})",
-    peer.label, peer.interactive
+    "core: accepted connection from {} (authorized={})",
+    peer.label, peer.authorized
   ));
-  if !peer.interactive {
+  if !peer.authorized {
     let line = Wire::ev(Ev::Log(crate::logline::Line::warn(format!(
       "core rejected frontend: {}",
       peer.label
@@ -1055,7 +1055,9 @@ fn write_line(out: &mut impl Write, wire: &Wire) -> std::io::Result<()> {
 /// A connection's peer, reduced to what the policy needs.
 struct Peer {
   label: String,
-  interactive: bool,
+  /// Whether the token check let this peer drive the core. The transport's own
+  /// permissions (the pipe DACL) have already decided who may connect at all.
+  authorized: bool,
 }
 
 #[cfg(windows)]
@@ -1064,13 +1066,18 @@ fn peer_of(stream: &Stream) -> Peer {
     Ok(pid) => crate::ident::describe(pid),
     Err(_) => "unknown".into(),
   };
-  // The pipe DACL already decides who may connect (INTERACTIVE for the machine
-  // pipe, owner-only for a portable one). Impersonation adds a token check
-  // without opening the client process, which the unprivileged service account
-  // cannot do. A session check is deliberately not used here: an identification
-  // token may report session 0 even for an interactive client, and the DACL is
-  // the real boundary.
-  let (interactive, how) = match stream.impersonate_client() {
+  // The pipe DACL already decides who may connect: SYSTEM, Administrators and
+  // INTERACTIVE for the machine pipe, the owner only for a portable one.
+  // Impersonation therefore checks one thing the DACL cannot express - that the
+  // peer is not the service's own account, which the ACL has to trust with
+  // `FILE_CREATE_PIPE_INSTANCE` and which could otherwise pose as a frontend.
+  //
+  // The session id is copied into the label and deliberately kept out of the
+  // decision. OpenSSH runs its children in session 0 with the user's own token,
+  // so rejecting session 0 turned every `thunet status` typed over SSH into a
+  // pipe the DACL had just admitted being closed again, with no reason the CLI
+  // could show.
+  let (authorized, how) = match stream.impersonate_client() {
     Ok(guard) => {
       let sid = crate::ident::current_thread_user_sid();
       let session = crate::ident::current_thread_session();
@@ -1079,25 +1086,22 @@ fn peer_of(stream: &Stream) -> Peer {
         .as_deref()
         .and_then(crate::ident::sid_to_string)
         .unwrap_or_else(|| "unknown".into());
-      match (sid, session) {
-        (Some(sid), Some(session)) => {
-          let service = crate::ident::is_service_sid(&sid);
-          (
-            !service && session != 0,
-            format!("impersonated sid={sid_text} session={session}"),
-          )
-        }
-        _ => (
-          false,
-          format!("impersonated sid={sid_text} session={session:?} could not be read"),
-        ),
+      let how = match session {
+        Some(session) => format!("impersonated sid={sid_text} session={session}"),
+        None => format!("impersonated sid={sid_text}, session unreadable"),
+      };
+      // A SID that cannot be read cannot be told apart from the service account,
+      // so it fails closed; a missing session id only costs a label.
+      match sid {
+        Some(sid) => (!crate::ident::is_service_sid(&sid), how),
+        None => (false, how),
       }
     }
     Err(e) => (false, format!("impersonation failed: {e}")),
   };
   Peer {
     label: format!("{label} [{how}]"),
-    interactive,
+    authorized,
   }
 }
 
@@ -1106,11 +1110,11 @@ fn peer_of(stream: &Stream) -> Peer {
   match stream.peer_creds().ok().and_then(|c| c.euid()) {
     Some(uid) => Peer {
       label: crate::ident::describe(uid),
-      interactive: crate::ident::is_interactive(uid),
+      authorized: crate::ident::is_interactive(uid),
     },
     None => Peer {
       label: "unknown".into(),
-      interactive: false,
+      authorized: false,
     },
   }
 }
@@ -1563,7 +1567,7 @@ mod tests {
     let line = read_first_line(&mut accepted).expect("handshake read");
     assert_eq!(line, "{\"v\":1}");
     let peer = peer_of(&accepted);
-    assert!(peer.interactive, "peer rejected: {}", peer.label);
+    assert!(peer.authorized, "peer rejected: {}", peer.label);
     // `accept` creates the next instance; if the DACL denied the server that
     // right, this second connection would block until it timed out.
     let second = connect(&name).expect("second client");

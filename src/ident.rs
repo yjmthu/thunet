@@ -2,7 +2,8 @@
 //!
 //! The control channel is machine-wide, so both ends authenticate each other:
 //!
-//! * the core checks that a frontend comes from an interactive user;
+//! * the core keeps the service's own account from posing as a frontend - the
+//!   pipe DACL has already decided who may connect at all;
 //! * the frontend checks that the process listening on the endpoint really is
 //!   the service, not a user-run process that grabbed the free name while the
 //!   service was stopped.
@@ -344,10 +345,12 @@ pub use imp::*;
 
 #[cfg(all(test, windows))]
 mod tests {
-  /// The service must be able to see that a frontend is interactive without
-  /// opening its process; `ProcessIdToSessionId` is the access-free check.
+  /// The service must be able to read a client's session without opening its
+  /// process; `ProcessIdToSessionId` is the access-free call. The value is only
+  /// a log label - a shell reached over SSH runs in session 0 with the user's
+  /// own token, so it says nothing about who may drive the core.
   #[test]
-  fn this_process_is_interactive() {
-    assert!(super::process_session(std::process::id()).is_some_and(|session| session != 0));
+  fn this_process_has_a_session() {
+    assert!(super::process_session(std::process::id()).is_some());
   }
 }

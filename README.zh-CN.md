@@ -605,9 +605,9 @@ flowchart LR
 | 谁可以连 | 服务管道：`SYSTEM`/`Administrators` 全权，`INTERACTIVE`（Windows 内置的“交互登录用户”安全标识）读写；便携管道：仅启动它的用户 | 无文件权限；任何本地 uid 都能连 |
 | 对端身份 | `ImpersonateNamedPipeClient` → token SID + session id | `SO_PEERCRED` → `ucred{pid,uid,gid}` |
 | 服务端身份 | 管道句柄的 `GetSecurityInfo` → owner SID | 已连接 socket 的 `SO_PEERCRED` → 服务端 uid |
-| 策略 | 拒绝 session 0 / 非交互 token | **任何本地 uid**：abstract socket 本身没有权限位，也不查 logind，所以机器上每个账号都能驱动共享 core |
+| 策略 | 只挡住服务自身账号；凡是被 DACL 放进来的都是前端（session id 只用于日志，因为 SSH shell 跑在 session 0） | **任何本地 uid**：abstract socket 本身没有权限位，也不查 logind，所以机器上每个账号都能驱动共享 core |
 
-两个方向都要检查：core 验证调用者是交互用户，窗口验证对面真的是服务。没有第二项检查，服务停着时任何用户都能抢占空闲端点，从其他用户的窗口里收走 `SetCredentials`。
+两个方向都要检查：core 验证调用者不是服务自己的账号——管道 DACL 必须授权该账号 `FILE_CREATE_PIPE_INSTANCE`，不挡的话它就能冒充前端；谁可以连进来是 DACL 的决定，而它已经覆盖每个已登录用户，包括通过 SSH 进来的 shell（那些进程在 session 0，所以 session id 不参与策略）。窗口验证对面真的是服务。没有第二项检查，服务停着时任何用户都能抢占空闲端点，从其他用户的窗口里收走 `SetCredentials`。
 
 两个平台并不是一样严格的，上表已经写明了这一点：Linux 上「前端 → core」这一项退化成「调用者是本机进程」，因为 abstract socket 没有权限位，`is_interactive()` 对每个 uid 都返回 `true`。也就是说同一台机器上的其他账号可以给共享 core 发 `Connect`、`Disconnect`、`SetCredentials`，也可以读它的状态——那些账号只要拿到 root 本来也能改 `/var/lib/thunet`，而 root 在两个平台上都能做任何事。要收紧（只允许有活动 logind 会话的 uid）就得引入 D-Bus 依赖，这里刻意不做。
 
