@@ -54,8 +54,9 @@ pub struct Texts {
   pub autostart_off: &'static str,
   pub autostart_core: &'static str,
   pub autostart_all: &'static str,
-  /// Shown instead of the autostart row in portable mode, which has no
-  /// service to start at boot.
+  /// The portable window's autostart switch. Machine mode offers the three
+  /// modes above instead, because they include the core service; a portable
+  /// run has no service, so its one entry is the login item for this window.
   pub portable_autostart: &'static str,
   pub start_minimized: &'static str,
   /// Sign in by itself right after the core starts.
@@ -354,7 +355,7 @@ static ZH: Texts = Texts {
   autostart_off: "关闭",
   autostart_core: "仅服务",
   autostart_all: "服务和托盘",
-  portable_autostart: "便携模式下没有开机自启：后台核心随本会话启动，退出即结束",
+  portable_autostart: "登录时启动本窗口",
   start_minimized: "启动时最小化到托盘",
   auto_connect: "启动时自动连接",
   keep_online: "保持连接",
@@ -507,7 +508,7 @@ static EN: Texts = Texts {
   autostart_off: "Off",
   autostart_core: "Service only",
   autostart_all: "Service and tray",
-  portable_autostart: "Portable mode has no autostart: the core belongs to this session",
+  portable_autostart: "Start this window at login",
   start_minimized: "Start minimised to tray",
   auto_connect: "Connect on startup",
   keep_online: "Stay online",

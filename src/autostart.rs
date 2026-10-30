@@ -113,10 +113,26 @@ mod portable_service {
   }
 }
 
+/// Quote an argument that a space would otherwise split.
+///
+/// Both consumers join the arguments into one command line with spaces - the
+/// Windows task XML and the `Exec=` line of the XDG entry - and neither quotes
+/// them, so a state directory under a path with spaces has to carry its own.
+fn quoted(arg: &str) -> String {
+  if arg.contains(' ') {
+    format!("\"{arg}\"")
+  } else {
+    arg.to_string()
+  }
+}
+
 #[derive(Clone)]
 pub struct Autostart {
   exe: PathBuf,
   minimized: bool,
+  /// Set for a portable window: the entry has to name the state directory, or
+  /// the copy it starts would read the machine configuration instead.
+  state_dir: Option<PathBuf>,
 }
 
 impl Autostart {
@@ -125,15 +141,35 @@ impl Autostart {
     Some(Self {
       exe: crate::exe_path()?,
       minimized,
+      state_dir: None,
     })
   }
 
-  fn args(&self) -> &'static [&'static str] {
-    if self.minimized {
-      &["--minimized"]
-    } else {
-      &[]
+  /// The login entry of a portable window: same executable, plus the state
+  /// directory it was started with.
+  pub fn portable(minimized: bool, state_dir: PathBuf) -> Option<Self> {
+    Some(Self {
+      exe: crate::exe_path()?,
+      minimized,
+      state_dir: Some(state_dir),
+    })
+  }
+
+  /// Is this the entry of a portable window?
+  pub fn is_portable(&self) -> bool {
+    self.state_dir.is_some()
+  }
+
+  fn args(&self) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(dir) = &self.state_dir {
+      args.push("--state-dir".to_string());
+      args.push(quoted(&dir.to_string_lossy()));
     }
+    if self.minimized {
+      args.push("--minimized".to_string());
+    }
+    args
   }
 
   /// Which entries are registered right now.
@@ -187,6 +223,26 @@ impl Autostart {
   /// alone — on Windows touching it would mean a UAC prompt for a checkbox.
   pub fn refresh_tray(&self) -> Result<(), String> {
     imp::refresh_tray(self)
+  }
+
+  /// Is the login entry that starts this window registered?
+  ///
+  /// A portable window has no core service, so this is its whole autostart
+  /// state: [`Self::mode`] would always answer `Off` for it.
+  pub fn tray_enabled(&self) -> bool {
+    imp::tray_registered(self)
+  }
+
+  /// Register or remove the login entry that starts this window.
+  ///
+  /// Only the window half: a portable run has no service to register. Both
+  /// platforms write a per-user entry, so nothing here needs elevation.
+  pub fn set_tray(&self, on: bool) -> Result<(), String> {
+    if on {
+      imp::enable_tray(self)
+    } else {
+      imp::disable_tray(self)
+    }
   }
 
   /// Install the service entry the CLI drives, if it is missing, so
@@ -342,6 +398,52 @@ fn now_ms() -> u128 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| d.as_millis())
+}
+
+#[cfg(test)]
+mod portable_entry {
+  use super::{Autostart, quoted};
+  use std::path::PathBuf;
+
+  fn entry(minimized: bool, state_dir: Option<&str>) -> Autostart {
+    Autostart {
+      exe: PathBuf::from("/opt/thunet"),
+      minimized,
+      state_dir: state_dir.map(PathBuf::from),
+    }
+  }
+
+  /// The autostarted copy has to read the same state directory, or it would
+  /// start against the machine config instead.
+  #[test]
+  fn a_portable_entry_names_its_state_directory() {
+    assert_eq!(
+      entry(true, Some("/opt/thunet/state")).args(),
+      ["--state-dir", "/opt/thunet/state", "--minimized"]
+    );
+    assert_eq!(
+      entry(false, Some("/opt/thunet/state")).args(),
+      ["--state-dir", "/opt/thunet/state"]
+    );
+    assert!(entry(false, Some("/opt/thunet/state")).is_portable());
+  }
+
+  /// A machine entry keeps the command line it always had.
+  #[test]
+  fn a_machine_entry_carries_only_the_minimized_flag() {
+    assert_eq!(entry(true, None).args(), ["--minimized"]);
+    assert!(entry(false, None).args().is_empty());
+    assert!(!entry(false, None).is_portable());
+  }
+
+  /// Both consumers join the arguments with spaces, so a directory with one
+  /// has to arrive quoted.
+  #[test]
+  fn a_state_directory_with_spaces_stays_one_argument() {
+    let args = entry(false, Some("/home/alice/My Apps/state")).args();
+    assert_eq!(args[1], "\"/home/alice/My Apps/state\"");
+    assert_eq!(quoted("/tmp/state"), "/tmp/state");
+  }
 }
 
 #[cfg(test)]
@@ -557,13 +659,20 @@ mod imp {
   /// Poll interval while waiting on the SCM.
   const POLL: Duration = Duration::from_millis(100);
 
-  fn tray_task_name() -> String {
+  fn tray_task_name(a: &Autostart) -> String {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-    format!("thunet-tray-{}", user.replace('\\', "_"))
+    let user = user.replace('\\', "_");
+    if a.is_portable() {
+      // A portable window keeps its own task: enabling it must not overwrite
+      // the installed one, and the uninstall's prefix sweep must not delete it.
+      format!("thunet-portable-{}-tray-{user}", crate::config::state_tag())
+    } else {
+      format!("thunet-tray-{user}")
+    }
   }
 
-  pub fn tray_registered(_a: &Autostart) -> bool {
-    task_exists(&tray_task_name())
+  pub fn tray_registered(a: &Autostart) -> bool {
+    task_exists(&tray_task_name(a))
   }
 
   /// The core is a service: the window asks the SCM to start it instead of
@@ -609,20 +718,21 @@ mod imp {
   }
 
   pub fn enable_tray(a: &Autostart) -> Result<(), String> {
-    register(&a.exe, a.args(), &tray_task_name())
+    register(&a.exe, &a.args(), &tray_task_name(a))
   }
 
-  pub fn disable_tray(_a: &Autostart) -> Result<(), String> {
-    delete_task(&tray_task_name())
+  pub fn disable_tray(a: &Autostart) -> Result<(), String> {
+    delete_task(&tray_task_name(a))
   }
 
   /// Rewrite the tray task after its command line changed (`--minimized`).
   /// The core entry has no such argument, so it is deliberately left alone.
   pub fn refresh_tray(a: &Autostart) -> Result<(), String> {
-    if !task_exists(&tray_task_name()) {
+    let name = tray_task_name(a);
+    if !task_exists(&name) {
       return Ok(());
     }
-    register(&a.exe, a.args(), &tray_task_name())
+    register(&a.exe, &a.args(), &name)
   }
 
   /// Register the core as a boot-time service and keep it running.
@@ -749,7 +859,7 @@ mod imp {
         // so that a later failure on a real machine can be traced back to this
         // change instead of being re-discovered.
         //
-        // Before: `delete_task(&tray_task_name())` only. `tray_task_name` is
+        // Before: `delete_task(&tray_task_name(a))` only. `tray_task_name` is
         // built from `USERNAME`/`USERDOMAIN`, which name *the account this
         // process runs as*. That is correct for `thunet service uninstall`
         // started by the user (UAC elevates the same account, so the variables
@@ -764,7 +874,7 @@ mod imp {
         // the result does not depend on which account runs the uninstall. The
         // single-name delete is kept: it is idempotent, and it still works if
         // the enumeration below cannot run.
-        let _ = delete_task(&tray_task_name());
+        let _ = delete_task(&tray_task_name(a));
         delete_all_tray_tasks()?;
         Ok("core service and tray autostart removed".into())
       }
@@ -1619,7 +1729,7 @@ mod imp {
     }
   }
 
-  fn register(exe: &Path, args: &[&str], name: &str) -> Result<(), String> {
+  fn register(exe: &Path, args: &[String], name: &str) -> Result<(), String> {
     let user = current_user()?;
     let xml = task_xml(exe, args, &user);
     let path = std::env::temp_dir().join(format!("thunet-autostart-{}.xml", std::process::id()));
@@ -1694,7 +1804,7 @@ mod imp {
 
   /// A logon task with no delay: same trigger the other login-time clients
   /// use, so the app is scheduled alongside them rather than after the shell.
-  fn task_xml(exe: &Path, args: &[&str], user: &str) -> String {
+  fn task_xml(exe: &Path, args: &[String], user: &str) -> String {
     let args = args.join(" ");
     let args = if args.is_empty() {
       String::new()
@@ -1769,7 +1879,7 @@ mod imp {
     fn xml_carries_the_command_line() {
       let xml = task_xml(
         Path::new(r"C:\Tools\thunet.exe"),
-        &["--minimized"],
+        &["--minimized".to_string()],
         "PC\\me",
       );
       assert!(xml.contains("<Command>C:\\Tools\\thunet.exe</Command>"));
@@ -1781,6 +1891,24 @@ mod imp {
     fn xml_omits_empty_arguments() {
       let xml = task_xml(Path::new(r"C:\Tools\thunet.exe"), &[], "PC\\me");
       assert!(!xml.contains("<Arguments>"));
+    }
+
+    /// A state directory under a path with spaces survives the join, because
+    /// the argument is quoted before the task XML is built.
+    #[test]
+    fn xml_keeps_a_quoted_state_directory_together() {
+      let xml = task_xml(
+        Path::new(r"C:\Tools\thunet.exe"),
+        &[
+          "--state-dir".to_string(),
+          "\"C:\\Users\\alice\\My Apps\\state\"".to_string(),
+        ],
+        "PC\\me",
+      );
+      assert!(
+        xml.contains(r#"<Arguments>--state-dir "C:\Users\alice\My Apps\state"</Arguments>"#),
+        "{xml}"
+      );
     }
 
     #[test]
@@ -1868,8 +1996,18 @@ mod imp {
 
   use super::{Autostart, ServiceAction, take_running_marker, write_running_marker};
 
-  /// Name of the XDG desktop entry (`auto-launch` writes `thunet.desktop`).
+  /// Name of the XDG desktop entry (`auto-launch` writes `<name>.desktop`).
   const APP_NAME: &str = "thunet";
+
+  /// The entry's name. A portable window writes its own, so enabling it can
+  /// never overwrite the installed window's file.
+  fn app_name(a: &Autostart) -> String {
+    if a.is_portable() {
+      format!("{APP_NAME}-portable-{}", crate::config::state_tag())
+    } else {
+      APP_NAME.to_string()
+    }
+  }
 
   /// The background core as a systemd **system** unit. It needs no display, so
   /// it can start with the machine, before anybody logs in, and it is shared by
@@ -1880,10 +2018,11 @@ mod imp {
   const CORE_UNIT: &str = "thunet.service";
 
   fn launcher(a: &Autostart) -> Result<AutoLaunch, String> {
+    let args = a.args();
     AutoLaunchBuilder::new()
-      .set_app_name(APP_NAME)
+      .set_app_name(&app_name(a))
       .set_app_path(&a.exe.to_string_lossy())
-      .set_args(a.args())
+      .set_args(&args)
       .build()
       .map_err(|e| e.to_string())
   }

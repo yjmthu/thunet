@@ -655,9 +655,13 @@ pub struct App {
   autostart_mode: Mode,
   /// This process runs a portable core (`THUNET_STATE_DIR`), so the machine
   /// service is not its business: the settings page hides the autostart modes
-  /// (all three register something with systemd / the SCM) and nothing here
-  /// may write a registration for a machine that chose portable.
+  /// (all three register something with systemd / the SCM) and offers the one
+  /// entry a portable run can write instead - the login item for this window.
   portable: bool,
+  /// Whether that window entry is registered. The machine modes answer with
+  /// `autostart_mode` instead; a portable run has no service, so this is its
+  /// whole autostart state.
+  portable_autostart: bool,
   user_edit: String,
   pass_edit: String,
   remember: bool,
@@ -740,9 +744,14 @@ pub struct App {
 }
 
 /// Build the auto-launch entry; `--minimized` is only passed when the user
-/// asked the app to start hidden.
-fn autostart_entry(minimized: bool) -> Option<Autostart> {
-  Autostart::new(minimized)
+/// asked the app to start hidden. A portable window's entry also names the
+/// state directory it was started with.
+fn autostart_entry(minimized: bool, portable: bool) -> Option<Autostart> {
+  if portable {
+    Autostart::portable(minimized, crate::config::dir())
+  } else {
+    Autostart::new(minimized)
+  }
 }
 
 impl App {
@@ -790,7 +799,7 @@ impl App {
       cloak::set(false);
     }
 
-    let autostart = autostart_entry(cfg.start_minimized);
+    let autostart = autostart_entry(cfg.start_minimized, portable);
     let (start_tx, start_rx) = mpsc::channel();
     let exe_path = crate::exe_path();
     let exe_stamp = exe_path.as_deref().and_then(exe_stamp);
@@ -820,14 +829,17 @@ impl App {
     // The tray entry has to name the executable that is installed now: an
     // upgrade may have moved it, and a task pointing at the old file would
     // simply fail at the next logon. Rewriting is a no-op when nothing is
-    // registered. A portable run leaves the entry alone: it belongs to a
-    // machine-mode configuration this process is not part of.
-    if !portable && let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
+    // registered, which is also why a portable run may run it: its entry points
+    // into the bundle, and the bundle can be moved.
+    if let Some(Err(e)) = autostart.as_ref().map(Autostart::refresh_tray) {
       logs.push(Line::warn(format!("autostart: {e}")));
     }
     // Read the mode after that: the settings page has to show what is actually
     // registered, not what was requested.
     let autostart_mode = autostart.as_ref().map(Autostart::mode).unwrap_or(Mode::Off);
+    // A portable window has no service to ask about, so its switch is the
+    // window entry alone.
+    let portable_autostart = portable && autostart.as_ref().is_some_and(Autostart::tray_enabled);
 
     // The portal host is a CLI/config-only setting, so log the effective value.
     logs.push(Line::debug(format!("portal: {}", cfg.host)));
@@ -907,6 +919,7 @@ impl App {
       autostart,
       autostart_mode,
       portable,
+      portable_autostart,
       tray,
       tray_rgb: Some(color_for(State::LoggedOut)),
       tray_warned: false,
@@ -1501,6 +1514,30 @@ impl App {
     self.set_toast(format!("{label}: {state}"), ToastKind::Info);
   }
 
+  /// Register or remove the login entry that starts this portable window.
+  ///
+  /// Only the window half: a portable run has no service to register.
+  fn apply_portable_autostart(&mut self, on: bool) {
+    let Some(autostart) = self.autostart.clone() else {
+      self.toast_err(self.t().autostart_failed.to_string());
+      return;
+    };
+    // Both platforms write a per-user entry, so unlike the machine modes this
+    // needs no elevation and no helper thread.
+    match autostart.set_tray(on) {
+      Ok(()) => {
+        self.portable_autostart = on;
+        self.push_log(Line::debug(format!("autostart: window entry {on}")));
+        self.toast_toggle(self.t().autostart, on);
+      }
+      Err(e) => {
+        self.push_log(Line::error(format!("autostart: {e}")));
+        let msg = format!("{}: {e}", self.t().autostart_failed);
+        self.toast_err(msg);
+      }
+    }
+  }
+
   /// Apply one of the three autostart modes and report the result.
   ///
   /// The work happens on a helper thread: on Windows the core half may show a
@@ -1595,7 +1632,7 @@ impl App {
       self.toast_err(e);
       return;
     }
-    self.autostart = autostart_entry(on);
+    self.autostart = autostart_entry(on, self.portable);
     let mut failure = None;
     if let Some(a) = &self.autostart
       && let Err(e) = a.refresh_tray()
@@ -2283,14 +2320,17 @@ impl App {
           // report "not running". With the short labels from `i18n.rs` all
           // three fit on the label's row, which is what keeps the page inside
           // the fixed window height.
-          // Every mode here registers something with the machine's service
-          // manager, so a portable process must not offer them at all: it has
-          // no service, and choosing one is exactly how a portable run would
-          // leave a registration behind on a machine that never asked for one.
+          // Every machine mode here registers something with the service
+          // manager, so a portable process must not offer them: it has no
+          // service. The one entry it can write is the login item for this
+          // window, state directory and all.
           #[cfg(not(target_os = "android"))]
           {
             if self.portable {
-              ui.label(t.portable_autostart);
+              let mut on = self.portable_autostart;
+              if ui.checkbox(&mut on, t.portable_autostart).changed() {
+                self.apply_portable_autostart(on);
+              }
             } else {
               let mut mode = self.autostart_mode;
               ui.horizontal(|ui| {
@@ -2319,7 +2359,11 @@ impl App {
           #[cfg(not(target_os = "android"))]
           let mut start_min = self.cfg.start_minimized;
           #[cfg(not(target_os = "android"))]
-          let tray_starts = !self.portable && self.autostart_mode != Mode::Core;
+          let tray_starts = if self.portable {
+            self.portable_autostart
+          } else {
+            self.autostart_mode != Mode::Core
+          };
           // These three labels are the widest set on the page, and English is
           // the tighter one: a slightly narrower gap keeps them on one row in
           // both languages (`the_startup_switches_fit_on_one_row` pins it).
