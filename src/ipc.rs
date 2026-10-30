@@ -300,6 +300,18 @@ impl Hub {
     (rx, backlog, live)
   }
 
+  /// How many frontends are attached right now, liveness flags included.
+  ///
+  /// Read before a new frontend is added, so the answer says whether this
+  /// connect replaced something that was still there.
+  fn live_count(&self) -> usize {
+    let shared = match self.0.lock() {
+      Ok(g) => g,
+      Err(poisoned) => poisoned.into_inner(),
+    };
+    shared.clients.iter().filter(|client| client.is_live()).count()
+  }
+
   /// A `Sender<Ev>`-shaped handle for the worker loop.
   pub fn sink(&self) -> Sink {
     Sink(self.clone())
@@ -942,11 +954,22 @@ pub(crate) mod endpoint {
 fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: String) {
   // Subscribe before writing the backlog, so an event published in between
   // arrives exactly once through the channel (the backlog is a snapshot).
+  //
+  // The count is taken before this one is added: it says whether this connect
+  // replaced a frontend that was still attached, which is what the teardown
+  // line below is about. A window that reconnects used to leave "attached"
+  // and "went away" in the same second with nothing linking the two.
+  let others = hub.live_count();
+  let started = Instant::now();
   let (events, backlog, live) = hub.attach();
   crate::diag::line(&format!("core: frontend attached ({})", peer.label));
   hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-    "core: attached frontend ({})",
-    peer.label
+    "core: attached frontend ({}{})",
+    peer.label,
+    match others {
+      0 => String::new(),
+      n => format!(", {n} still attached"),
+    }
   ))));
   let (recv_half, send_half) = stream.halves();
 
@@ -966,7 +989,8 @@ fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: S
           // warning.
           crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
           writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-            "core: frontend went away: {e}"
+            "core: frontend went away after {:.1}s: {e}",
+            started.elapsed().as_secs_f32()
           ))));
           return;
         }
@@ -975,7 +999,8 @@ fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: S
         if let Err(e) = write_line(&mut out, &Wire::ev(ev)) {
           crate::diag::line(&format!("core: writer for {writer_label} stopped: {e}"));
           writer_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-            "core: frontend went away: {e}"
+            "core: frontend went away after {:.1}s: {e}",
+            started.elapsed().as_secs_f32()
           ))));
           return;
         }
@@ -1002,12 +1027,16 @@ fn attach(stream: impl Duplex, peer: Peer, cmds: Sender<Cmd>, hub: Hub, first: S
           Some(Err(e)) => {
             crate::diag::line(&format!("core: reader for {reader_label} failed: {e}"));
             reader_hub.publish(Ev::Log(crate::logline::Line::debug(format!(
-              "core: frontend read failed: {e}"
+              "core: frontend read failed after {:.1}s: {e}",
+              started.elapsed().as_secs_f32()
             ))));
             break;
           }
           None => {
-            crate::diag::line(&format!("core: frontend {reader_label} disconnected"));
+            crate::diag::line(&format!(
+              "core: frontend {reader_label} disconnected after {:.1}s",
+              started.elapsed().as_secs_f32()
+            ));
             break;
           }
         };
