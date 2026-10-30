@@ -211,6 +211,9 @@ pub struct Texts {
   pub online: &'static str,
   pub authenticating: &'static str,
   pub offline: &'static str,
+  /// While no core answers: the window cannot tell what the link is doing, and
+  /// the last verdict came from a core that is no longer there.
+  pub unknown: &'static str,
   pub account: &'static str,
   /// Label of the row that names the link the session rides on (cable, Wi-Fi).
   pub link: &'static str,
@@ -428,6 +431,7 @@ static ZH: Texts = Texts {
   online_no_portal: "当前网络不是校园网，可直接上网，无需门户登录",
   authenticating: "认证中",
   offline: "离线",
+  unknown: "未知",
   account: "账号",
   link: "网络",
   link_ethernet: "以太网",
@@ -576,6 +580,7 @@ static EN: Texts = Texts {
   online_no_portal: "This is not the campus network; the internet works directly, so no portal login is needed",
   authenticating: "Authenticating",
   offline: "Offline",
+  unknown: "Unknown",
   account: "Account",
   link: "Link",
   link_ethernet: "Ethernet",

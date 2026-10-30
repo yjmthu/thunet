@@ -274,6 +274,37 @@ fn state_color(state: State) -> egui::Color32 {
   egui::Color32::from_rgb(c[0], c[1], c[2])
 }
 
+/// What the state line says, and which palette entry colours it.
+///
+/// No core answering wins over every network verdict: that verdict came from a
+/// core that is no longer there, so reading it as "online" left a stopped core
+/// looking connected (the link was still "no portal, direct internet" from a
+/// minute ago). The palette falls back to the offline grey for the same reason
+/// - there is no session to colour.
+fn state_words(
+  state: State,
+  env: &LoginEnv,
+  core_answered: bool,
+  t: &Texts,
+) -> (&'static str, State) {
+  if !core_answered {
+    return (t.unknown, State::Offline);
+  }
+  match state {
+    State::Online => (t.online, State::Online),
+    State::Authenticating => (t.authenticating, State::Authenticating),
+    // The portal has no session for this address, but the link does not go
+    // through it at all: "Offline" would read as "there is no internet",
+    // which is the opposite of what the probe just measured.
+    State::Offline if *env == LoginEnv::NoPortal => (t.online_without_portal, State::Online),
+    // Same reading, different cause: the link is not the campus network at all
+    // (home Wi-Fi, mobile data). It is named separately so the label does not
+    // claim a campus session that never existed.
+    State::Offline if *env == LoginEnv::OtherNetwork => (t.online_other_network, State::Online),
+    State::Offline => (t.offline, State::Offline),
+  }
+}
+
 /// How far one status-poll cycle has run, 0.0 .. 1.0.
 fn heartbeat_fraction(elapsed: Duration, period: Duration) -> f32 {
   if period.is_zero() {
@@ -1689,23 +1720,8 @@ impl App {
   /// One helper because the two drifted apart: the window showed "online" for
   /// a link that carries no portal session while the tray icon kept its grey.
   fn state_display(&self, t: &Texts) -> (&'static str, [u8; 3]) {
-    match self.state {
-      State::Online => (t.online, app_fill(State::Online)),
-      State::Authenticating => (t.authenticating, app_fill(State::Authenticating)),
-      // The portal has no session for this address, but the link does not go
-      // through it at all: "Offline" would read as "there is no internet",
-      // which is the opposite of what the probe just measured.
-      State::Offline if self.env == LoginEnv::NoPortal => {
-        (t.online_without_portal, app_fill(State::Online))
-      }
-      // Same reading, different cause: the link is not the campus network at
-      // all (home Wi-Fi, mobile data). It is named separately so the label does
-      // not claim a campus session that never existed.
-      State::Offline if self.env == LoginEnv::OtherNetwork => {
-        (t.online_other_network, app_fill(State::Online))
-      }
-      State::Offline => (t.offline, app_fill(State::Offline)),
-    }
+    let (text, palette) = state_words(self.state, &self.env, self.core_answered, t);
+    (text, app_fill(palette))
   }
 
   /// Replace this process with a fresh launch of the executable on disk.
@@ -5436,6 +5452,39 @@ mod tests {
       Some(base),
       base + TRAY_MIN_GAP + Duration::from_secs(3)
     ));
+  }
+
+  /// A core that stopped must not leave the window claiming a live connection:
+  /// the last probe's "no portal" verdict describes a link, not the present.
+  #[test]
+  fn a_silent_core_reads_as_unknown() {
+    let t = crate::i18n::Lang::En.texts();
+    assert_eq!(
+      state_words(State::Offline, &LoginEnv::NoPortal, false, t),
+      (t.unknown, State::Offline)
+    );
+    // With a core answering, the verdict still explains the missing session,
+    // and the palette stays green because the machine is online.
+    assert_eq!(
+      state_words(State::Offline, &LoginEnv::NoPortal, true, t),
+      (t.online_without_portal, State::Online)
+    );
+    assert_eq!(
+      state_words(State::Offline, &LoginEnv::OtherNetwork, true, t),
+      (t.online_other_network, State::Online)
+    );
+    assert_eq!(
+      state_words(State::Offline, &LoginEnv::Campus, true, t),
+      (t.offline, State::Offline)
+    );
+    assert_eq!(
+      state_words(State::Online, &LoginEnv::Campus, true, t),
+      (t.online, State::Online)
+    );
+    assert_eq!(
+      state_words(State::Authenticating, &LoginEnv::Campus, true, t),
+      (t.authenticating, State::Authenticating)
+    );
   }
 }
 
