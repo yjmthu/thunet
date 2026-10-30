@@ -1057,19 +1057,19 @@ fn say(line: &str) {
 /// with the very account it would use, so neither a `SetCredentials` nor a
 /// `Connect` is sent and the stored pair stays as it is.
 fn already_online_with(state: session::State, account: &str, held: &str) -> bool {
-  state == session::State::Online && account == held
+  state == session::State::LoggedIn && account == held
 }
 
 /// One line about the service: whether a session is up, and the account the
 /// core holds when it has one.
 fn session_line(state: session::State, held: &str) -> String {
   let verb = match state {
-    session::State::Online => "online",
+    session::State::LoggedIn => "online",
     session::State::Authenticating => "authenticating",
-    session::State::Offline => "offline",
+    session::State::LoggedOut => "offline",
   };
   match (held.is_empty(), state) {
-    (false, session::State::Offline) => format!("session: {verb} (credential: {held})"),
+    (false, session::State::LoggedOut) => format!("session: {verb} (credential: {held})"),
     (false, _) => format!("session: {verb} as {held}"),
     (true, _) => format!("session: {verb}"),
   }
@@ -1103,10 +1103,10 @@ fn settled(link: &ipc::Link, timeout: Duration) -> Result<(), String> {
   match wait_for(link, timeout, |ev| {
     matches!(
       ev,
-      CoreEv::State(session::State::Online) | CoreEv::Notify { .. } | CoreEv::Error(Some(_))
+      CoreEv::State(session::State::LoggedIn) | CoreEv::Notify { .. } | CoreEv::Error(Some(_))
     )
   })? {
-    CoreEv::State(session::State::Online) => {
+    CoreEv::State(session::State::LoggedIn) => {
       println!("online");
       Ok(())
     }
@@ -1277,13 +1277,17 @@ mod tests {
   #[test]
   fn a_bare_login_leaves_an_online_session_alone() {
     assert!(already_online_with(
-      session::State::Online,
+      session::State::LoggedIn,
       "alice",
       "alice"
     ));
-    assert!(!already_online_with(session::State::Online, "bob", "alice"));
     assert!(!already_online_with(
-      session::State::Offline,
+      session::State::LoggedIn,
+      "bob",
+      "alice"
+    ));
+    assert!(!already_online_with(
+      session::State::LoggedOut,
       "alice",
       "alice"
     ));
@@ -1297,15 +1301,15 @@ mod tests {
   #[test]
   fn the_session_line_names_the_account_the_core_holds() {
     assert_eq!(
-      session_line(session::State::Online, "bob"),
+      session_line(session::State::LoggedIn, "bob"),
       "session: online as bob"
     );
     assert_eq!(
-      session_line(session::State::Offline, "alice"),
+      session_line(session::State::LoggedOut, "alice"),
       "session: offline (credential: alice)"
     );
     assert_eq!(
-      session_line(session::State::Offline, ""),
+      session_line(session::State::LoggedOut, ""),
       "session: offline"
     );
     assert_eq!(

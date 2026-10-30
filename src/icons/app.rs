@@ -10,9 +10,9 @@ use crate::session::State;
 /// all read the same colour.
 pub fn color_for(state: State) -> [u8; 3] {
   match state {
-    State::Online => [46, 160, 67],
+    State::LoggedIn => [46, 160, 67],
     State::Authenticating => [210, 153, 34],
-    State::Offline => [140, 140, 140],
+    State::LoggedOut => [140, 140, 140],
   }
 }
 
@@ -104,7 +104,7 @@ const PORTABLE_FILL: [u8; 3] = [58, 120, 200];
 pub fn app_icon() -> egui::IconData {
   const S: usize = 64;
   egui::IconData {
-    rgba: disc_rgba(S, app_fill(State::Online)),
+    rgba: disc_rgba(S, app_fill(State::LoggedIn)),
     width: S as u32,
     height: S as u32,
   }
@@ -122,8 +122,8 @@ pub fn app_fill(state: State) -> [u8; 3] {
     return color_for(state);
   }
   match state {
-    State::Online => PORTABLE_FILL,
+    State::LoggedIn => PORTABLE_FILL,
     State::Authenticating => [108, 158, 216],
-    State::Offline => [72, 88, 116],
+    State::LoggedOut => [72, 88, 116],
   }
 }

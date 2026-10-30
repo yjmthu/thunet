@@ -1640,14 +1640,14 @@ mod tests {
   #[test]
   fn a_late_frontend_gets_the_current_state_and_the_log_tail() {
     let hub = Hub::new();
-    hub.publish(Ev::State(State::Online));
+    hub.publish(Ev::State(State::LoggedIn));
     hub.publish(Ev::Env(LoginEnv::Campus));
     hub.publish(Ev::Log(Line::info("first")));
     hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
     let (_rx, backlog, _live) = hub.attach();
     // Snapshot first, then the replayed log lines.
-    assert!(matches!(backlog[0], Ev::State(State::Online)));
+    assert!(matches!(backlog[0], Ev::State(State::LoggedIn)));
     assert!(matches!(backlog[1], Ev::Env(LoginEnv::Campus)));
     assert!(matches!(&backlog[2], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
     assert!(matches!(backlog.last(), Some(Ev::Log(_))));
@@ -1673,7 +1673,7 @@ mod tests {
   #[test]
   fn the_last_warning_is_kept_for_the_error_message() {
     let slot: Mutex<Option<String>> = Mutex::new(None);
-    remember_warn(&slot, &Ev::State(State::Online));
+    remember_warn(&slot, &Ev::State(State::LoggedIn));
     remember_warn(&slot, &Ev::Log(Line::debug("core: attached frontend")));
     assert_eq!(slot.lock().unwrap().as_deref(), None);
 

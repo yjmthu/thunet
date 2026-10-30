@@ -435,7 +435,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // Ask the portal again in this pass: a new link or a new Wi-Fi name can
   // invalidate the answer the window is showing before the next period is due.
   let mut force_status = false;
-  let mut last_state = State::Offline;
+  let mut last_state = State::LoggedOut;
   // Backoff state so a rejected login does not hammer the portal every tick.
   let retry_delay = Duration::from_secs(session.cfg().reconnect_delay_secs.max(5));
   let mut next_attempt = Instant::now();
@@ -609,7 +609,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             // A refresh proves the portal answers, not that the stored
             // password is right: a rejection stays on screen through it,
             // unless the session turns out to be online.
-            if session.state == State::Online
+            if session.state == State::LoggedIn
               || !matches!(
                 banner.as_ref(),
                 Some(Failure::Credentials | Failure::AcUnreachable)
@@ -617,7 +617,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             {
               set_banner(&tx, &mut banner, None);
             }
-            if session.state == State::Online {
+            if session.state == State::LoggedIn {
               // Whatever the connect window was still waiting for, the machine
               // is online now.
               connect_budget = Duration::ZERO;
@@ -726,7 +726,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           // stored as given and queued for the retry loop: there is no session
           // to protect, and the account has to be ready when the network
           // returns.
-          if ready && new_pair && session.state == State::Online {
+          if ready && new_pair && session.state == State::LoggedIn {
             match switch_account(&mut session, &tx, t, (&username, &password, remember)) {
               Ok(()) => {
                 want_online = true;
@@ -755,7 +755,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
               Err(failure) => {
                 // Nothing was written, so the stored credential still works and
                 // the loop may keep retrying with it.
-                want_online = session.state != State::Online;
+                want_online = session.state != State::LoggedIn;
                 failures = 0;
                 last_failure.clear();
                 next_attempt = Instant::now();
@@ -771,7 +771,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
                 // rejected, so the red banner would be a lie that never clears.
                 // The toast and the log line carry the news instead. Only a
                 // switch that left the machine offline keeps the banner.
-                let back_online = session.state == State::Online;
+                let back_online = session.state == State::LoggedIn;
                 set_banner(
                   &tx,
                   &mut banner,
@@ -830,7 +830,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             // chosen for the old one. An edit is the user asking to be online,
             // so it sets the intent regardless of `auto_connect`; the startup
             // window is not needed either, since this is a manual attempt.
-            if ready && session.state != State::Online {
+            if ready && session.state != State::LoggedIn {
               tx.send(Ev::Log(Line::debug("intent: online by credentials")))
                 .ok();
               want_online = true;
@@ -876,7 +876,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             // The retry loop now owns every attempt, so a connect window that
             // was still ticking has nothing left to decide.
             connect_budget = Duration::ZERO;
-            if want_online && session.state != State::Online {
+            if want_online && session.state != State::LoggedIn {
               // Answer the click: a machine that was waiting for the window to
               // expire (or for a dropped session to be ignored) tries at once.
               next_attempt = Instant::now();
@@ -950,7 +950,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     // below is gated on the same flag, so nothing can reach the portal either
     // way; this branch only decides what the user is told.
     let missing_creds = session.cfg().username.is_empty() || session.cfg().password.is_empty();
-    if want_online && session.state != State::Online && missing_creds {
+    if want_online && session.state != State::LoggedIn && missing_creds {
       let log = "skipped: no account or password to log in with";
       if last_failure != log {
         last_failure = log.to_string();
@@ -988,7 +988,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       let settled = if id == last_link {
         pending_link = None;
         false
-      } else if session.state != State::Online {
+      } else if session.state != State::LoggedIn {
         pending_link = None;
         true
       } else {
@@ -1012,8 +1012,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         // The portal session belonged to the link just left: its address is
         // gone, so the window must not keep claiming it is online. Whatever
         // the next poll finds is an answer about the new link.
-        if session.state == State::Online {
-          session.state = State::Offline;
+        if session.state == State::LoggedIn {
+          session.state = State::LoggedOut;
           tx.send(Ev::Log(Line::warn("link changed, now offline")))
             .ok();
           tx.send(Ev::Info(serde_json::json!({}))).ok();
@@ -1087,7 +1087,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     // costs three requests), but a name is local, and it is what decides the
     // enterprise verdict - right after joining, Windows may still be calling
     // the network "Identifying…".
-    if session.state == State::Online
+    if session.state == State::LoggedIn
       && !force_env
       && Instant::now() < ssid_watch_until
       && Instant::now() >= next_ssid_watch
@@ -1114,7 +1114,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     // Probe the network on a timer while offline, and in the same pass the path
     // to the internet changed - online included, because the verdict is what
     // the window shows and it may not describe the old network.
-    if force_env || (session.state != State::Online && Instant::now() >= next_env_probe) {
+    if force_env || (session.state != State::LoggedIn && Instant::now() >= next_env_probe) {
       force_env = false;
       let probe = probe_env(&session);
       let env = probe.env;
@@ -1158,7 +1158,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
     let auto_attempts = want_online && (session.cfg().keep_online || !connect_budget.is_zero());
     if !missing_creds
       && auto_attempts
-      && session.state != State::Online
+      && session.state != State::LoggedIn
       && link_ready
       && Instant::now() >= next_attempt
     {
@@ -1198,8 +1198,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           let online = session
             .refresh()
             .map(|_| session.state)
-            .unwrap_or(State::Offline);
-          if online != State::Online {
+            .unwrap_or(State::LoggedOut);
+          if online != State::LoggedIn {
             skip = Some((
               t.no_login_needed.to_string(),
               "skipped: internet is reachable without a portal login".to_string(),
@@ -1344,7 +1344,7 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
 
     // Ask the portal what is actually going on, online or not: the session may
     // have been created elsewhere, and "no password saved" is not "offline".
-    let poll_every = if session.state == State::Online {
+    let poll_every = if session.state == State::LoggedIn {
       POLL_ONLINE
     } else {
       POLL_OFFLINE
@@ -1371,10 +1371,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
             tx.send(Ev::Log(Line::debug(text.clone()))).ok();
             last_status_log = Some((text, Instant::now()));
           }
-          if session.state == State::Online {
+          if session.state == State::LoggedIn {
             status_failures = status_failures.saturating_add(1);
             if status_failures >= STATUS_FAILURES {
-              session.state = State::Offline;
+              session.state = State::LoggedOut;
               tx.send(Ev::Log(Line::warn("portal not answering, now offline")))
                 .ok();
               tx.send(Ev::Info(serde_json::json!({}))).ok();
@@ -1384,8 +1384,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       }
       if let Ok(v) = answer {
         let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
-        if online && session.state != State::Online {
-          session.state = State::Online;
+        if online && session.state != State::LoggedIn {
+          session.state = State::LoggedIn;
           failures = 0;
           // Being online is what the connect window was for: it is done. A
           // session found here may have been opened elsewhere, which is still
@@ -1393,9 +1393,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           connect_budget = Duration::ZERO;
           set_banner(&tx, &mut banner, None);
           tx.send(Ev::Log(Line::info("already online"))).ok();
-        } else if !online && session.state == State::Online {
+        } else if !online && session.state == State::LoggedIn {
           // Session ended outside our control (timeout / kicked / unplugged).
-          session.state = State::Offline;
+          session.state = State::LoggedOut;
           tx.send(Ev::Log(Line::warn("session ended, now offline")))
             .ok();
         } else if online

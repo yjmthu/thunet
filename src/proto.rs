@@ -369,7 +369,7 @@ mod tests {
   #[test]
   fn events_roundtrip_including_the_network_verdict() {
     for ev in [
-      Ev::State(State::Online),
+      Ev::State(State::LoggedIn),
       Ev::Env(LoginEnv::EnterpriseWifi("Tsinghua-Secure".into())),
       Ev::Env(LoginEnv::NoPortal),
       Ev::Error(None),
@@ -416,7 +416,7 @@ mod tests {
       build_epoch: 1_700_000_000,
       pid: 42,
       uptime_secs: 7,
-      state: State::Online,
+      state: State::LoggedIn,
       env: LoginEnv::Campus,
       ac_id: "169".into(),
       host: "auth4.tsinghua.edu.cn".into(),
@@ -439,7 +439,7 @@ mod tests {
       Msg::Ev(Ev::Core(back)) => {
         assert_eq!(back.version, "0.1.3");
         assert_eq!(back.ac_id, "169");
-        assert_eq!(back.state, State::Online);
+        assert_eq!(back.state, State::LoggedIn);
         assert_eq!(back.frontends, 1);
       }
       other => panic!("wrong variant: {other:?}"),
@@ -458,8 +458,27 @@ mod tests {
       "endpoint":"x"}"#;
     let info: CoreInfo = serde_json::from_str(old).unwrap();
     assert_eq!(info.link, LinkKind::None);
+    assert_eq!(info.state, State::LoggedOut, "the old wire name parses");
     assert!(!info.keep_online, "an old core never reported it");
     assert_eq!(info.version, "0.1.3");
+  }
+
+  /// The variants were renamed in code, not on the wire: a window and a
+  /// service from different builds still have to read each other's state.
+  #[test]
+  fn the_state_variants_keep_their_wire_names() {
+    for (state, wire) in [
+      (State::LoggedOut, "Offline"),
+      (State::Authenticating, "Authenticating"),
+      (State::LoggedIn, "Online"),
+    ] {
+      let text = Wire::ev(Ev::State(state)).line().unwrap();
+      assert!(text.contains(&format!("\"State\":\"{wire}\"")), "{text}");
+      match Wire::parse(text.trim_end()).unwrap().msg {
+        Msg::Ev(Ev::State(back)) => assert_eq!(back, state),
+        other => panic!("wrong variant: {other:?}"),
+      }
+    }
   }
 
   #[test]

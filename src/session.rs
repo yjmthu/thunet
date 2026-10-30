@@ -14,9 +14,16 @@ use crate::srun::{Client, NetEnv, NetError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
-  Offline,
+  /// The portal has no session for this address. Not "no internet": a campus
+  /// link can carry traffic while the portal still reports nobody signed in.
+  #[serde(rename = "Offline")]
+  LoggedOut,
   Authenticating,
-  Online,
+  /// The portal reports a session for this address, or this core just opened
+  /// one. The wire keeps the old names, so a window and a service from
+  /// different builds still understand each other.
+  #[serde(rename = "Online")]
+  LoggedIn,
 }
 
 /// Why the last login attempt failed, so the caller can decide how much of the
@@ -83,7 +90,7 @@ impl Session {
       cfg,
       auto_ac,
       warnings,
-      state: State::Offline,
+      state: State::LoggedOut,
       failures: 0,
       failure: FailureKind::Other,
     }
@@ -119,9 +126,9 @@ impl Session {
     let v = self.client.status(&self.cfg.ac_id)?;
     let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
     self.state = if online {
-      State::Online
+      State::LoggedIn
     } else {
-      State::Offline
+      State::LoggedOut
     };
     if online {
       self.failures = 0;
@@ -177,7 +184,7 @@ impl Session {
     self.state = State::Authenticating;
     self.failure = FailureKind::Other;
     if self.client.is_online(&self.cfg.ac_id) {
-      self.state = State::Online;
+      self.state = State::LoggedIn;
       self.failures = 0;
       return Ok("already online".into());
     }
@@ -208,7 +215,7 @@ impl Session {
           // "authenticating". Leaving it there kept the window and the tray
           // amber until a later status poll happened to succeed — which on a
           // dead network never happens.
-          self.state = State::Offline;
+          self.state = State::LoggedOut;
           // Keep the cause: the window words a dead network differently from a
           // portal that answered with something unusable.
           return Err(e.context(format!("request to {} failed", self.cfg.host)));
@@ -216,7 +223,7 @@ impl Session {
       };
 
       if v.get("error").and_then(|e| e.as_str()) == Some("ok") {
-        self.state = State::Online;
+        self.state = State::LoggedIn;
         self.failures = 0;
         return Ok("login ok".into());
       }
@@ -225,7 +232,7 @@ impl Session {
       let code = ecode(&v);
       if crate::srun::is_credentials_error(&code) {
         self.failure = FailureKind::Credentials;
-        self.state = State::Offline;
+        self.state = State::LoggedOut;
         return Err(NetError::msg(self.rejected(&v)));
       }
       // Errors that are about the AC id (or that carry no code at all) may
@@ -233,7 +240,7 @@ impl Session {
       // with a fresh id and then polling for. Everything else is final.
       let policy_like = code.starts_with("E28") || code == "no ecode" || code.is_empty();
       if !policy_like {
-        self.state = State::Offline;
+        self.state = State::LoggedOut;
         return Err(NetError::msg(self.rejected(&v)));
       }
       // The AC id changes with the network; re-detect once.
@@ -251,13 +258,13 @@ impl Session {
         .client
         .wait_online(&self.cfg.ac_id, Duration::from_secs(20))
       {
-        self.state = State::Online;
+        self.state = State::LoggedIn;
         self.failures = 0;
         return Ok(format!(
           "login ok (server reported {code}, verified online)"
         ));
       }
-      self.state = State::Offline;
+      self.state = State::LoggedOut;
       // Both of these say the same thing: the portal could not hand the login
       // to an access controller for the id this client has, which on THU is
       // what a stale id from another link looks like. The raw JSON in the
@@ -312,7 +319,7 @@ impl Session {
         .unwrap_or("portal rejected the logout");
       return Err(NetError::msg(format!("logout rejected: {reason}")));
     }
-    self.state = State::Offline;
+    self.state = State::LoggedOut;
     Ok("ok".to_string())
   }
 }
