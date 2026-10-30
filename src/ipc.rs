@@ -1128,7 +1128,27 @@ pub struct Link {
   /// build. A frontend needs it to tell "an old core is serving" apart from
   /// "no core at all", which are very different situations for the user.
   speaks: Arc<Mutex<Option<u8>>>,
+  /// The last warning the core sent, kept because a core that refuses a
+  /// frontend says why in one warning and then closes the pipe. The event still
+  /// travels to the caller - the CLI drops everything it reads while it waits
+  /// for the replay to end - so the reason is remembered here or nowhere.
+  last_warn: Arc<Mutex<Option<String>>>,
   machine: bool,
+}
+
+/// Remember the reason a link is about to die for.
+///
+/// Only warnings and above count: the replay a frontend receives on connect is
+/// mostly `DEBUG` bookkeeping, and remembering those would answer "closed by
+/// itself" with an unrelated line. A later warning replaces an earlier one, so
+/// the slot always names the last thing that went wrong.
+fn remember_warn(slot: &Mutex<Option<String>>, ev: &Ev) {
+  if let Ev::Log(line) = ev
+    && line.level >= crate::logline::Level::Warn
+  {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(line.msg.clone());
+  }
 }
 
 #[cfg(windows)]
@@ -1197,6 +1217,7 @@ impl Link {
     let (recv_half, send_half) = stream.halves();
     let alive = Arc::new(AtomicBool::new(true));
     let speaks = Arc::new(Mutex::new(None::<u8>));
+    let last_warn = Arc::new(Mutex::new(None::<String>));
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (ev_tx, ev_rx) = channel::<Ev>();
 
@@ -1218,6 +1239,7 @@ impl Link {
 
     let reader_alive = alive.clone();
     let reader_speaks = speaks.clone();
+    let reader_warn = last_warn.clone();
     std::thread::spawn(move || {
       let mut lines = BufReader::new(recv_half).lines();
       loop {
@@ -1241,10 +1263,11 @@ impl Link {
         }
         match Wire::parse(&text) {
           Ok(wire) if wire.v == VERSION => {
-            if let Msg::Ev(ev) = wire.msg
-              && ev_tx.send(ev).is_err()
-            {
-              break;
+            if let Msg::Ev(ev) = wire.msg {
+              remember_warn(&reader_warn, &ev);
+              if ev_tx.send(ev).is_err() {
+                break;
+              }
             }
           }
           Ok(wire) => {
@@ -1273,6 +1296,7 @@ impl Link {
       events: ev_rx,
       alive,
       speaks,
+      last_warn,
       machine,
     })
   }
@@ -1298,6 +1322,15 @@ impl Link {
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot
+  }
+
+  /// The last warning the core sent, when it died without answering.
+  pub fn last_warn(&self) -> Option<String> {
+    let slot = self
+      .last_warn
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.clone()
   }
 
   /// Whether this link goes to the machine service rather than a portable core.
@@ -1603,6 +1636,28 @@ mod tests {
     for events in [first, second] {
       assert!(matches!(events.try_recv(), Ok(Ev::Notify { .. })));
     }
+  }
+
+  /// A core that refuses a frontend says why in one warning and then closes.
+  /// The CLI drops everything it reads while it waits for the replay to end, so
+  /// the reason has to be kept outside the event stream or it is lost.
+  #[test]
+  fn the_last_warning_is_kept_for_the_error_message() {
+    let slot: Mutex<Option<String>> = Mutex::new(None);
+    remember_warn(&slot, &Ev::State(State::Online));
+    remember_warn(&slot, &Ev::Log(Line::debug("core: attached frontend")));
+    assert_eq!(slot.lock().unwrap().as_deref(), None);
+
+    remember_warn(&slot, &Ev::Log(Line::warn("core rejected frontend: pid 1")));
+    // An `INFO` line after it is not "the last thing that went wrong".
+    remember_warn(&slot, &Ev::Log(Line::info("later, harmless")));
+    assert_eq!(
+      slot.lock().unwrap().as_deref(),
+      Some("core rejected frontend: pid 1")
+    );
+
+    remember_warn(&slot, &Ev::Log(Line::error("fatal")));
+    assert_eq!(slot.lock().unwrap().as_deref(), Some("fatal"));
   }
 
   #[test]

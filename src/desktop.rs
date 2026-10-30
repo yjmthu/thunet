@@ -904,6 +904,28 @@ fn with_core() -> Result<ipc::Link, String> {
   Ok(link)
 }
 
+/// The one line that explains a link which died without answering.
+///
+/// Both facts are read off the [`ipc::Link`], which is the only place left that
+/// knows them once the connection is gone: an old core announced its protocol,
+/// and a core that refuses this frontend left one warning before closing.
+/// Naming that warning is the difference between "closed the connection" and a
+/// reason the user can act on.
+fn closed_reason(speaks: Option<u8>, warn: Option<String>) -> String {
+  match speaks {
+    // The core refused every line this build sent, so nothing will work
+    // until the service is restarted on a matching build.
+    Some(v) => format!(
+      "the background service speaks protocol {v} but this build speaks {}; restart the service",
+      proto::VERSION
+    ),
+    None => match warn {
+      Some(warn) => format!("the background service closed the connection: {warn}"),
+      None => "the background service closed the connection".into(),
+    },
+  }
+}
+
 /// Wait until an event satisfies `done`, echoing the core's log lines.
 fn wait_for<F>(link: &ipc::Link, timeout: Duration, mut done: F) -> Result<CoreEv, String>
 where
@@ -920,15 +942,7 @@ where
       }
     }
     if !link.alive() {
-      return Err(match link.speaks() {
-        // The core refused every line this build sent, so nothing will work
-        // until the service is restarted on a matching build.
-        Some(v) => format!(
-          "the background service speaks protocol {v} but this build speaks {}; restart the service",
-          proto::VERSION
-        ),
-        None => "the background service closed the connection".into(),
-      });
+      return Err(closed_reason(link.speaks(), link.last_warn()));
     }
     if Instant::now() >= deadline {
       return Err(format!(
@@ -1112,6 +1126,26 @@ fn settled(link: &ipc::Link, timeout: Duration) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A link that dies under a command has to say what the core said: the phrase
+  /// "closed the connection" alone is what made a refused frontend look like a
+  /// crash, while the reason existed only in the service's own log file.
+  #[test]
+  fn a_dead_link_names_its_reason() {
+    assert_eq!(
+      closed_reason(None, None),
+      "the background service closed the connection"
+    );
+    assert_eq!(
+      closed_reason(None, Some("core rejected frontend: pid 1".into())),
+      "the background service closed the connection: core rejected frontend: pid 1"
+    );
+    // A protocol mismatch is the more precise answer and must win.
+    assert!(
+      closed_reason(Some(7), Some("ignored".into())).contains("speaks protocol 7"),
+      "the protocol reason must not be replaced by a stale warning"
+    );
+  }
 
   /// The `.deb` installs the scripts under `assets/completions/`, and a
   /// checked-in copy can only stay honest if something compares it with the
