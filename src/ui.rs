@@ -2860,18 +2860,7 @@ impl App {
           // taller than the text and centres it, which pushed the stamp back up
           // by half the difference.
           let text_h = ui.text_style_height(&egui::TextStyle::Small);
-          // Android needs a second footer line for the build time: the full
-          // label does not fit beside the version at 412 pt. Reserve both lines
-          // so the rule stays pinned to the bottom edge.
-          #[cfg(target_os = "android")]
-          let footer_lines = 2.0;
-          #[cfg(not(target_os = "android"))]
-          let footer_lines = 1.0;
-          #[cfg(target_os = "android")]
-          let footer_gap = 2.0;
-          #[cfg(not(target_os = "android"))]
-          let footer_gap = 0.0;
-          let strip = RULE_H + RULE_GAP + text_h * footer_lines + footer_gap;
+          let strip = RULE_H + RULE_GAP + text_h;
           let rest = ui.available_height() - strip;
           if rest > 0.0 {
             ui.add_space(rest);
@@ -2928,28 +2917,13 @@ impl App {
                     new_tab: true,
                   });
                 }
-                // Desktop keeps the build time on this row; the phone puts it
-                // on the line below because the full label does not fit at
-                // 412 pt.
-                #[cfg(not(target_os = "android"))]
+                // Version on the left, build time on the right: one row on
+                // every platform; the measured label fits the phone width.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                   ui.label(egui::RichText::new(build_time_label(t)).small().weak());
                 });
               },
             );
-            // On the phone the build time gets its own right-aligned line under
-            // the version instead of sharing the strip with it.
-            #[cfg(target_os = "android")]
-            {
-              ui.add_space(footer_gap);
-              ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), text_h),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                  ui.label(egui::RichText::new(build_time_label(t)).small().weak());
-                },
-              );
-            }
           });
         }
         // Consume the leftover vertical space so the frame background reaches
