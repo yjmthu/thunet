@@ -1247,6 +1247,12 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           // keeps it that way is `keep_online`'s decision from here on.
           connect_budget = Duration::ZERO;
           set_banner(&tx, &mut banner, None);
+          // A login names the account but carries none of the numbers the
+          // status page shows: without an answer here the page drew Online
+          // with an empty account row until the next scheduled poll, which is
+          // what a `keep_online` re-login looked like when another client
+          // ended the shared session. The poll below is that answer.
+          force_status = true;
           tx.send(Ev::Log(Line::info(m))).ok();
           tx.send(Ev::Notify {
             msg: t.connect_ok.into(),
