@@ -478,6 +478,22 @@ const LINK_RETRY: Duration = Duration::from_secs(2);
 /// is picked up without waiting out a full period.
 const STALE_RETRY: Duration = Duration::from_secs(5);
 
+/// Shortest interval between two tray bitmap writes.
+///
+/// The Linux backend exports the icon as a fresh PNG file and tells the shell
+/// where it is; the shell reads that file when the property changes. A read
+/// that lands after the next bitmap has replaced the file fails, and GNOME then
+/// draws its fallback glyph - three dots in the top bar - without retrying on
+/// its own. Spacing the writes makes that race impossible; a state that comes
+/// and goes inside the interval is coalesced away instead of written.
+const TRAY_MIN_GAP: Duration = Duration::from_millis(500);
+
+/// May the tray write a bitmap at `now`? `last` is when the previous one was
+/// written, so `None` (nothing written yet) is always due.
+fn tray_write_due(last: Option<Instant>, now: Instant) -> bool {
+  last.is_none_or(|at| now.saturating_duration_since(at) >= TRAY_MIN_GAP)
+}
+
 struct Toast {
   msg: String,
   at: Instant,
@@ -632,6 +648,10 @@ pub struct App {
   /// The failed recolour has already been reported, so a retry loop does not
   /// fill the log pane with the same line.
   tray_warned: bool,
+  /// When the last bitmap was written; `None` before the first write. Writes
+  /// closer than [`TRAY_MIN_GAP`] wait, so the shell always reads a bitmap that
+  /// is not being replaced under it.
+  tray_wrote_at: Option<Instant>,
   /// The gear in front of *Settings*, built on first paint: the egui context
   /// does not exist yet when `App::new` runs.
   gear: Option<egui::TextureHandle>,
@@ -859,6 +879,9 @@ impl App {
       tray,
       tray_rgb: Some(color_for(State::Offline)),
       tray_warned: false,
+      // `Tray::new` has just written the first bitmap, so a state change in the
+      // first half second of the run waits like any other.
+      tray_wrote_at: Some(Instant::now()),
       gear: None,
       back_arrow: None,
       eye_open: None,
@@ -5393,6 +5416,27 @@ mod tests {
     assert!(!should_restart(0, 200, true));
     assert!(!should_restart(200, 0, true));
   }
+
+  /// Two tray writes closer than the shell's read are what leaves GNOME on its
+  /// placeholder glyph, so the second one waits instead of racing the first.
+  #[test]
+  fn tray_writes_are_spaced_by_the_minimum_gap() {
+    let base = Instant::now();
+    assert!(tray_write_due(None, base), "the first write is always due");
+    assert!(
+      !tray_write_due(Some(base), base),
+      "a write in the same instant must wait"
+    );
+    assert!(!tray_write_due(
+      Some(base),
+      base + TRAY_MIN_GAP - Duration::from_millis(1)
+    ));
+    assert!(tray_write_due(Some(base), base + TRAY_MIN_GAP));
+    assert!(tray_write_due(
+      Some(base),
+      base + TRAY_MIN_GAP + Duration::from_secs(3)
+    ));
+  }
 }
 
 /// Space between stacked bands, and between the last band and the page.
@@ -6016,12 +6060,22 @@ impl eframe::App for App {
     // from a notification area that was being rebuilt (resume, an explorer
     // restart) when the state changed - the case where the icon used to stay
     // grey while the tooltip said Online, with no way back until the state
-    // happened to change again. Retrying every tick rather than on a timer is
-    // safe: a `NIM_MODIFY` per tick is what the tooltip below already costs.
-    if self.tray_rgb != Some(rgb) {
+    // happened to change again.
+    //
+    // Two writes closer together than `TRAY_MIN_GAP` are coalesced, because the
+    // shell reads the bitmap we announce and a read that lands while the next
+    // one replaces it fails: GNOME then keeps its own placeholder (the three
+    // dots) and never retries. The wanted colour is recomputed every tick, so
+    // a state that comes and goes inside the window is never written at all,
+    // and the latest one is the one that lands. Retrying a *refusal* every tick
+    // is still safe: no bitmap was written, so nothing can race.
+    let now = Instant::now();
+    let spaced = tray_write_due(self.tray_wrote_at, now);
+    if spaced && self.tray_rgb != Some(rgb) {
       match self.tray.set_color(rgb) {
         Ok(()) => {
           self.tray_rgb = Some(rgb);
+          self.tray_wrote_at = Some(now);
           self.tray_warned = false;
         }
         Err(e) => {
