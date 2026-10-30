@@ -237,11 +237,16 @@ pub struct Texts {
   /// The same row in portable mode, where the core is a thread of the window
   /// rather than a service: there is nothing to start, stop or restart.
   pub core_row: &'static str,
-  pub core_in_window: &'static str,
+  /// Its status words. The same two pairs describe where the core lives: a
+  /// thread of this window here, a process of its own there.
+  pub core_running: &'static str,
+  pub core_gone: &'static str,
   pub service_running: &'static str,
   pub service_gone: &'static str,
   /// Red banner on the status page while no core is answering.
   pub service_down: &'static str,
+  /// The same band while the core of a portable window is stopped.
+  pub core_down: &'static str,
   /// Red banner while a core answers with another protocol version: it runs,
   /// but this build cannot talk to it until someone restarts it. `{}` is the
   /// protocol the core reported.
@@ -256,6 +261,10 @@ pub struct Texts {
   /// when it provably did not; none of them uses a colon.
   pub service_started: &'static str,
   pub service_stopped: &'static str,
+  /// Toasts for the same button in a portable window, where there is no
+  /// service to name - the core is a thread of that window.
+  pub core_started: &'static str,
+  pub core_stopped: &'static str,
   pub service_start_failed: &'static str,
   pub service_stop_failed: &'static str,
   /// Apply was pressed while the machine service was down; a start is running.
@@ -447,16 +456,20 @@ static ZH: Texts = Texts {
   devices_title: "校园网在线设备：",
   service: "后台服务",
   core_row: "核心",
-  core_in_window: "随本窗口运行",
-  service_running: "运行中",
-  service_gone: "未运行",
+  core_running: "线程运行中",
+  core_gone: "线程未运行",
+  service_running: "进程运行中",
+  service_gone: "进程未运行",
   service_down: "后台服务当前没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
+  core_down: "本窗口的核心线程没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
   service_stale: "后台服务还在运行旧版本（协议 {}），重启后才能恢复连接。",
   service_start: "启动",
   service_stop: "停止",
   service_restart: "重启",
   service_started: "后台服务已启动",
   service_stopped: "后台服务已停止",
+  core_started: "核心线程已启动",
+  core_stopped: "核心线程已停止",
   service_start_failed: "后台服务启动失败",
   service_stop_failed: "后台服务停止失败",
   service_starting: "正在启动后台服务，请稍候…",
@@ -596,16 +609,20 @@ static EN: Texts = Texts {
   devices_title: "Online devices: ",
   service: "Service",
   core_row: "Core",
-  core_in_window: "runs in this window",
-  service_running: "running",
-  service_gone: "not running",
+  core_running: "thread running",
+  core_gone: "thread not running",
+  service_running: "process running",
+  service_gone: "process not running",
   service_down: "The background service is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
+  core_down: "The core thread is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
   service_stale: "The background service still runs an older build (protocol {}); restart it to reconnect.",
   service_start: "Start",
   service_stop: "Stop",
   service_restart: "Restart",
   service_started: "Service started",
   service_stopped: "Service stopped",
+  core_started: "Core thread started",
+  core_stopped: "Core thread stopped",
   service_start_failed: "Service failed to start",
   service_stop_failed: "Service failed to stop",
   service_starting: "Starting the background service…",

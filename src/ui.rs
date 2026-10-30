@@ -1001,8 +1001,12 @@ impl App {
       // keep the reconnect probe quiet until a core answers again. The flag
       // resets on a successful connect, so a real outage still reports.
       self.service_warned = true;
-      let msg = self.t().service_stopped.to_string();
-      self.toast_ok(msg);
+      let msg = if self.portable {
+        self.t().core_stopped
+      } else {
+        self.t().service_stopped
+      };
+      self.toast_ok(msg.to_string());
     }
   }
 
@@ -1157,8 +1161,12 @@ impl App {
       && start_ready
     {
       self.service_request = None;
-      let msg = self.t().service_started.to_string();
-      self.toast_ok(msg);
+      let msg = if self.portable {
+        self.t().core_started
+      } else {
+        self.t().service_started
+      };
+      self.toast_ok(msg.to_string());
     }
   }
 
@@ -1911,11 +1919,11 @@ impl App {
         let auto_connect = self.core.as_ref().is_some_and(|c| c.auto_connect);
         let credentials_ready =
           credential.is_some_and(|c| c.has_password && !c.username.is_empty());
-        // Portable mode hosts the core, so "not running" or "an old core" are
-        // not things the user can act on: at most the link has not been made
-        // yet, and the status row says where the core lives. Reporting it as a
-        // fault would flash a red band on every start.
-        let answered = self.core_answered || self.portable;
+        // Portable mode hosts the core, so "not running" only means the user
+        // stopped the thread. The core is still ours, so the band names the
+        // thread; while the thread is starting the link has simply not been
+        // made yet, which is not a fault.
+        let answered = self.core_answered || (self.portable && crate::ipc::hosted());
         let banners = page_banners(
           self.page,
           self.state,
@@ -1925,6 +1933,7 @@ impl App {
           self.last_error.as_ref(),
           auto_connect,
           credentials_ready,
+          self.portable,
           t,
         );
         if !banners.is_empty() {
@@ -2100,46 +2109,39 @@ impl App {
               // protocol: it is alive, it just cannot serve this build.
               let stale = self.core_stale.is_some();
               let running = service.is_some() || self.core_answered || stale;
-              if self.portable {
-                ui.label(t.core_row);
-                ui.horizontal(|ui| {
-                  let mut text = egui::RichText::new(t.core_in_window);
-                  if running {
-                    text = text.color(state_color(State::Online));
-                  }
-                  ui.label(text);
-                  if let Some((version, _)) = &service {
-                    ui.label(format!("v{version}"));
-                  }
-                });
-                ui.end_row();
+              // The same row in both modes: the core is a process of its own in
+              // service mode and a thread of this window in portable mode, so
+              // only the words differ. The button is the same click either way -
+              // `service_button` stops a hosted core with `Cmd::Shutdown` and
+              // starts one by hosting it again.
+              let (row, words) = if self.portable {
+                (t.core_row, (t.core_running, t.core_gone))
               } else {
-                ui.label(t.service);
-                // Same shape as the address rows above: the button is laid out
-                // first in a right-to-left row, so it keeps the column's right
-                // edge, and the status text takes the rest from the left. The
-                // children stay inside the cell because the row is given
-                // exactly the width the cell offers.
-                let action = match (stale, running) {
-                  (true, _) => t.service_restart,
-                  (false, true) => t.service_stop,
-                  (false, false) => t.service_start,
-                };
-                ui.horizontal(|ui| {
-                  let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-                  ui.allocate_ui_with_layout(
-                    size,
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                      self.service_button(ui, stale, running, action);
-                      ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        service_status(ui, service.as_ref(), running, t);
-                      });
-                    },
-                  );
-                });
-                ui.end_row();
-              }
+                (t.service, (t.service_running, t.service_gone))
+              };
+              ui.label(row);
+              // A hosted core is always this build, so "restart an old core"
+              // cannot happen in portable mode; the three states stay because
+              // the service core can be in any of them.
+              let action = match (stale, running) {
+                (true, _) => t.service_restart,
+                (false, true) => t.service_stop,
+                (false, false) => t.service_start,
+              };
+              ui.horizontal(|ui| {
+                let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(
+                  size,
+                  egui::Layout::right_to_left(egui::Align::Center),
+                  |ui| {
+                    self.service_button(ui, stale, running, action);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                      core_status(ui, service.as_ref(), running, words.0, words.1);
+                    });
+                  },
+                );
+              });
+              ui.end_row();
             });
 
           // Drawn after the grid, on top of everything else: the popup floats
@@ -3382,24 +3384,47 @@ fn address_cell(ui: &mut egui::Ui, value: &str, t: &Texts) -> bool {
   address_row(ui, value, t).1.clicked()
 }
 
-/// The service row's status: "running v0.1.5 · 1m", or why nothing answers.
-fn service_status(ui: &mut egui::Ui, service: Option<&(String, u64)>, running: bool, t: &Texts) {
+/// The core's build and how long it has been up, as two labels.
+///
+/// The version describes the binary, so it stays weak (or amber when it is not
+/// this build); the uptime is a live reading, so it keeps the regular text
+/// colour - that is what tells the two apart at a glance. The `~` marks it as
+/// an approximation: the core reports it only when the window asks.
+fn core_version_uptime(ui: &mut egui::Ui, version: &str, uptime_secs: u64) {
+  let text = egui::RichText::new(format!("v{version}")).monospace();
+  ui.label(if version == env!("CARGO_PKG_VERSION") {
+    text.weak()
+  } else {
+    text.color(state_color(State::Authenticating))
+  });
+  let color = ui.visuals().text_color();
+  ui.label(
+    egui::RichText::new(format!("~{}", human_uptime(uptime_secs)))
+      .monospace()
+      .color(color),
+  );
+}
+
+/// The core row's status: "process running v0.1.5 ~1m", or why nothing
+/// answers. `running`/`gone` are the words for the same two states, which are
+/// "process" for a service and "thread" for a core hosted by its window.
+fn core_status(
+  ui: &mut egui::Ui,
+  service: Option<&(String, u64)>,
+  running: bool,
+  running_word: &str,
+  gone_word: &str,
+) {
   match service {
     Some((version, uptime)) => {
-      ui.label(egui::RichText::new(t.service_running).color(state_color(State::Online)));
-      let label = format!("v{version} · {}", human_uptime(*uptime));
-      let text = egui::RichText::new(label).monospace();
-      ui.label(if version == env!("CARGO_PKG_VERSION") {
-        text.weak()
-      } else {
-        text.color(state_color(State::Authenticating))
-      });
+      ui.label(egui::RichText::new(running_word).color(state_color(State::Online)));
+      core_version_uptime(ui, version, *uptime);
     }
     None if running => {
-      ui.label(egui::RichText::new(t.service_running).color(state_color(State::Online)));
+      ui.label(egui::RichText::new(running_word).color(state_color(State::Online)));
     }
     None => {
-      ui.label(egui::RichText::new(t.service_gone).color(state_color(State::Offline)));
+      ui.label(egui::RichText::new(gone_word).color(state_color(State::Offline)));
     }
   }
 }
@@ -4708,6 +4733,7 @@ mod tests {
         err.as_ref(),
         false,
         true,
+        false,
         t,
       )
       .into_iter()
@@ -4752,6 +4778,7 @@ mod tests {
       None,
       false,
       true,
+      false,
       t,
     );
     assert_eq!(
@@ -4772,9 +4799,27 @@ mod tests {
         None,
         false,
         true,
+        false,
         t
       ),
       vec![(BannerTone::Error, t.service_down.to_string())]
+    );
+    // The same state in a portable window names the thread it runs there: there
+    // is no service to report.
+    assert_eq!(
+      page_banners(
+        Page::Status,
+        State::Offline,
+        false,
+        None,
+        LoginEnv::Campus,
+        None,
+        false,
+        true,
+        true,
+        t
+      ),
+      vec![(BannerTone::Error, t.core_down.to_string())]
     );
     // A core that answers with another protocol is running, so the band says
     // that instead of "not running" and keeps saying it while the retry loop
@@ -4789,6 +4834,7 @@ mod tests {
         None,
         false,
         true,
+        false,
         t
       ),
       vec![(BannerTone::Error, t.service_stale.replacen("{}", "1", 1))]
@@ -4816,6 +4862,7 @@ mod tests {
           Some(&Failure::Network(crate::srun::NetCause::Resolve)),
           false,
           true,
+          false,
           t
         ),
         vec![(BannerTone::Error, t.net_resolve.to_string())]
@@ -4832,6 +4879,7 @@ mod tests {
         Some(&Failure::Credentials),
         false,
         true,
+        false,
         t
       ),
       vec![(BannerTone::Error, t.invalid_credentials.to_string())]
@@ -4848,6 +4896,7 @@ mod tests {
         None,
         true,
         ready,
+        false,
         t,
       )
     };
@@ -5527,6 +5576,7 @@ fn page_banners(
   last_error: Option<&Failure>,
   auto_connect: bool,
   credentials_ready: bool,
+  portable: bool,
   t: &Texts,
 ) -> Vec<(BannerTone, String)> {
   let mut banners = Vec::new();
@@ -5535,6 +5585,7 @@ fn page_banners(
   if page == Page::Status && !core_answered {
     let text = match stale {
       Some(v) => t.service_stale.replacen("{}", &v.to_string(), 1),
+      None if portable => t.core_down.to_string(),
       None => t.service_down.to_string(),
     };
     banners.push((BannerTone::Error, text));
