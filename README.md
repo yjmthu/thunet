@@ -193,7 +193,7 @@ Under *Wi-Fi change* and *Resident* sits one more row, **Allow background wake-u
 
 **Start the service** — the window never starts it by itself: while the `Service` row says `not running`, click **Start** next to it (or run `thunet service start`). On Windows, if the service is not registered yet, **Start** registers it first (one administrator prompt) and then asks the SCM to start it; it never falls back to a user-run process. A red banner at the top of the Status page says the same until a service answers again. **Stop** ends the machine service and leaves the window open.
 
-The one exception is a portable setup (`--state-dir` / `THUNET_STATE_DIR`), where both platforms behave identically and there is no service at all: the core is a thread of the window, started with it and ended with it, so the status page has no *Start* / *Stop* / *Restart* — only a `Core` row that says `runs in this window`. Starting it again means naming the same directory (`thunet --state-dir …`); a bare `thunet` is machine mode, and `thunet core --state-dir …` runs the same core without a window. That path holds no single-instance lock, so `thunet quit` cannot find it; end that process directly (Ctrl-C in the foreground, `kill` in the background). The `thunet service` verbs refuse to run in that mode for the same reason: they would act on the machine service while the window is looking at a separate, portable core.
+The one exception is a portable setup (`--state-dir` / `THUNET_STATE_DIR`), where both platforms behave identically and there is no machine service: the core is a thread of the window unless you start one of its own. The status page's `Core` row starts and stops it either way; `thunet service start|stop|restart` does the same from a terminal (a core process of that state directory, which an open window attaches to), and `service enable|disable|status` control the window's own login entry. Only `install`/`uninstall` are refused — `thunet --machine service …` is the way to the machine service. Naming a portable setup means naming its directory: a bare `thunet` is machine mode.
 
 **Log in and out** — use the buttons on the Status page, the tray menu, or `thunet login` / `thunet logout`. If a session already exists the client says so instead of authenticating twice.
 
@@ -236,13 +236,15 @@ thunet status                # JSON: service state + portal session/traffic
 thunet login                 # authenticate: stdin three lines, -i to ask, --cmd/--bash for the line
 thunet logout                # ask the service to de-authenticate
 thunet ac-id                 # portal ac_id the service is using
-thunet config                # config path + effective settings
+thunet config                # the core's effective settings; --auto-connect/--keep-online/--remember-password on|off
 thunet shortcut              # create a desktop shortcut
 thunet completions <shell>   # print a bash/zsh/fish/elvish/powershell completion script
 thunet selftest              # note: the real test vectors live in `cargo test`
 ```
 
 On Windows the MSI puts the executable in `C:\Program Files\THUnet\bin` and appends that directory to the system `PATH`, so `thunet` works in any shell started after the install; the `.deb` installs it as `/usr/bin/thunet`.
+
+`thunet config` asks the running core for its effective settings — the portal host, `ac_id`, the account, `has_password`, `remember_password`, `auto_connect` and `keep_online` — and prints the path of the file that holds the rest (`core.json`; `https`, `ip` and the reconnect delay have no UI or switch). It does not read the window's file at all. `--auto-connect on|off`, `--keep-online on|off` and `--remember-password on|off` (alias `--remember-pwd`) are the CLI form of the three switches on the Settings page: they go to the core, which is the process that acts on them and the only one that may write them down. `--remember-password off` deletes the sealed copy the core holds, exactly like unticking *Remember password*, and the answer is the core's own `CredentialState`, so the service has to be running.
 
 Completion scripts come from the same `clap` definition the parser uses, so they cover every subcommand (including `service <action>`) and every global flag:
 
@@ -270,7 +272,7 @@ The default on line 3 is "store" on purpose: saving the password is what most pe
 
 Without `-i` nothing is asked on any platform: on Windows the executable is a windowed binary, so it owns no console of its own, and the console it attaches to is one the shell is reading at the same time — an Enter would be taken by the shell's own line editor and the answers split between the two. That is why the default path is a pipe, and why `-i` is your explicit promise that a shell is waiting to answer.
 
-`-i` asks the same three things instead of reading them: the account (the stored one is offered as the default, so Enter keeps it), the password (not echoed; Enter keeps the one the service holds) and remembering — `[Y/n]`, where Enter means yes and only `n`, `no`, `0` or `false` means no, which also deletes a password stored earlier. Ctrl+C cancels at any question, leaves the terminal as it was and exits with status 130. Whatever stdin is, that is where the answers come from: with a pipe they are the three lines, and with nothing usable there the question fails at once rather than waiting. Nothing checks the promise for you.
+`-i` asks those three things instead of reading them — the account (the stored one is offered as the default, so Enter keeps it), the password (not echoed; Enter keeps the one the service holds) and remembering — `[Y/n]`, where Enter means yes and only `n`, `no`, `0` or `false` means no, which also deletes a password stored earlier — plus one question the pipe cannot carry: whether the service connects at startup (`Connect automatically at startup? [Y/n]`, yes by default; the pipe stays at three lines so a script never changes a setting it did not see). Ctrl+C cancels at any question, leaves the terminal as it was and exits with status 130. Whatever stdin is, that is where the answers come from: with a pipe they are the three lines, and with nothing usable there the question fails at once rather than waiting. Nothing checks the promise for you.
 
 Where that promise holds depends on the shell, not on the platform:
 
@@ -291,14 +293,18 @@ printf 'alice\npw\ny\n' | thunet login
 
 The password never reaches `argv` and never enters the shell history; it is read from the console or from that pipe, so no process listing shows it either. `thunet login --help` is the short form of all this and `thunet login -v` the long one, with the reasoning behind the two commands.
 
-The command is never silent. It first says which account it will use and where that came from — `account: alice (stored)` for a bare run, `account: alice (stdin, remember yes)` or `(stdin, remember no)` when a pair was piped, `account: alice (asked)` when `-i` asked — then the service's state, which names the account the service holds when it has one (`session: online as bob`, `session: authenticating as alice`, `session: offline (credential: alice)`, or a bare `session: offline`), and then what it did:
+The command is never silent. It first says which account it will use and where that came from — `account: alice (stored)` for a bare run, `account: alice (stdin, remember yes)` or `(stdin, remember no)` when a pair was piped, `account: alice (asked)` when `-i` asked — then the service's state, which names the account the service holds when it has one (`session: online as bob`, `session: authenticating as alice`, `session: offline (credential: alice)`, or a bare `session: offline`). With `-i` one more line follows, `auto connect: on` or `off`, saying what the next start will do. Every run then reports autostart, naming the entry that starts the app and, when it is disabled, how to turn it on:
 
 ```
 account: alice (stdin, remember yes)
 session: offline (credential: bob)
+autostart: disabled (thunet.service)
+  turn it on with `thunet service enable` (asks for administrator rights)
 credentials: alice, saved for the next start
 online
 ```
+
+Machine mode names the service (`thunet.service` on Linux, the `thunet` service on Windows); a portable window names its own login entry instead (`thunet-portable-<tag>.desktop`, or the `thunet-portable-<tag>-tray-<user>` task), because it has no service to point at, and its hint points at *Start this window at login* in the settings page.
 
 A pair that was piped or asked for always produces the `credentials:` line (`saved for the next start`, `this session only`, or `NOT saved` when the pair was incomplete) before the result of the login itself. A bare `login` on a service that is already online with the same account prints `nothing to change` instead: no credential change is sent and no login is attempted. With no account anywhere — a fresh machine and nothing piped — it stops with an error that says to pipe the three lines (or use `-i`) and points at `thunet login --help`.
 
@@ -313,7 +319,7 @@ A pair that was piped or asked for always produces the `credentials:` line (`sav
               "credential": { "username": "1234567890", "has_password": true,
                               "remembered": true, "revision": 2, "matches": null },
               "auto_connect": true, "keep_online": true,
-              "wanted_online": true, "failures": 0, "frontends": 1,
+              "wanted_online": true, "autostart": true, "failures": 0, "frontends": 1,
               "endpoint": "/run/user/1000/thunet/control.sock" },
   "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
 }
@@ -325,7 +331,7 @@ Starting `thunet` while it is already running does **not** start a second copy: 
 
 Global overrides: `--host <host>`, `--http`, `--timeout <secs>`, `--ip <addr>`, `--ac-id <id>`.
 
-Precedence is **command line > config file > credential store**. `--host` / `--http` / `--timeout` / `--ip` / `--ac-id` apply to the one-off commands and to a portable core (`thunet --host … core`), which is what makes a test against a fake host possible; the machine service and the window read their settings from the config file only, and the account and the password never come from the command line at all: `thunet login` reads them from stdin.
+Precedence is **command line > the core's file > the credential store**. `--host` / `--http` / `--timeout` / `--ip` / `--ac-id` apply to the one-off commands and to a portable core (`thunet --host … core`), which is what makes a test against a fake host possible; the machine service and the window read their settings from `core.json` only, and the account and the password never come from the command line at all: `thunet login` reads them from stdin.
 
 The password has no `argv` form at all: it is only ever read from stdin, so it never appears in the shell history or in a process listing (`/proc/<pid>/cmdline` on Linux is readable by other users, unless `hidepid=2`).
 
@@ -343,21 +349,21 @@ Per-user files:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | Language, log level, start-minimised, and a mirror of the *Remember password* switch. **No password** — that field is skipped when serialising, and the authoritative switch is the core's copy. |
+| `config.json` | Language, log level, theme, privacy, start-minimised. Window settings only: the account and the session policy belong to the core. |
 | `crash.log` | Appended only when the window panics. |
 
 Machine-wide files:
 
 | File | Contents |
 | --- | --- |
-| `config.json` | Account name, portal host, the *Connect on startup* and *Stay online* switches, and whether the sealed credential should be loaded on the next start. **No password.** |
+| `core.json` | Account name, portal host, the `https`/`ac_id`/`ip` overrides, the *Connect on startup* and *Stay online* switches, the reconnect delay, and whether the sealed credential should be loaded on the next start. **No password.** |
 | `credential.bin` | The sealed account/password pair, mode `0600` / service-only ACL. |
 | `key.bin` | A random 32-byte data key, mode `0600` / service-only ACL. |
 | `core.log` | Diagnostics from the background core. |
 
 Password storage is one implementation on every platform. `credential.bin` holds `MAGIC "THUNET-1" ‖ nonce ‖ ciphertext` (ChaCha20-Poly1305) with mode `0600`, under a **random 32-byte key** stored in `key.bin`. The key is never derived from the machine identity, and there is no older format: a blob with any other magic is treated as absent.
 
-The window never opens either file: it sends `SetCredentials` and receives only a `CredentialState` — `{ username, has_password, remembered, revision }` — with no password, and asks `CheckCredentials` to compare a typed candidate against the sealed one. `remembered` is what the checkbox shows, and the core records it in its own `config.json`, so a service restart still reads the blob back. This is what lets every interactive user change the shared credential without being able to read it.
+The window never opens `core.json` or the blob: it sends `SetCredentials` and receives only a `CredentialState` — `{ username, has_password, remembered, revision }` — with no password, and asks `CheckCredentials` to compare a typed candidate against the sealed one. `remembered` is what the checkbox shows, and the core records it in its own `core.json`, so a service restart still reads the blob back. This is what lets every interactive user change the shared credential without being able to read it.
 
 The protection is the directory ACL, not the encryption:
 
@@ -368,7 +374,7 @@ A full-disk image that includes `key.bin` (and, on Linux, the systemd host key) 
 
 Deleting the per-user directory resets the window's preferences. The machine directory belongs to the service and is kept across upgrades and reinstalls; a real uninstall removes it, which is also how you forget the shared account.
 
-Deleting `config.json` resets every setting. A real uninstall (Windows *Uninstall*, `apt remove`) deletes the whole machine directory, including `credential.bin` and `key.bin`; an upgrade or a reinstall keeps it, so the account and the sealed password survive.
+Deleting `config.json` resets the window's settings; deleting `core.json` resets the core's (the sealed blob still knows the account, so the next start recovers it). A configuration written before the two files were split kept both owners in one `config.json`: the first start splits it in place — the core's half moves to `core.json`, and in the machine directory the old file is removed. A real uninstall (Windows *Uninstall*, `apt remove`) deletes the whole machine directory, including `credential.bin` and `key.bin`; an upgrade or a reinstall keeps it, so the account and the sealed password survive.
 
 ## 7. Installing, uninstalling, shortcuts
 
@@ -424,7 +430,7 @@ The package ships the system unit; a portable install can write it with `thunet 
 | `start` / `stop` / `restart` | `systemctl …`, administrator only | `StartServiceW`, `ControlService`, administrator only |
 | `status` | `systemctl status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
 
-Once the core is registered it belongs to systemd / the Service Control Manager: the window only reconnects to it and never spawns one behind the manager's back. `enable` and `disable` only decide what happens at the **next** boot; they never start or stop the running core — that is what `start` and `stop` are for.
+Once the core is registered it belongs to systemd / the Service Control Manager: the window only reconnects to it and never spawns one behind the manager's back. `enable` and `disable` only decide what happens at the **next** boot; they never start or stop the running core — that is what `start` and `stop` are for. In portable mode (`THUNET_STATE_DIR`) there is no machine service to address: `enable`, `disable` and `status` operate on the window's own login entry (the CLI half of *Start this window at login*), `start`, `stop` and `restart` run and end a core of that state directory (a process of its own, which an open window attaches to), and only `install`/`uninstall` are refused; `thunet --machine service …` is the explicit way to the machine service.
 
 On Linux the unit is written on first start even with autostart off, so `thunet service start|stop|status` works right away. On Windows the service is created by `thunet service install` (or by picking a service mode, or by the status page's **Start**), and `start|stop|status` then work without any further prompt.
 
@@ -695,8 +701,8 @@ The machine core has no `Shutdown` command on the control channel: the status pa
 | --- | --- | --- |
 | Machine state | `%ProgramData%\thunet` | `/var/lib/thunet` |
 | Permissions | explicit DACL, inheritance disabled: service SID + Administrators | `0700`, owner `thunet` (`StateDirectory=thunet`, `StateDirectoryMode=0700`) |
-| Contents | `config.json` (no password), `credential.bin`, `key.bin`, `core.log` | same |
-| Per-user prefs | `%APPDATA%\thunet` (language, log level, tray autostart) | `~/.config/thunet` |
+| Contents | `core.json` (no password), `credential.bin`, `key.bin`, `core.log` | same |
+| Per-user prefs | `%APPDATA%\thunet` (language, log level, theme, privacy, start-minimised) | `~/.config/thunet` |
 
 The UI never opens `credential.bin`: it sends `SetCredentials` and receives only `{ username, has_password }` back. The core writes the file atomically with the service's own token. That is what makes "any user may change the shared credential, no user may read it" possible at all.
 
@@ -734,7 +740,7 @@ Two more practices for shared machines:
 - Linux: the package ships a system unit with `DynamicUser=yes` and `StateDirectory=thunet`; `postinst` runs `systemctl enable --now thunet.service`.
 - This version does not migrate older layouts. If an older per-user install left a `credential.bin`, `key.bin` or `systemd --user` unit behind, remove it by hand before enabling the service; leftover files are simply ignored.
 - A real uninstall removes the machine directory: on Windows the MSI runs `service-purge` after deleting the service, on Linux `postrm` removes `/var/lib/thunet`. The account, `credential.bin` and `key.bin` therefore do not outlive the package. An upgrade, a repair or a reinstall keeps them.
-- Portable/dev mode keeps `--state-dir` and a core that runs inside the window's own process; it is not the supported multi-user configuration. Because every autostart mode registers something with systemd / the SCM, the settings page hides that row in portable mode (the core ends with the window). `thunet service <action>` refuses to run under a state directory for the same reason — there is no service to act on — with one exception: the read-only `thunet service status` still reports what the platform's service manager says about the machine service. Adding `--machine` to any command makes it ignore `THUNET_STATE_DIR` for that one invocation (`thunet --machine service start` from a portable shell), which is also what the Windows installer passes to `quit`, so a variable inherited from the shell that started msiexec cannot retarget it at a portable endpoint.
+- Portable/dev mode keeps `--state-dir` and a core that runs inside the window's own process; it is not the supported multi-user configuration. Because every autostart mode registers something with systemd / the SCM, the settings page hides that row in portable mode (the core ends with the window) and offers *Start this window at login* instead. `thunet service enable|disable|status` act on that window entry; `start`, `stop` and `restart` run and end a core of the state directory as a process of its own (which an open window then attaches to), and only `install`/`uninstall` are refused. Adding `--machine` to any command makes it ignore `THUNET_STATE_DIR` for that one invocation (`thunet --machine service start` from a portable shell), which is also what the Windows installer passes to `quit`, so a variable inherited from the shell that started msiexec cannot retarget it at a portable endpoint.
 
 ## 14. License
 

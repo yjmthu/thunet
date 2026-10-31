@@ -37,7 +37,7 @@ use interprocess::os::windows::named_pipe::{
   PipeListener, PipeListenerOptions, PipeStream, pipe_mode::Bytes,
 };
 
-use crate::config::Config;
+use crate::config::CoreConfig;
 use crate::proto::{Cmd, Ev, Failure, Msg, VERSION, Wire};
 
 /// Whether this process serves the machine-wide endpoint. Set by [`serve`].
@@ -446,7 +446,7 @@ fn bind_retrying<T>(
 ///
 /// `machine` selects the machine-wide endpoint and requires the process to run
 /// as the service identity. A user-run core stays on its per-user endpoint.
-pub fn serve(cfg: Config, machine: bool) -> Result<Serve, String> {
+pub fn serve(cfg: CoreConfig, machine: bool) -> Result<Serve, String> {
   if machine && !crate::ident::is_current_service() {
     return Err(
       "refusing machine mode: this process is not running as the THUnet service account".into(),
@@ -1494,7 +1494,7 @@ pub fn host_core() -> Result<(), String> {
   let spawned = std::thread::Builder::new()
     .name("thunet-core".into())
     .spawn(|| {
-      match serve(Config::load(), false) {
+      match serve(CoreConfig::load(), false) {
         Ok(Serve::Started) => {}
         Ok(Serve::AlreadyRunning) => {
           crate::diag::line("core (hosted): another core already serves the endpoint");
@@ -1774,7 +1774,7 @@ mod tests {
   #[ignore = "binds the live core endpoint; run by hand"]
   fn a_frontend_can_talk_to_a_core() {
     std::thread::spawn(|| {
-      let _ = serve(crate::config::Config::load(), false);
+      let _ = serve(crate::config::CoreConfig::load(), false);
     });
 
     let mut link = None;

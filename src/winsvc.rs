@@ -98,7 +98,7 @@ fn body() -> Result<(), String> {
   // (and the window) convinced that a core is listening, so fail out loud.
   std::thread::spawn(|| {
     crate::diag::line("service: starting core serve loop");
-    let cfg = crate::config::Config::load_machine();
+    let cfg = crate::config::CoreConfig::load_machine();
     match crate::ipc::serve(cfg, true) {
       Ok(crate::ipc::Serve::Started) => {}
       Ok(crate::ipc::Serve::AlreadyRunning) => {

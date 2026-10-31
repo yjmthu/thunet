@@ -185,7 +185,7 @@ THUnet 也能在安卓上跑：同一个程序、同样的两个页面、同一�
 
 **启动服务** —— 窗口不会自己拉起后台服务：`后台服务` 一行显示 `未运行` 时，点它右边的 **启动**（或执行 `thunet service start`）。Windows 上如果服务还没注册，**启动** 会先注册服务（一次管理员授权），再让 SCM 启动它，不会另起一个用户进程。在服务重新应答之前，状态页顶部会一直有一条红色横幅说明这一点。**停止** 会结束整机服务，但窗口保持打开。
 
-唯一的例外是便携配置（`--state-dir` / `THUNET_STATE_DIR`）：两个平台行为一致，而且那里根本没有服务——核心是窗口的一个线程，随窗口启动、随窗口结束，所以状态页没有 *启动* / *停止* / *重启*，只有一行 `核心` 写着 `随本窗口运行`。启动它要重新带上同一个状态目录（裸 `thunet` 是机器模式），不想要窗口就用 `thunet core` 跑同一个核心；这条路径不持有窗口的单实例锁，`thunet quit` 找不到它，结束它要直接终止该进程（前台运行用 Ctrl-C，后台运行用 `kill`）。`thunet service` 这套动词在这个模式下会直接拒绝，理由相同：它们作用于整机服务，而你眼前这套是独立的便携核心。
+唯一的例外是便携配置（`--state-dir` / `THUNET_STATE_DIR`）：两个平台行为一致，而且那里没有机器服务——核心默认是窗口的一个线程，也可以单独起一个进程。状态页的 `核心` 一行两种都能起停；`thunet service start|stop|restart` 在终端做同样的事（起停该状态目录的 core 进程，已打开的窗口会自动 attach），`service enable|disable|status` 则管本窗口自己的登录条目。只有 `install` / `uninstall` 被拒绝——要操作机器服务用 `thunet --machine service …`。提便携配置就是提它的目录：裸 `thunet` 是机器模式。
 
 **登录与注销** —— 用状态页的按钮、托盘菜单，或者 `thunet login` / `thunet logout`。如果会话已经存在，客户端会直接告诉你，而不是重复认证。
 
@@ -228,13 +228,15 @@ thunet status                # JSON：服务自身状态 + 门户会话/流量
 thunet login                 # 认证：stdin 三行、-i 提问，--cmd/--bash 打印该敲的命令
 thunet logout                # 让服务注销
 thunet ac-id                 # 服务正在使用的门户 ac_id
-thunet config                # 配置路径 + 生效中的设置
+thunet config                # core 的生效设置；--auto-connect/--keep-online/--remember-password on|off
 thunet shortcut              # 创建桌面快捷方式
 thunet completions <shell>   # 输出 bash/zsh/fish/elvish/powershell 补全脚本
 thunet selftest              # 注意：真正的测试向量在 `cargo test` 里
 ```
 
 Windows 上 MSI 把可执行文件放在 `C:\Program Files\THUnet\bin`，并把该目录追加到系统 `PATH`，所以安装之后新开的终端里可以直接用 `thunet`；`.deb` 装的是 `/usr/bin/thunet`。
+
+`thunet config` 向运行中的 core 要它的生效设置——门户主机、`ac_id`、账号、`has_password`、`remember_password`、`auto_connect`、`keep_online`——并打印保存其余字段的文件路径（`core.json`；`https`、`ip`、重连延迟没有界面也没有开关）。它完全不读窗口的文件。`--auto-connect on|off`、`--keep-online on|off`、`--remember-password on|off`（别名 `--remember-pwd`）是设置页那三个开关的 CLI 形式：它们发给 core —— core 才是执行这些设置、并且唯一有权写入它们的进程。`--remember-password off` 会删掉 core 保存的密文，和取消勾选*记住密码*完全一样，回答直接取自 core 的 `CredentialState`，所以服务必须在运行。
 
 补全脚本由解析器使用的同一份 `clap` 定义生成，所以每个子命令（含 `service <action>`）和每个全局参数都能补全：
 
@@ -262,7 +264,7 @@ thunet completions fish > ~/.config/fish/completions/thunet.fish
 
 不加 `-i` 时任何平台都不会提问：Windows 上的可执行文件是 GUI 子系统的程序，本身不拥有控制台，而它附加的那个控制台正被 shell 同时读取——回车会被 shell 自己的行编辑器吃掉，答案会被两边分掉。这就是默认走管道的原因，也是 `-i` 的含义：你明确承诺有一个 shell 正在等着回答。
 
-`-i` 把这同样三件事问出来而不是读出来：账号（已保存的账号作为默认值，回车即沿用）、密码（不回显，回车则沿用服务当前持有的那个）、以及是否记住——`[Y/n]`，回车表示「是」，只有 `n`、`no`、`0` 或 `false` 表示「否」，而「否」还会删掉之前保存的那份。任何一步按 Ctrl+C 都会取消：终端恢复原样，进程以 130 退出。stdin 是什么，答案就从哪里来：接的是管道，答案就是那三行；那里没有任何可用输入时，问题会立刻失败而不是一直等下去。这个承诺没有任何东西替你检查。
+`-i` 把这同样三件事问出来而不是读出来：账号（已保存的账号作为默认值，回车即沿用）、密码（不回显，回车则沿用服务当前持有的那个）、是否记住——`[Y/n]`，回车表示「是」，只有 `n`、`no`、`0` 或 `false` 表示「否」，而「否」还会删掉之前保存的那份——再加一个管道带不了的问题：服务是否在启动时自动连接（`Connect automatically at startup? [Y/n]`，默认「是」；管道仍然只有三行，所以脚本不会悄悄改掉它没看见的设置）。任何一步按 Ctrl+C 都会取消：终端恢复原样，进程以 130 退出。stdin 是什么，答案就从哪里来：接的是管道，答案就是那三行；那里没有任何可用输入时，问题会立刻失败而不是一直等下去。这个承诺没有任何东西替你检查。
 
 这个承诺在哪些 shell 里成立，取决于 shell 而不是平台：
 
@@ -283,14 +285,18 @@ printf 'alice\npw\ny\n' | thunet login
 
 密码从不进入 `argv`，也不进入 shell 历史：它只会从控制台或那条管道读取，所以任何进程列表里都看不到它。`thunet login --help` 是这套说明的短版本，`thunet login -v` 是长版本，附带两条命令背后的原因。
 
-这个命令从不沉默。它先说明打算用哪个账号、这个账号从哪来——直接运行是 `account: alice (stored)`，接了管道则是 `account: alice (stdin, remember yes)` 或 `(stdin, remember no)`，用 `-i` 问出来则是 `account: alice (asked)`——然后打印服务状态，core 持有账号时会一并写出（`session: online as bob`、`session: authenticating as alice`、`session: offline (credential: alice)`，或者干脆只有 `session: offline`），最后说明它做了什么：
+这个命令从不沉默。它先说明打算用哪个账号、这个账号从哪来——直接运行是 `account: alice (stored)`，接了管道则是 `account: alice (stdin, remember yes)` 或 `(stdin, remember no)`，用 `-i` 问出来则是 `account: alice (asked)`——然后打印服务状态，core 持有账号时会一并写出（`session: online as bob`、`session: authenticating as alice`、`session: offline (credential: alice)`，或者干脆只有 `session: offline`）。用 `-i` 时紧跟一行 `auto connect: on` 或 `off`，说明下一次启动会怎么做。每次运行还会报告自启动状态，写出负责启动的条目；关闭时会附上打开它的办法：
 
 ```
 account: alice (stdin, remember yes)
 session: offline (credential: bob)
+autostart: disabled (thunet.service)
+  turn it on with `thunet service enable` (asks for administrator rights)
 credentials: alice, saved for the next start
 online
 ```
+
+机器模式写的是服务（Linux 是 `thunet.service`，Windows 是 `thunet` 服务）；便携窗口写的是它自己的登录条目（`thunet-portable-<tag>.desktop`，或计划任务 `thunet-portable-<tag>-tray-<user>`），因为它没有服务可指，提示指向设置页的*登录时启动本窗口*。
 
 接了管道或用了 `-i` 时，在登录结果之前一定会有 `credentials:` 这一行（`saved for the next start`、`this session only`，凭据不完整时是 `NOT saved`）。直接运行且服务已经用同一个账号在线时，它打印 `nothing to change`：既不发送凭据变更，也不再尝试登录。完全没有账号时（新机器、没有接管道也没用 `-i`），它会报错，提示把三行接进管道（或者用 `-i`），并指向 `thunet login --help`。
 
@@ -305,7 +311,7 @@ online
               "credential": { "username": "1234567890", "has_password": true,
                               "remembered": true, "revision": 2, "matches": null },
               "auto_connect": true, "keep_online": true,
-              "wanted_online": true, "failures": 0, "frontends": 1,
+              "wanted_online": true, "autostart": true, "failures": 0, "frontends": 1,
               "endpoint": "/run/user/1000/thunet/control.sock" },
   "portal": { "error": "ok", "online_ip": "…", "bytes_in": … }
 }
@@ -317,7 +323,7 @@ online
 
 全局覆盖参数：`--host <host>`、`--http`、`--timeout <secs>`、`--ip <addr>`、`--ac-id <id>`。
 
-优先级是 **命令行 > 配置文件 > 凭据存储**。`--host` / `--http` / `--timeout` / `--ip` / `--ac-id` 作用于一次性的命令，也作用于便携模式的 core（`thunet --host … core`），所以拿假门户做测试才可行；机器服务与窗口只从配置文件读设置，而账号和密码从不来自命令行：`thunet login` 从 stdin 读取它们。
+优先级是 **命令行 > core 的文件 > 凭据存储**。`--host` / `--http` / `--timeout` / `--ip` / `--ac-id` 作用于一次性的命令，也作用于便携模式的 core（`thunet --host … core`），所以拿假门户做测试才可行；机器服务和窗口只从 `core.json` 读设置，而账号和密码从不来自命令行：`thunet login` 从 stdin 读取它们。
 
 密码根本没有 `argv` 形式：它只会从 stdin 读取，所以不会出现在 shell 历史和进程列表里（Linux 的 `/proc/<pid>/cmdline` 对其他用户可读，除非 `hidepid=2`）。
 
@@ -335,21 +341,21 @@ online
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 语言、日志级别、启动时最小化，以及*记住密码*开关的副本。**没有密码** —— 序列化时该字段会被跳过；真正的开关以 core 的副本为准。 |
+| `config.json` | 语言、日志级别、主题、隐私开关、启动时最小化。只属窗口：账号和会话策略归 core。 |
 | `crash.log` | 仅在窗口 panic 时追加。 |
 
 整机文件：
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 账号、门户主机、*启动时自动连接* / *保持连接* 两个开关，以及下次启动是否读回加密凭据。**没有密码。** |
+| `core.json` | 账号、门户主机、`https`/`ac_id`/`ip` 覆盖、*启动时自动连接* / *保持连接* 两个开关、重连延迟，以及下次启动是否读回加密凭据。**没有密码。** |
 | `credential.bin` | 加密保存的账号密码，权限 `0600` / 仅服务 ACL。 |
 | `key.bin` | 随机 32 字节数据密钥，权限 `0600` / 仅服务 ACL。 |
 | `core.log` | 后台 core 的诊断日志。 |
 
 密码存储在所有平台上只有一套实现：`credential.bin` 里是 `MAGIC "THUNET-1" ‖ nonce ‖ 密文`（ChaCha20-Poly1305），权限 `0600`，密钥是 `key.bin` 里的**随机 32 字节**，从不由机器标识派生。没有旧格式兼容：magic 不是 `THUNET-1` 的文件一律当作不存在。
 
-窗口从不打开这两个文件：它发送 `SetCredentials`，只拿回 `{ username, has_password }`。这样每个交互用户都能改共享凭据，却读不到它。
+窗口从不打开 `core.json` 或凭据文件：它发送 `SetCredentials`，只拿回 `{ username, has_password, remembered }`，从不接触密码。`remembered` 由 core 记在自己的 `core.json` 里，所以服务重启后仍能读回密文。这样每个交互用户都能改共享凭据，却读不到它。
 
 真正起作用的边界是目录 ACL，不是加密：
 
@@ -358,7 +364,7 @@ online
 
 如果整盘镜像把 `key.bin`（以及 Linux 上的 systemd host key）也带走了，仍然可以解密；只有 TPM 绑定密钥或口令能改变这一点。管理员/root 无论如何都能读密钥或 dump core 的内存。
 
-删除每用户目录只会重置窗口偏好；整机目录属于服务，升级和重装后仍在，真正的卸载会连同 `credential.bin`、`key.bin` 一起删除。
+删除每用户目录只会重置窗口偏好；删除 `core.json` 重置 core 的设置（密文里仍有账号，下次启动会恢复）。拆分前的旧版本把两个主人放在同一个 `config.json` 里：首次启动会就地拆分——core 那一半搬到 `core.json`，机器目录里的旧文件直接删除。整机目录属于服务，升级和重装后仍在，真正的卸载会连同 `credential.bin`、`key.bin` 一起删除。
 
 ## 7. 安装、卸载、快捷方式
 
@@ -414,7 +420,7 @@ MSI 是每机器安装（`Scope="perMachine"`），一次 UAC 换来的是：安
 | `start` / `stop` / `restart` | `systemctl …`，需要管理员 | `StartServiceW` / `ControlService`，需要管理员 |
 | `status` | `systemctl status` | `QueryServiceStatusEx` + `QueryServiceConfig` |
 
-core 一旦注册，就属于 systemd / 服务控制管理器管：窗口只会重连它，绝不在后台自己再 spawn 一个。`enable` / `disable` 只决定**下次开机**是否自动起，不改变当前是否在运行 —— 那是 `start` / `stop` 的事。
+core 一旦注册，就属于 systemd / 服务控制管理器管：窗口只会重连它，绝不在后台自己再 spawn 一个。`enable` / `disable` 只决定**下次开机**是否自动起，不改变当前是否在运行 —— 那是 `start` / `stop` 的事。便携模式（`THUNET_STATE_DIR`）下没有机器服务可操作：`enable`、`disable`、`status` 作用于本窗口自己的登录条目（「登录时启动本窗口」的 CLI 版），`start`、`stop`、`restart` 起停该状态目录的 core（独立进程，已打开的窗口会 attach 上去），只有 `install` / `uninstall` 被拒绝；要操作机器服务，用 `thunet --machine service …` 显式指明。
 
 Linux 上服务由安装包提供，`thunet service start|stop|status` 立刻可用；便携安装需要先执行 `thunet service install`（管理员）。Windows 上服务由第一次选择服务档位、第一次点 **启动**（或 `thunet service install`）创建，之后 `start|stop|status` 都需要管理员授权。
 
@@ -639,10 +645,10 @@ core 变成机器级之后不再使用文件 socket（`$XDG_RUNTIME_DIR/thunet/c
 | --- | --- | --- |
 | 机器状态 | `%ProgramData%\thunet` | `/var/lib/thunet` |
 | 权限 | 显式 DACL，关闭继承：服务 SID + Administrators | `0700`，属主 `thunet`（`StateDirectory=thunet`、`StateDirectoryMode=0700`） |
-| 内容 | `config.json`（无密码）、`credential.bin`、`key.bin`、`core.log` | 同上 |
-| 每用户偏好 | `%APPDATA%\thunet`（语言、日志级别、托盘自启） | `~/.config/thunet` |
+| 内容 | `core.json`（无密码）、`credential.bin`、`key.bin`、`core.log` | 同上 |
+| 每用户偏好 | `%APPDATA%\thunet`（语言、日志级别、主题、隐私、启动最小化） | `~/.config/thunet` |
 
-UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个不含密码的 `CredentialState`（`{ username, has_password, remembered, revision }`），并用 `CheckCredentials` 让 core 比对刚输入的密码是否就是已保存的那个。勾选框显示的是 `remembered`，而 core 会把它写进自己的 `config.json`，所以服务重启后仍然会读回密文。这样“任何用户可改共享凭据、任何用户不可读”才成立。
+UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个不含密码的 `CredentialState`（`{ username, has_password, remembered, revision }`），并用 `CheckCredentials` 让 core 比对刚输入的密码是否就是已保存的那个。勾选框显示的是 `remembered`，而 core 会把它写进自己的 `core.json`，所以服务重启后仍然会读回密文。这样“任何用户可改共享凭据、任何用户不可读”才成立。
 
 ### 13.5 别的用户能解密密码吗？
 
@@ -678,7 +684,7 @@ UI 从不打开 `credential.bin`：它发送 `SetCredentials`，只拿回一个�
 - Linux：包内提供带 `DynamicUser=yes` 和 `StateDirectory=thunet` 的 system unit；`postinst` 执行 `systemctl enable --now thunet.service`。
 - 本版本不迁移旧布局。如果旧版每用户安装留下了 `credential.bin`、`key.bin` 或 `systemd --user` 单元，请在启用服务前手动删除；残留文件会被直接忽略。
 - 真正的卸载会删除整机目录：Windows 上 MSI 删除服务后执行 `service-purge`，Linux 上 `postrm` 删除 `/var/lib/thunet`。账号、`credential.bin` 和 `key.bin` 因此不会在安装包移除后继续存在；升级、修复和重装则保留。
-- 便携/开发模式保留 `--state-dir`，核心直接跑在窗口自己的进程里；它不是受支持的多用户配置。由于每个自启动档位都要向 systemd / SCM 注册东西，便携模式下设置页会隐藏这一行（核心随窗口结束）。`thunet service <action>` 在状态目录下会拒绝执行，理由同样是「没有服务可操作」；唯一例外是只读的 `thunet service status`，它照旧报告平台服务管理器眼里的整机服务状态。任何命令加上 `--machine` 都会在这一次调用里忽略 `THUNET_STATE_DIR`（例如便携 shell 里执行 `thunet --machine service start`），Windows 安装包给 `quit` 传的也是它，这样从启动 msiexec 的那个 shell 继承来的变量就无法把它指向便携端点。
+- 便携/开发模式保留 `--state-dir`，核心直接跑在窗口自己的进程里；它不是受支持的多用户配置。由于每个自启动档位都要向 systemd / SCM 注册东西，便携模式下设置页会隐藏这一行（核心随窗口结束），改为提供「登录时启动本窗口」。`thunet service enable|disable|status` 作用于这个窗口条目；`start`、`stop`、`restart` 以独立进程起停该状态目录的 core（已打开的窗口随后 attach），只有 `install` / `uninstall` 仍被拒绝。任何命令加上 `--machine` 都会在这一次调用里忽略 `THUNET_STATE_DIR`（例如便携 shell 里执行 `thunet --machine service start`），Windows 安装包给 `quit` 传的也是它，这样从启动 msiexec 的那个 shell 继承来的变量就无法把它指向便携端点。
 
 ## 14. 许可证
 

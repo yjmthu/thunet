@@ -168,6 +168,26 @@ pub struct Client {
 /// How long a login (challenge + `srun_portal`) may take, at least.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What the campus portal answered about this client.
+///
+/// The answer itself is the evidence: only a link that reaches the campus
+/// portal can produce one, and that is the one property every campus path
+/// shares - a cable, the campus Wi-Fi, a router or VPN in between, an emulator
+/// whose traffic leaves through a campus host - none of which has to carry a
+/// campus SSID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalView {
+  /// Somebody is logged in on the address the portal sees: the answer's
+  /// `error` is `ok`. It says nothing about the link itself - a portal that
+  /// answers `not_online` still proves the link reaches the campus network.
+  pub logged_in: bool,
+  /// The address the portal sees, when its answer names one: this machine's,
+  /// or a router's/VPN's in between. The portal names one even when nobody is
+  /// logged in (`rad_user_info` reports `client_ip`/`online_ip` either way), so
+  /// this is diagnostic rather than a sign of a session.
+  pub address: Option<String>,
+}
+
 impl Client {
   pub fn new(host: impl Into<String>, https: bool, timeout: Duration) -> Self {
     let agent = |t: Duration| -> ureq::Agent {
@@ -411,26 +431,40 @@ impl Client {
     Self::jsonp(&body)
   }
 
-  /// The address the portal sees this request coming from, or `None` when the
-  /// portal did not answer with one.
+  /// Ask the campus portal about this client. `None` when it does not answer,
+  /// or answers with something that is not its own JSON.
   ///
-  /// It is the one fact that says "this machine is on the campus network",
-  /// even where the gateway does not intercept HTTP: the portal reports the
-  /// caller's own address, which only matches ours while no NAT stands
-  /// between the two.
-  pub fn portal_address(&self) -> Option<String> {
+  /// This is the request that tells a campus path apart from a home connection
+  /// without looking at the Wi-Fi name: a portal answer means the campus network
+  /// is reachable, whether a session exists or not, and whatever NAT, VPN or
+  /// router sits in between.
+  pub fn portal_view(&self) -> Option<PortalView> {
     let url = self.url("/cgi-bin/rad_user_info", &[]);
     let body = self.get(&url).ok()?;
-    let v = Self::jsonp(&body).ok()?;
+    Self::portal_view_of(&body)
+  }
+
+  /// Parse one `rad_user_info` answer.
+  ///
+  /// The portal names the outcome in `error`; there is no separate online flag
+  /// on the wire (`status()` derives one, this does not need it).
+  fn portal_view_of(body: &str) -> Option<PortalView> {
+    let v = Self::jsonp(body).ok()?;
+    let error = v.get("error").and_then(Value::as_str)?;
     // The portal speaks two shapes: the older answers carry `client_ip`, the
-    // current one reports the same address as `online_ip` (and has no
-    // `client_ip` at all). Reading only the former made every campus link look
-    // like "another network" on the real portal.
-    v.get("client_ip")
+    // current one reports the address as `online_ip` (and has no `client_ip`
+    // at all).
+    let address = v
+      .get("client_ip")
       .or_else(|| v.get("online_ip"))
       .and_then(Value::as_str)
-      .filter(|ip| !ip.trim().is_empty())
-      .map(|ip| ip.trim().to_string())
+      .map(str::trim)
+      .filter(|ip| !ip.is_empty())
+      .map(str::to_owned);
+    Some(PortalView {
+      logged_in: error == "ok",
+      address,
+    })
   }
 
   /// Account name and address of the live session on `ip` (empty = this host).
@@ -1398,6 +1432,44 @@ mod tests {
         other => other,
       }
     );
+  }
+
+  /// The portal names the outcome in `error`; there is no `online` boolean. An
+  /// answer means the campus portal was reachable - that is the evidence the
+  /// core's campus verdict uses, and it must survive "not online" too.
+  #[test]
+  fn a_portal_answer_is_read_from_its_error_field() {
+    // The current shape: `online_ip`, no `client_ip`.
+    let online = Client::portal_view_of(
+      r#"C_a_l_l_b_a_c_k({"error":"ok","online_ip":"192.0.2.10","user_name":"alice"})"#,
+    );
+    assert_eq!(
+      online,
+      Some(PortalView {
+        logged_in: true,
+        address: Some("192.0.2.10".into()),
+      })
+    );
+    // The older shape reports the same address as `client_ip`.
+    let old = Client::portal_view_of(r#"{"error":"ok","client_ip":"198.51.100.7"}"#);
+    assert_eq!(old.unwrap().address.as_deref(), Some("198.51.100.7"));
+    // A link without a session still gets a well-formed answer, and it names no
+    // address: the answer alone is what marks the link as the campus one.
+    let offline = Client::portal_view_of(
+      r#"C_a_l_l_b_a_c_k({"error":"not_online","error_msg":"User not online","ecode":1})"#,
+    );
+    assert_eq!(
+      offline,
+      Some(PortalView {
+        logged_in: false,
+        address: None,
+      })
+    );
+    // Anything else is not the campus portal speaking: a captive portal's HTML,
+    // a random JSON document, a truncated answer.
+    assert_eq!(Client::portal_view_of("<html>login</html>"), None);
+    assert_eq!(Client::portal_view_of(r#"{"hello":"world"}"#), None);
+    assert_eq!(Client::portal_view_of(""), None);
   }
 
   #[test]

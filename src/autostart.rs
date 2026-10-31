@@ -71,28 +71,33 @@ impl ServiceAction {
 
 /// Whether `thunet service <action>` must refuse in a portable process.
 ///
-/// Portable mode has no service: the core is a thread of the window. Letting
-/// the mutating verbs through would act on the *machine* service while the user
-/// is looking at their own setup - `service start` would even put a second core
-/// on the same portal session. `status` stays usable: it is a read-only query,
-/// and refusing it would only hide whether a machine service exists.
+/// Portable mode has no machine service: the core is a thread of the window
+/// (or, after `service start`, a process of its own). Only `install` and
+/// `uninstall` are refused: they are about the *machine* service, and running
+/// them here would register this very executable as the machine core while the
+/// user is looking at their own portable setup. The other verbs have a portable
+/// meaning - `status`, `enable` and `disable` address the window's login entry,
+/// `start` runs a headless core, `stop` ends it - and are handled in
+/// `desktop::portable_service`.
 ///
 /// Apply this to `service` only. `service-admin` follows the same rule, but its
 /// callers (the elevated helper and the Windows installer) say `--machine`
 /// explicitly: neither may inherit the mode of whatever started it, and
 /// `--machine` is the one way to say "machine semantics" regardless.
 pub fn service_refused_in_portable(action: ServiceAction) -> bool {
-  !matches!(action, ServiceAction::Status)
+  matches!(action, ServiceAction::Install | ServiceAction::Uninstall)
 }
 
 #[cfg(test)]
 mod portable_service {
   use super::{ServiceAction, service_refused_in_portable};
 
-  /// The read-only query survives; everything that changes the machine service
-  /// is refused. Pinned as a whole list so a new verb cannot slip through.
+  /// Only the two verbs that write the machine registration are refused; the
+  /// window's own login entry, the headless core and its stop all have a
+  /// portable meaning. Pinned as a whole list so a new verb cannot slip
+  /// through.
   #[test]
-  fn only_the_read_only_verb_runs_in_portable_mode() {
+  fn portable_refuses_only_the_machine_registration_verbs() {
     let refused: Vec<bool> = [
       ServiceAction::Install,
       ServiceAction::Uninstall,
@@ -108,7 +113,7 @@ mod portable_service {
     .collect();
     assert_eq!(
       refused,
-      vec![true, true, true, true, true, true, true, false]
+      vec![true, true, false, false, false, false, false, false]
     );
   }
 }
@@ -133,6 +138,17 @@ pub struct Autostart {
   /// Set for a portable window: the entry has to name the state directory, or
   /// the copy it starts would read the machine configuration instead.
   state_dir: Option<PathBuf>,
+}
+
+/// What `thunet login` says about autostart, and how to turn it on.
+#[cfg(not(target_os = "android"))]
+pub struct LoginStatus {
+  pub enabled: bool,
+  /// The entry that does the starting: `thunet.service` on Linux, the service
+  /// on Windows, or the window's own login entry in portable mode.
+  pub entry: String,
+  /// One line naming the command or setting that turns it on.
+  pub hint: String,
 }
 
 impl Autostart {
@@ -233,6 +249,17 @@ impl Autostart {
     imp::tray_registered(self)
   }
 
+  /// What `thunet login` reports about starting by itself.
+  ///
+  /// Machine mode has a background core, so the answer is the service's start
+  /// type; a portable window has no service, so its own login entry is the
+  /// whole answer. The hint exists because this line is printed by the one
+  /// command a new user runs first, and "disabled" alone leaves them stuck.
+  #[cfg(not(target_os = "android"))]
+  pub fn login_status(&self) -> LoginStatus {
+    imp::login_status(self)
+  }
+
   /// Register or remove the login entry that starts this window.
   ///
   /// Only the window half: a portable run has no service to register. Both
@@ -270,6 +297,16 @@ impl Autostart {
     let me = Autostart::new(minimized).ok_or("cannot determine the executable path")?;
     imp::service(action, &me)
   }
+}
+
+/// Whether the platform's service manager starts the background core at boot.
+///
+/// This asks the OS, so it describes the machine's service whatever process
+/// asks. A portable core is a thread of its window and never starts on its own,
+/// which is why the core reports this as `false` rather than calling here (see
+/// `core::core_info`).
+pub fn core_starts_at_boot() -> bool {
+  imp::core_starts_at_boot()
 }
 
 /// Perform one service operation that needs administrator rights.
@@ -615,7 +652,7 @@ mod imp {
   };
   use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
-  use super::{Autostart, ServiceAction, take_running_marker, write_running_marker};
+  use super::{Autostart, LoginStatus, ServiceAction, take_running_marker, write_running_marker};
 
   /// Service Control Manager key of the background core. The same name as the
   /// Linux unit (`thunet.service`), so the mental model is identical on both
@@ -701,6 +738,23 @@ mod imp {
       CloseServiceHandle(service);
     }
     start == Some(SERVICE_AUTO_START)
+  }
+
+  pub fn login_status(a: &Autostart) -> LoginStatus {
+    if a.is_portable() {
+      return LoginStatus {
+        enabled: tray_registered(a),
+        entry: tray_task_name(a),
+        hint: "turn it on with `Start this window at login` in the settings page: a portable \
+               window has no service"
+          .into(),
+      };
+    }
+    LoginStatus {
+      enabled: core_starts_at_boot(),
+      entry: format!("{CORE_SERVICE} service"),
+      hint: "turn it on with `thunet service enable` (asks for administrator rights)".into(),
+    }
   }
 
   /// Whether the SCM holds a live core right now. Registration says nothing
@@ -1994,7 +2048,7 @@ mod imp {
 
   use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
-  use super::{Autostart, ServiceAction, take_running_marker, write_running_marker};
+  use super::{Autostart, LoginStatus, ServiceAction, take_running_marker, write_running_marker};
 
   /// Name of the XDG desktop entry (`auto-launch` writes `<name>.desktop`).
   const APP_NAME: &str = "thunet";
@@ -2031,6 +2085,25 @@ mod imp {
     launcher(a)
       .and_then(|l| l.is_enabled().map_err(|e| e.to_string()))
       .unwrap_or(false)
+  }
+
+  pub fn login_status(a: &Autostart) -> LoginStatus {
+    if a.is_portable() {
+      return LoginStatus {
+        enabled: tray_registered(a),
+        entry: format!("{}.desktop", app_name(a)),
+        hint: "turn it on with `Start this window at login` in the settings page: a portable \
+               window has no service"
+          .into(),
+      };
+    }
+    LoginStatus {
+      enabled: core_starts_at_boot(),
+      entry: CORE_UNIT.to_string(),
+      hint: "turn it on with `thunet service enable` (asks for administrator rights; \
+             `sudo systemctl enable thunet.service` where no polkit dialog can appear)"
+        .into(),
+    }
   }
 
   pub fn core_registered() -> bool {

@@ -293,6 +293,12 @@ fn state_words(
   match state {
     State::LoggedIn => (t.online, State::LoggedIn),
     State::Authenticating => (t.authenticating, State::Authenticating),
+    // The OS owns an 802.1X session: the portal row is not the authority there,
+    // and it can lag the join by a poll. `probe_env` only names an enterprise
+    // SSID on the interface that carries the default route, so the link is up -
+    // calling it "Offline" next to a banner that already named the network read
+    // as "there is no internet" until the next poll corrected it.
+    State::LoggedOut if matches!(env, LoginEnv::EnterpriseWifi(_)) => (t.online, State::LoggedIn),
     // The portal has no session for this address, but the link does not go
     // through it at all: "Offline" would read as "there is no internet",
     // which is the opposite of what the probe just measured.
@@ -531,6 +537,18 @@ struct Toast {
   kind: ToastKind,
 }
 
+/// One credential exactly as `SetCredentials` carries it.
+///
+/// The field holds what the user typed in this session, or nothing for "keep
+/// the password the core already holds". The saved plaintext never exists in
+/// this process.
+#[derive(Clone)]
+struct Credential {
+  username: String,
+  password: String,
+  remember: bool,
+}
+
 pub struct App {
   /// Connection to the background core; `None` until one answers. The app keeps
   /// retrying, so a core that is restarted does not leave the window deaf.
@@ -539,9 +557,17 @@ pub struct App {
   /// Last reported state of the core itself (version, uptime, pid).
   core: Option<CoreInfo>,
   /// What the core holds in the credential slot. The window never receives
-  /// the password, so this — not `cfg.password` — is what the *Remember
-  /// password* row and the *Unsaved* markers are based on once a core answers.
+  /// the password, so this is what the *Remember password* row and the
+  /// *Unsaved* markers are based on once a core answers.
   core_cred: Option<CredentialState>,
+  /// The core's two session switches, as the last `CoreInfo` reported them and
+  /// as this window last asked for them. They are not in the window's file: the
+  /// core owns them (`thunet config --auto-connect` reaches the same ones).
+  core_auto: bool,
+  core_keep: bool,
+  /// Whether the portal host has been logged. `CoreInfo` carries it; the window
+  /// no longer reads it from a file.
+  host_logged: bool,
   /// Result of comparing the typed password with the core's copy: `Some(true)`
   /// means the text in the field is already the stored value, so it is not an
   /// edit. Cleared whenever the field changes.
@@ -720,13 +746,13 @@ pub struct App {
   /// An account switch that has no stored credential to fall back on: the user
   /// has to agree to it first, because a wrong password would take the machine
   /// off the network with nothing to sign back in with.
-  confirm_switch: Option<Config>,
+  confirm_switch: Option<Credential>,
   /// A switch is in flight; *Apply* stays disabled until the core answers.
   switch_pending: Option<Instant>,
-  /// Credentials entered while the machine service was down. They stay out of
-  /// `cfg` until the service accepts them, so a failed start leaves the
-  /// *Unsaved* markers visible.
-  pending_credentials: Option<Config>,
+  /// Credentials entered while the machine service was down. They travel with
+  /// the start and are handed over once the core answers; nothing is written to
+  /// the window's file, which does not own them.
+  pending_credentials: Option<Credential>,
   /// A mode change running on a helper thread. On Windows its core half can
   /// wait for a UAC prompt, which must not block a frame.
   mode_rx: Option<Receiver<(Mode, Result<(), String>)>>,
@@ -756,14 +782,6 @@ fn autostart_entry(minimized: bool, portable: bool) -> Option<Autostart> {
 
 impl App {
   pub fn new(cfg: Config, minimized: bool, font: Option<&'static str>) -> Self {
-    // The core owns the credential: it read the sealed blob at startup, and the
-    // window must not hold a second copy. Portable mode is exactly where
-    // `Config::load()` hands the window the plaintext (the core and the window
-    // share a state directory), and seeding `pass_edit` with it made the window
-    // treat a saved password as an unsaved edit — the *Unsaved* marker never
-    // cleared after a restart on Android.
-    let mut cfg = cfg;
-    cfg.password.clear();
     // The root window already exists at this point (eframe creates it before
     // calling the app creator) but has not been shown yet, so cloaking it here
     // means the forced show after the first painted frame stays invisible.
@@ -841,8 +859,8 @@ impl App {
     // window entry alone.
     let portable_autostart = portable && autostart.as_ref().is_some_and(Autostart::tray_enabled);
 
-    // The portal host is a CLI/config-only setting, so log the effective value.
-    logs.push(Line::debug(format!("portal: {}", cfg.host)));
+    // The portal host belongs to the core now; `CoreInfo` carries it, and the
+    // first answer logs it once.
     #[cfg(not(target_os = "android"))]
     if !tray.available() {
       logs.push(Line::warn(
@@ -859,6 +877,11 @@ impl App {
       next_link_try: Instant::now(),
       core: None,
       core_cred: None,
+      // The core's defaults; the first `CoreInfo` replaces them. Both files
+      // start with these, so the page does not show a made-up state for long.
+      core_auto: true,
+      core_keep: true,
+      host_logged: false,
       pass_matches: None,
       pass_check_at: None,
       pass_checked: String::new(),
@@ -901,9 +924,9 @@ impl App {
       service_warned: false,
       core_stale: None,
       core_answered: false,
-      user_edit: cfg.username.chars().take(ACCOUNT_MAX_CHARS).collect(),
+      user_edit: String::new(),
       pass_edit: String::new(),
-      remember: cfg.remember_password,
+      remember: false,
       // Until the worker's first probe lands, assume a login is possible: a
       // wrongly disabled button is worse than a click that reports why not.
       env: LoginEnv::Campus,
@@ -1032,16 +1055,25 @@ impl App {
     // A core this window hosts ends *inside* this process, and the connections
     // it accepted cannot report EOF from there: both halves of the socket stay
     // open until the other side lets go, and the core's read half only lets go
-    // after the frontend does. "Stop was requested and nothing is hosted any
-    // more" is the same fact seen from the hosting side, so use it instead of
-    // waiting for a hang-up that cannot happen.
-    if self.portable
+    // after the frontend does. "Nothing is hosted any more" is the same fact
+    // seen from the hosting side, so use it instead of waiting for a hang-up
+    // that cannot happen. The stop may also have come from the CLI (`thunet
+    // service stop`), where this window has no pending request to key on: the
+    // pid of the core behind the link says whether it was this very process.
+    // A link to a *separate* core (`service start`) is left alone - that
+    // process exits and the reader sees an ordinary EOF.
+    let stop_pending = self
+      .service_request
+      .is_some_and(|(r, _)| r == ServiceRequest::Stop);
+    let hosted_gone = self.portable
       && self.link.is_some()
-      && self
-        .service_request
-        .is_some_and(|(r, _)| r == ServiceRequest::Stop)
       && !crate::ipc::hosted()
-    {
+      && (stop_pending
+        || self
+          .core
+          .as_ref()
+          .is_some_and(|core| core.pid == std::process::id()));
+    if hosted_gone {
       let was_machine = self.link.as_ref().is_some_and(Link::is_machine);
       let stale = self.link.as_ref().and_then(Link::speaks);
       self.link = None;
@@ -1130,23 +1162,19 @@ impl App {
     // link may already be refused for speaking another protocol.
     let machine_ready = self.core_answered && self.link.as_ref().is_some_and(Link::is_machine);
     if machine_ready && let Some(next) = self.pending_credentials.take() {
-      // The service accepted the start: this is the point where the edits
-      // become the new baseline and the per-field markers clear.
-      self.cfg = next;
       self.service_request = None;
-      let typed = !self.cfg.password.is_empty();
+      let typed = !next.password.is_empty();
       let (msg, kind) = self.credentials_toast(typed);
       self.set_toast(msg.to_string(), kind);
       self.send(Cmd::SetCredentials {
-        username: self.cfg.username.clone(),
-        password: self.cfg.password.clone(),
-        remember: self.cfg.remember_password,
+        username: next.username,
+        password: next.password,
+        remember: next.remember,
         // These were typed in this window, so there is nothing held to seal.
         keep_password: false,
       });
-      // The machine core holds it from now on. Keeping a copy here would make
-      // the window claim a stored password it cannot verify against the core.
-      self.cfg.password.clear();
+      // The machine core holds it from now on; the field goes back to empty and
+      // `Ev::Credentials` fills in the baseline.
       self.pass_edit.clear();
       self.pass_matches = None;
       self.pass_checked.clear();
@@ -1189,18 +1217,13 @@ impl App {
     insert_log(&mut self.logs, line, MAX_LINES);
   }
 
-  /// Every account name this window knows: the one it configured, the one the
-  /// core holds, and the one the portal reports. Any of them can be the name a
-  /// log line quotes, so all of them are masked.
+  /// Every account name this window knows: the one the core holds, the one the
+  /// portal reports, and the OS account. Any of them can be the name a log line
+  /// quotes, so all of them are masked.
   fn accounts(&self) -> Vec<&str> {
     let held = self.core_cred.as_ref().map_or("", |c| c.username.as_str());
     let mut names: Vec<&str> = Vec::new();
-    for name in [
-      self.cfg.username.as_str(),
-      held,
-      self.info.name.as_str(),
-      os_account(),
-    ] {
+    for name in [held, self.info.name.as_str(), os_account()] {
       let name = name.trim();
       if !name.is_empty() && !names.contains(&name) {
         names.push(name);
@@ -1220,9 +1243,9 @@ impl App {
     }
   }
 
-  /// Persist the edited credentials and hand them to the worker.
+  /// Hand the edited credentials to the core.
   fn apply_credentials(&mut self) {
-    let next = self.edited_config();
+    let next = self.edited_credential();
 
     if self.link.as_ref().is_some_and(Link::alive) {
       match self.credential_action(&next) {
@@ -1240,20 +1263,14 @@ impl App {
       return;
     }
 
-    // No core answers. When the start below brings up the machine service (see
-    // `ipc::core_is_service`), the credential has to travel with it and is
-    // delivered once that core answers: the machine core would never read the
-    // per-user store. An explicit `--state-dir` asks for portable mode, where
-    // the user store is exactly right.
+    // No core answers. When the start below brings up the machine service, the
+    // credential has to travel with it and is delivered once that core answers:
+    // the window's file does not own it.
     if crate::ipc::core_is_service() {
-      if let Err(e) = next.save_prefs() {
-        self.toast_err(e);
-        return;
-      }
       let first = self.pending_credentials.is_none();
-      // The newest fields travel with the in-flight start, but `cfg` stays on
-      // the old values until the core actually accepts them; that is what the
-      // per-field *Unsaved* markers compare against.
+      // The newest fields travel with the in-flight start. Nothing becomes the
+      // baseline until the core accepts them; that is what the per-field
+      // *Unsaved* markers compare against.
       self.pending_credentials = Some(next);
       if !first {
         return;
@@ -1270,18 +1287,19 @@ impl App {
       return;
     }
 
-    // Portable install with no core yet: keep the credential in the user store.
-    // The next `thunet core` reads it from there.
+    // A portable setup with no core: the window and the core are one principal
+    // and share the directory, so write the core's own file and let the next
+    // start read it from there.
     self.save_credentials(next, false);
   }
 
-  /// The config a click on *Apply* would store, without touching `cfg` yet.
-  fn edited_config(&self) -> Config {
-    let mut next = self.cfg.clone();
-    next.username = self.user_edit.trim().to_string();
-    next.password = self.pass_edit.clone();
-    next.remember_password = self.remember;
-    next
+  /// What a click on *Apply* would send, without committing anything yet.
+  fn edited_credential(&self) -> Credential {
+    Credential {
+      username: self.user_edit.trim().to_string(),
+      password: self.pass_edit.clone(),
+      remember: self.remember,
+    }
   }
 
   /// Would this *Apply* replace the live session, and does that need a question?
@@ -1290,10 +1308,14 @@ impl App {
   /// one, while online. The core then logs the session out and tries the new
   /// pair; whether it can fall back to the old one decides if the user is asked
   /// first.
-  fn credential_action(&self, next: &Config) -> CredentialAction {
+  fn credential_action(&self, next: &Credential) -> CredentialAction {
+    let account_changes = match self.core_cred.as_ref() {
+      Some(state) => next.username != state.username,
+      None => !next.username.is_empty(),
+    };
     credential_action(
       self.state == State::LoggedIn,
-      next.username != self.cfg.username,
+      account_changes,
       !next.password.is_empty(),
       self.pass_matches == Some(true),
       self.switch_has_fallback(),
@@ -1312,62 +1334,72 @@ impl App {
       .is_some_and(|c| c.has_password && !c.username.is_empty())
   }
 
-  /// Save the credential and hand it to a live core.
-  ///
-  /// `owned_by_core` selects the JSON-only path: a core writes the sealed blob
-  /// into its own state directory, so the window must not keep a second copy.
-  fn save_credentials(&mut self, next: Config, owned_by_core: bool) {
-    let saved = if owned_by_core {
-      next.save_prefs()
-    } else {
-      next.save()
-    };
-    match saved {
-      Ok(()) => {
-        // The form is submitted: let a password manager offer to save the pair.
-        #[cfg(target_os = "android")]
-        let _ = crate::android_jni::autofill_save();
-        // Only now do the edits become the new baseline, so a failed save
-        // leaves the *Unsaved* markers in place.
-        let typed = !next.password.is_empty();
-        self.cfg = next;
-        // Say what actually happened: unticking the checkbox deletes the stored
-        // credential instead of writing one.
-        let (msg, kind) = self.credentials_toast(typed);
-        self.set_toast(msg.to_string(), kind);
-        self.send(Cmd::SetCredentials {
-          username: self.cfg.username.clone(),
-          password: self.cfg.password.clone(),
-          remember: self.cfg.remember_password,
-          // The field is empty and the core is the holder: ask it to seal the
-          // password it already has instead of failing for lack of plaintext.
-          keep_password: owned_by_core
-            && self.cfg.remember_password
-            && self.cfg.password.is_empty()
-            && self.core_cred.as_ref().is_some_and(|c| c.has_password),
-        });
-        if owned_by_core {
-          // The core is the only holder now; the field goes back to empty and
-          // the hint explains that the saved value is kept as long as it stays
-          // empty. `Ev::Credentials` will confirm it and fill in the state.
-          self.cfg.password.clear();
-          self.pass_edit.clear();
-          self.pass_matches = None;
-          self.pass_checked.clear();
-        }
+  /// Hand the credential to a live core, or - in a portable setup with no core
+  /// - write it into the core's own file.
+  fn save_credentials(&mut self, next: Credential, owned_by_core: bool) {
+    let typed = !next.password.is_empty();
+    if !owned_by_core {
+      // Portable and stopped: this process is the same principal that will run
+      // the core, and both share the directory, so the core's own file is the
+      // right place. Everything else in it is left as it was.
+      let mut core = crate::config::CoreConfig::load();
+      core.username = next.username.clone();
+      if !next.password.is_empty() {
+        core.password = next.password.clone();
       }
-      Err(e) => {
+      core.remember_password = next.remember;
+      if let Err(e) = core.save() {
         self.toast_err(e);
+        return;
       }
+    }
+    // The form is submitted: let a password manager offer to save the pair.
+    #[cfg(target_os = "android")]
+    let _ = crate::android_jni::autofill_save();
+    // Say what actually happened: unticking the checkbox deletes the stored
+    // credential instead of writing one.
+    let (msg, kind) = self.credentials_toast(typed);
+    self.set_toast(msg.to_string(), kind);
+    // The field is empty and the core is the holder: ask it to seal the
+    // password it already has instead of failing for lack of plaintext.
+    let held = self.core_cred.as_ref().is_some_and(|c| c.has_password);
+    let keep_password = owned_by_core && next.remember && next.password.is_empty() && held;
+    self.send(Cmd::SetCredentials {
+      username: next.username.clone(),
+      password: next.password.clone(),
+      remember: next.remember,
+      keep_password,
+    });
+    // Optimistic baseline; `Ev::Credentials` replaces it with the core's own
+    // answer. Without it the *Unsaved* markers would stay on until then - and
+    // a portable window with no core would never receive one at all.
+    let has_password = typed || keep_password;
+    self.core_cred = Some(CredentialState {
+      username: next.username,
+      has_password,
+      remembered: next.remember && has_password,
+      matches: None,
+    });
+    if owned_by_core {
+      // The core is the only holder now; the field goes back to empty and the
+      // hint explains that the saved value is kept as long as it stays empty.
+      self.pass_edit.clear();
+      self.pass_matches = None;
+      self.pass_checked.clear();
     }
   }
 
   /// Throw away the edits and go back to what is stored, which is what *Revert*
   /// next to *Apply* does.
   fn revert_credentials(&mut self) {
-    self.user_edit = self.cfg.username.clone();
-    self.pass_edit = self.cfg.password.clone();
-    self.remember = self.cfg.remember_password;
+    let (username, remembered) = self
+      .core_cred
+      .as_ref()
+      .map(|c| (c.username.clone(), c.remembered))
+      .unwrap_or_default();
+    self.user_edit = username;
+    self.pass_edit.clear();
+    self.remember = remembered;
     self.pending_credentials = None;
     self.toast = None;
     // An account that was refused is only reported until the user takes the
@@ -1440,19 +1472,21 @@ impl App {
   /// currently editing are left alone: overwriting them would silently discard
   /// an edit whenever a periodic `CoreInfo` answer lands.
   fn apply_core_credential(&mut self, state: &CredentialState) {
-    let editing_user = self.user_edit.trim() != self.cfg.username;
-    let editing_remember = self.remember != self.cfg.remember_password;
-    self.cfg.username = state.username.clone();
-    self.cfg.remember_password = state.remembered;
-    // Never keep a copy: `has_password` says whether the core has one.
-    self.cfg.password.clear();
+    let previous_user = self
+      .core_cred
+      .as_ref()
+      .map(|c| c.username.as_str())
+      .unwrap_or("");
+    let previous_remember = self.core_cred.as_ref().is_some_and(|c| c.remembered);
+    let editing_user = self.user_edit.trim() != previous_user;
+    let editing_remember = self.remember != previous_remember;
+    self.core_cred = Some(state.clone());
     if !editing_user {
-      self.user_edit = state.username.clone();
+      self.user_edit = state.username.chars().take(ACCOUNT_MAX_CHARS).collect();
     }
     if !editing_remember {
       self.remember = state.remembered;
     }
-    self.core_cred = Some(state.clone());
   }
 
   /// Ask the core whether the typed password is the stored one.
@@ -1879,6 +1913,17 @@ impl App {
               env!("CARGO_PKG_VERSION")
             )));
           }
+          // These two belong to the core: it acts on them and it is the one
+          // that writes them down. Taking its answer keeps the settings page
+          // honest when another frontend changed them (`thunet config
+          // --auto-connect off` from a terminal, or the same on another
+          // machine).
+          self.core_auto = info.auto_connect;
+          self.core_keep = info.keep_online;
+          if !self.host_logged {
+            self.host_logged = true;
+            self.push_log(Line::debug(format!("portal: {}", info.host)));
+          }
           let cred = info.credential.clone();
           self.apply_core_credential(&cred);
           self.core = Some(info);
@@ -2143,12 +2188,20 @@ impl App {
               let stale = self.core_stale.is_some();
               let running = service.is_some() || self.core_answered || stale;
               // The same row in both modes: the core is a process of its own in
-              // service mode and a thread of this window in portable mode, so
-              // only the words differ. The button is the same click either way -
-              // `service_button` stops a hosted core with `Cmd::Shutdown` and
-              // starts one by hosting it again.
+              // service mode and - unless this window hosts it - in portable mode
+              // too, where only a core this very process runs is a thread. The
+              // button is the same click either way: `service_button` stops a
+              // hosted core with `Cmd::Shutdown` and starts one by hosting it
+              // again.
               let (row, words) = if self.portable {
-                (t.core_row, (t.core_running, t.core_gone))
+                (
+                  t.core_row,
+                  if crate::ipc::hosted() {
+                    (t.core_running, t.core_gone)
+                  } else {
+                    (t.service_running, t.service_gone)
+                  },
+                )
               } else {
                 (t.service, (t.service_running, t.service_gone))
               };
@@ -2348,8 +2401,8 @@ impl App {
           // Startup and session behaviour share one row: the settings page has
           // to fit the fixed window height. *Start minimised* is only
           // meaningful when the tray is part of the autostart mode.
-          let mut auto_conn = self.cfg.auto_connect;
-          let mut keep_on = self.cfg.keep_online;
+          let mut auto_conn = self.core_auto;
+          let mut keep_on = self.core_keep;
           // `Start minimised` and the tray are desktop concepts; Android has
           // neither a tray nor a hidden start.
           #[cfg(not(target_os = "android"))]
@@ -2377,24 +2430,18 @@ impl App {
                 self.apply_start_minimized(start_min);
               }
               if ui.checkbox(&mut auto_conn, t.auto_connect).changed() {
-                self.cfg.auto_connect = auto_conn;
+                self.core_auto = auto_conn;
                 self.send(Cmd::SetAutoConnect(auto_conn));
-                match self.cfg.save() {
-                  Ok(()) => self.toast_toggle(t.auto_connect, auto_conn),
-                  Err(e) => self.toast_err(e),
-                }
+                self.toast_toggle(t.auto_connect, auto_conn);
               }
               if ui
                 .checkbox(&mut keep_on, t.keep_online)
                 .on_hover_text(t.keep_online_hint)
                 .changed()
               {
-                self.cfg.keep_online = keep_on;
+                self.core_keep = keep_on;
                 self.send(Cmd::SetKeepOnline(keep_on));
-                match self.cfg.save() {
-                  Ok(()) => self.toast_toggle(t.keep_online, keep_on),
-                  Err(e) => self.toast_err(e),
-                }
+                self.toast_toggle(t.keep_online, keep_on);
               }
             });
           });
@@ -2620,7 +2667,6 @@ impl App {
             &self.user_edit,
             &self.pass_edit,
             self.remember,
-            &self.cfg,
             self.core_cred.as_ref(),
             match_hint,
           );
@@ -3546,7 +3592,6 @@ impl CredentialEdits {
     user_edit: &str,
     pass_edit: &str,
     remember: bool,
-    cfg: &Config,
     core: Option<&CredentialState>,
     pass_matches: Option<bool>,
   ) -> Self {
@@ -3556,13 +3601,16 @@ impl CredentialEdits {
       // typed value is an edit unless the core said it equals the stored pair.
       Some(state) if state.has_password => !pass_edit.is_empty() && pass_matches != Some(true),
       Some(_) => !pass_edit.is_empty(),
-      None => pass_edit != cfg.password,
+      // No answer yet: the window has no baseline, so anything typed is an edit.
+      None => !pass_edit.is_empty(),
     };
     Self {
       // Applying trims the account, so a stray space is not a change.
-      username: user_edit.trim() != cfg.username,
+      username: core.map_or(!user_edit.trim().is_empty(), |state| {
+        user_edit.trim() != state.username
+      }),
       password,
-      remember: remember != cfg.remember_password,
+      remember: core.map_or(remember, |state| remember != state.remembered),
     }
   }
 
@@ -4571,23 +4619,23 @@ mod tests {
 
   #[test]
   fn credential_edits_flag_the_field_that_changed() {
-    let cfg = Config {
+    let core = CredentialState {
       username: "alice".into(),
-      password: "pw".into(),
-      remember_password: true,
-      ..Config::default()
+      has_password: true,
+      remembered: true,
+      matches: None,
     };
-    let same = CredentialEdits::new("alice", "pw", true, &cfg, None, None);
+    let same = CredentialEdits::new("alice", "", true, Some(&core), None);
     assert_eq!(same, CredentialEdits::default(), "unchanged");
     assert!(!same.any());
     // A stray space is trimmed away when applying, so it is not a change.
-    assert!(!CredentialEdits::new("  alice  ", "pw", true, &cfg, None, None).username);
+    assert!(!CredentialEdits::new("  alice  ", "", true, Some(&core), None).username);
 
-    let user = CredentialEdits::new("bob", "pw", true, &cfg, None, None);
+    let user = CredentialEdits::new("bob", "", true, Some(&core), None);
     assert!(user.username && !user.password && !user.remember);
-    let pass = CredentialEdits::new("alice", "pw2", true, &cfg, None, None);
+    let pass = CredentialEdits::new("alice", "pw2", true, Some(&core), None);
     assert!(!pass.username && pass.password && !pass.remember);
-    let remember = CredentialEdits::new("alice", "pw", false, &cfg, None, None);
+    let remember = CredentialEdits::new("alice", "", false, Some(&core), None);
     assert!(!remember.username && !remember.password && remember.remember);
     assert!(remember.any());
   }
@@ -4596,18 +4644,13 @@ mod tests {
   fn a_core_owned_password_is_only_unsaved_when_it_was_typed() {
     // The window never receives the core's password, so the form baseline is
     // `has_password = true` plus an empty field.
-    let cfg = Config {
-      username: "alice".into(),
-      remember_password: true,
-      ..Config::default()
-    };
     let core = CredentialState {
       username: "alice".into(),
       has_password: true,
       remembered: true,
       matches: None,
     };
-    let empty = CredentialEdits::new("alice", "", true, &cfg, Some(&core), None);
+    let empty = CredentialEdits::new("alice", "", true, Some(&core), None);
     assert_eq!(
       empty,
       CredentialEdits::default(),
@@ -4616,15 +4659,21 @@ mod tests {
 
     // Typing the value that is already stored is not an edit once the core
     // confirmed it; typing anything else is.
-    let same = CredentialEdits::new("alice", "pw", true, &cfg, Some(&core), Some(true));
+    let same = CredentialEdits::new("alice", "pw", true, Some(&core), Some(true));
     assert!(!same.password, "the core said it matches");
-    let other = CredentialEdits::new("alice", "pw", true, &cfg, Some(&core), Some(false));
+    let other = CredentialEdits::new("alice", "pw", true, Some(&core), Some(false));
     assert!(other.password, "the core said it differs");
 
     // With nothing stored, any password is a change.
     let none = CredentialState::default();
-    let typed = CredentialEdits::new("alice", "pw", false, &cfg, Some(&none), None);
+    let typed = CredentialEdits::new("alice", "pw", false, Some(&none), None);
     assert!(typed.password);
+
+    // Before the first answer there is no baseline at all: anything typed is an
+    // edit, and an untouched form is not.
+    let unknown = CredentialEdits::new("alice", "pw", false, None, None);
+    assert!(unknown.username && unknown.password);
+    assert!(!CredentialEdits::new("", "", false, None, None).any());
   }
 
   /// Toasts used to break over two lines because the area is sized from the
@@ -5581,6 +5630,18 @@ mod tests {
     assert_eq!(
       state_words(State::LoggedOut, &LoginEnv::Campus, true, t),
       (t.offline, State::LoggedOut)
+    );
+    // An 802.1X link is online the moment the OS joined it: the portal row can
+    // arrive a poll later, and waiting for it used to print "Offline" beside a
+    // banner that already named the authenticated network.
+    assert_eq!(
+      state_words(
+        State::LoggedOut,
+        &LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
+        true,
+        t
+      ),
+      (t.online, State::LoggedIn)
     );
     assert_eq!(
       state_words(State::LoggedIn, &LoginEnv::Campus, true, t),

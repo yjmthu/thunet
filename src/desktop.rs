@@ -188,6 +188,10 @@ empty password keeps the password the service holds, and only n/no/0/false skips
 storing (which removes a stored one). Without a pipe the command connects with
 the pair the service already holds.
 
+-i asks one more question the pipe cannot carry: whether the service connects at
+startup (default yes). Every report also says whether the app starts by itself
+at login, and names the way to turn that on when it does not.
+
   Ask instead:  cmd /c thunet login -i      cmd.exe and PowerShell
                 thunet login -i             bash, zsh, sh, fish, Linux, macOS
   Print one:    thunet login --cmd          also --pwsh
@@ -196,11 +200,12 @@ the pair the service already holds.
 
 This text in full: thunet login --verbose"#;
 
-/// The three questions, word for word: `-i` asks them, and the tests compare the
+/// The questions, word for word: `-i` asks them, and the tests compare the
 /// wording against these rather than repeating it.
 const ASK_ACCOUNT: &str = "THUnet account";
 const ASK_PASSWORD: &str = "Password (Enter keeps the stored one)";
 const ASK_REMEMBER: &str = "Remember the password for the next start? [Y/n]";
+const ASK_AUTO_CONNECT: &str = "Connect automatically at startup? [Y/n]";
 
 /// The line that makes `-i` work in the shell the reader is using, printed by
 /// `thunet login --cmd` (alias `--pwsh`).
@@ -235,11 +240,14 @@ answers split between the two. stdin is the one channel both sides can share.
   line 2  password   empty keeps the password the service already holds
   line 3  remember   stored unless this line says n, no, 0 or false
 
-With -i the same three answers are asked instead: the account (the stored one is
-offered as the default, so Enter keeps it), the password (not echoed, and Enter
-keeps the one the service holds) and remember ([Y/n], where Enter means yes). The
-flag is your promise that the shell is waiting, and nothing here second-guesses
-it. Which line keeps that promise depends on the shell, not on the platform:
+With -i those answers are asked instead: the account (the stored one is offered
+as the default, so Enter keeps it), the password (not echoed, and Enter keeps the
+one the service holds), remember ([Y/n], where Enter means yes) and whether the
+service connects at startup ([Y/n], also yes by default - it says what the next
+start does, not whether this run connects; the pipe never carries this one, so a
+script cannot change a setting it never sees). The flag is your promise that the
+shell is waiting, and nothing here second-guesses it. Which line keeps that
+promise depends on the shell, not on the platform:
 
   cmd /c thunet login -i     cmd.exe and PowerShell (Windows)
   thunet login -i            bash, zsh, sh, fish, Linux, macOS
@@ -262,8 +270,29 @@ network returns.
 Without a pipe and without -i (a terminal, a bare launch) nothing is read at all;
 the command only asks the service to connect with the pair it already holds.
 
+Every run also reports whether the app starts by itself at login: the entry that
+does it (`thunet.service`, the Windows service, or the window's own login entry in
+portable mode) and, when it is disabled, the command or setting that turns it on.
+
 The password never reaches argv and never enters the shell history: it is only
 ever read from that pipe or from the console, so no process listing shows it."#;
+
+/// A boolean a person types as `on` or `off`.
+///
+/// Used by the core-owned switches: `--auto-connect on` reads like the
+/// settings page, and `off` cannot be confused with a missing flag the way a
+/// bare `--flag`/`--no-flag` pair can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Toggle {
+  On,
+  Off,
+}
+
+impl Toggle {
+  fn value(self) -> bool {
+    matches!(self, Self::On)
+  }
+}
 
 #[derive(Subcommand)]
 enum Cmd {
@@ -276,7 +305,7 @@ enum Cmd {
   /// Ask the running service to authenticate now.
   ///
   /// Without `-i` nothing is asked: the account and the password come from stdin,
-  /// three lines, or from the pair the service already holds. With `-i` the three
+  /// three lines, or from the pair the service already holds. With `-i` the
   /// questions are asked instead, reading whatever stdin is - the flag is the
   /// promise that a shell is waiting to answer them. `--cmd` (alias `--pwsh`)
   /// prints the line that makes that promise in cmd.exe and PowerShell, and
@@ -292,7 +321,8 @@ enum Cmd {
     /// Print the long explanation and exit.
     #[arg(short, long)]
     verbose: bool,
-    /// Ask for the account, the password and whether to remember, on this console.
+    /// Ask for the account, the password, whether to remember, and whether to
+    /// connect at startup, on this console.
     #[arg(short, long)]
     interactive: bool,
     /// Print the command line for cmd.exe and PowerShell, then exit.
@@ -333,8 +363,11 @@ enum Cmd {
   /// or the running state needs administrator rights on both platforms, which
   /// this asks for once.
   ///
-  /// A portable setup (`THUNET_STATE_DIR`) has no service: there only `status`
-  /// runs, and every other verb is refused.
+  /// A portable setup (`THUNET_STATE_DIR`) has no machine service: there
+  /// `status`, `enable` and `disable` address the window's own login entry,
+  /// `start`/`stop`/`restart` run and end a core of that state directory, and
+  /// only `install`/`uninstall` are refused (`--machine` is the explicit way to
+  /// the machine service).
   Service {
     #[arg(value_enum)]
     action: autostart::ServiceAction,
@@ -380,8 +413,27 @@ enum Cmd {
     #[arg(long)]
     all_sessions: bool,
   },
-  /// Print the config path and effective settings.
-  Config,
+  /// Print the core's effective settings.
+  ///
+  /// Read from the running core, never from the window's file: the account,
+  /// the portal host and the session policy belong to the core, which is also
+  /// the only process that may write them down. The options change the same
+  /// three switches the settings page has; they need a core as well.
+  Config {
+    /// Start online right after the core starts.
+    #[arg(long, value_name = "on|off")]
+    auto_connect: Option<Toggle>,
+    /// Sign back in after the session is lost, until the user disconnects.
+    #[arg(long, value_name = "on|off")]
+    keep_online: Option<Toggle>,
+    /// Keep the password for the next start; `off` deletes the stored copy.
+    #[arg(
+      long = "remember-password",
+      visible_alias = "remember-pwd",
+      value_name = "on|off"
+    )]
+    remember_password: Option<Toggle>,
+  },
   /// Create a desktop shortcut for this executable.
   Shortcut,
   /// Print a shell completion script.
@@ -463,20 +515,14 @@ fn run(cli: Cli) -> Result<(), String> {
     finish_machine_quit(single::machine_quit()?)?;
     return Ok(());
   }
-  // Effective settings: config file first, explicit CLI flags win.
-  let mut cfg = config::Config::load();
-  if let Some(h) = cli.host.clone() {
-    cfg.host = h;
+  // The window's settings. The core's own file is read where it is needed: by
+  // the service itself, and through the IPC by every command that acts on it.
+  if ipc::portable() {
+    // A portable setup kept both owners in one file before the split; move the
+    // core's half out before the window can save over it.
+    config::migrate();
   }
-  if cli.http {
-    cfg.https = false;
-  }
-  if !cli.ac_id.is_empty() {
-    cfg.ac_id = cli.ac_id.clone();
-  }
-  if !cli.ip.is_empty() {
-    cfg.ip = cli.ip.clone();
-  }
+  let cfg = config::Config::load();
 
   // No subcommand -> run the tray/window app. The HTTP agent is only built for
   // the CLI subcommands below, so launching the GUI does no network setup on
@@ -504,13 +550,94 @@ fn run(cli: Cli) -> Result<(), String> {
       println!("protocol vectors live in `cargo test` (5 tests)");
       Ok(())
     }
-    Cmd::Config => {
-      println!("path: {}", config::path().display());
-      let mut masked = cfg.clone();
-      if !masked.password.is_empty() {
-        masked.password = "***".into();
+    Cmd::Config {
+      auto_connect,
+      keep_online,
+      remember_password,
+    } => {
+      if auto_connect.is_none() && keep_online.is_none() && remember_password.is_none() {
+        // The core's own view: the window's file is not consulted at all. The
+        // path is printed so the reader knows where the parts `CoreInfo` does
+        // not carry (`https`, `ip`, the reconnect delay) live on disk.
+        let dir = if ipc::portable() {
+          config::dir()
+        } else {
+          config::machine_dir()
+        };
+        println!("path: {}", config::core_path_in(&dir).display());
+        let link = with_core()?;
+        let info = core_snapshot(&link)?;
+        let settings = serde_json::json!({
+          "host": info.host,
+          "ac_id": info.ac_id,
+          "username": info.credential.username,
+          "has_password": info.credential.has_password,
+          "remember_password": info.credential.remembered,
+          "auto_connect": info.auto_connect,
+          "keep_online": info.keep_online,
+        });
+        println!("{}", serde_json::to_string_pretty(&settings).unwrap());
+        return Ok(());
       }
-      println!("{}", serde_json::to_string_pretty(&masked).unwrap());
+      // The three switches belong to the core: asking it is both the only way
+      // to make the change and the only way to report what is actually in
+      // force. A machine core keeps its own `core.json` in the machine
+      // directory, which an ordinary caller cannot write.
+      let link = with_core()?;
+      let before = core_snapshot(&link)?;
+      if remember_password.is_some() && matches!(before.env, proto::LoginEnv::EnterpriseWifi(_)) {
+        // The OS owns that session; there is no portal pair to seal, and the
+        // core would answer with the state it already has, which reads like a
+        // success.
+        return Err(
+          "this network signs in with 802.1X, so there is no portal account to remember".into(),
+        );
+      }
+      if let Some(toggle) = auto_connect {
+        link.send(CoreCmd::SetAutoConnect(toggle.value()));
+      }
+      if let Some(toggle) = keep_online {
+        link.send(CoreCmd::SetKeepOnline(toggle.value()));
+      }
+      if let Some(toggle) = remember_password {
+        let on = toggle.value();
+        if !on && !before.credential.has_password {
+          // Nothing is sealed and nothing is held, so there is no copy to
+          // delete. Sending `remember = false` anyway would make the core
+          // rewrite its config, and with no password to keep the account name
+          // has no business surviving that write either.
+          say("credentials: nothing is stored, so there is nothing to forget");
+        } else {
+          // An empty password with `keep_password` asks the core to seal - or,
+          // with `off`, to delete - the copy it already holds: the plaintext
+          // never leaves the core, and the account has to be the one it holds.
+          link.send(CoreCmd::SetCredentials {
+            username: before.credential.username.clone(),
+            password: String::new(),
+            remember: on,
+            keep_password: true,
+          });
+          match wait_for(&link, Duration::from_secs(10), |ev| {
+            matches!(ev, CoreEv::Credentials(_) | CoreEv::Error(Some(_)))
+          })? {
+            CoreEv::Credentials(state) => say(&credential_line(&state, on)),
+            CoreEv::Error(Some(e)) => return Err(e.to_string()),
+            _ => return Err("the service did not confirm the credentials".into()),
+          }
+        }
+      }
+      // Ask again rather than repeating what was requested: the answer is what
+      // the core holds now, and a failed write (it logs instead of returning an
+      // error) has been printed by then.
+      if auto_connect.is_some() || keep_online.is_some() {
+        let after = core_snapshot(&link)?;
+        if auto_connect.is_some() {
+          say(&format!("auto connect: {}", onoff(after.auto_connect)));
+        }
+        if keep_online.is_some() {
+          say(&format!("keep online: {}", onoff(after.keep_online)));
+        }
+      }
       Ok(())
     }
     Cmd::Shortcut => {
@@ -588,35 +715,36 @@ fn run(cli: Cli) -> Result<(), String> {
         say(LOGIN_LONG);
         return Ok(());
       }
-      // `-i` asks on whatever stdin is: the shell that started this command is
-      // the user's promise that it is waiting, and nothing here second-guesses
-      // it. The questions come first, so cancelling - or a typo in the account -
-      // leaves both the service and the sealed credential as they were.
-      let asked = if interactive {
-        let (account, password, remember) = ask_credentials(&cfg)?;
-        Some(Piped {
-          account,
-          password,
-          remember,
-        })
-      } else {
-        None
-      };
+      // The core holds the account, so the prompt's default and the run's
+      // fallback come from it. Connecting here changes nothing, and cancelling
+      // still leaves the service and the sealed credential exactly as they were.
       let link = with_core()?;
       // Both facts come from the core itself. `status` would cost a portal
       // round trip, and asking the core to hold a pair just to learn which one
       // it holds would rewrite the stored credential.
       let info = core_snapshot(&link)?;
       let held = info.credential.username.trim().to_string();
+      // `-i` asks on whatever stdin is: the shell that started this command is
+      // the user's promise that it is waiting, and nothing here second-guesses
+      // it.
+      let asked = if interactive {
+        let (account, password, remember, auto_connect) = ask_credentials(&held)?;
+        Some(Piped {
+          account,
+          password,
+          remember,
+          auto_connect: Some(auto_connect),
+        })
+      } else {
+        None
+      };
       // The account this run would use: the answers, else line 1 of the pipe,
-      // else the one the core holds, else the one the sealed blob carries (the
-      // config loader reads `credential.bin` too, so this also covers a core
-      // that started before the pair was stored).
+      // else the one the core holds.
       let answers = asked.or_else(piped_pair);
       let account = match answers.as_ref().map(|p| p.account.as_str()) {
         Some(account) if !account.is_empty() => account.to_string(),
         _ if !held.is_empty() => held.clone(),
-        _ => cfg.username.trim().to_string(),
+        _ => String::new(),
       };
       if account.is_empty() {
         return Err(format!(
@@ -637,6 +765,14 @@ fn run(cli: Cli) -> Result<(), String> {
         (None, _) => say(&format!("account: {account} (stored)")),
       }
       say(&session_line(info.state, &held));
+      // The start-up preference is asked only with `-i`, and it is persisted by
+      // the core: it says what the *next* start does, not whether this run
+      // connects (that is the `Connect` below).
+      if let Some(on) = answers.as_ref().and_then(|p| p.auto_connect) {
+        link.send(CoreCmd::SetAutoConnect(on));
+        say(&format!("auto connect: {}", if on { "on" } else { "off" }));
+      }
+      say(&autostart_line(cfg.start_minimized));
       match &answers {
         Some(p) => {
           link.send(CoreCmd::SetCredentials {
@@ -705,14 +841,25 @@ fn run(cli: Cli) -> Result<(), String> {
         diag::set_file(config::machine_dir().join("core.log"));
       }
       // A service never receives command-line overrides, but a portable core
-      // does: `thunet --host … core` has to talk to the host it was given, so
-      // the settings merged at the top of `run()` are what it uses.
-      let cfg = if machine {
-        config::Config::load_machine()
+      // does: `thunet --host … core` has to talk to the host it was given.
+      let mut core = if machine {
+        config::CoreConfig::load_machine()
       } else {
-        cfg
+        config::CoreConfig::load()
       };
-      match ipc::serve(cfg, machine)? {
+      if let Some(h) = cli.host.clone() {
+        core.host = h;
+      }
+      if cli.http {
+        core.https = false;
+      }
+      if !cli.ac_id.is_empty() {
+        core.ac_id = cli.ac_id.clone();
+      }
+      if !cli.ip.is_empty() {
+        core.ip = cli.ip.clone();
+      }
+      match ipc::serve(core, machine)? {
         ipc::Serve::Started => Ok(()),
         ipc::Serve::AlreadyRunning => {
           // Nothing to do: whoever owns the endpoint keeps serving the frontends.
@@ -722,21 +869,25 @@ fn run(cli: Cli) -> Result<(), String> {
       }
     }
     Cmd::Service { action } => {
-      // Portable mode has no service, so every mutating verb here would act on
-      // the *machine* service instead - the one thing a portable setup is
-      // defined by not using, and `service start` would even put a second core
-      // on the same portal session. Refuse, and name both ways out: the core
-      // belongs to the window, and the machine service is only meaningful
-      // without `THUNET_STATE_DIR`. `status` is a read-only query and still
-      // runs; `service-admin` is deliberately not gated (see its arm below).
-      if ipc::portable() && autostart::service_refused_in_portable(action) {
-        return Err(
-          "portable mode has no service: the core runs inside the window, so it lives exactly as \
-           long as the window does. Closing the window only hides both, and `thunet quit` (or \
-           Quit in the tray menu) ends them. To act on the machine service, run \
-           `thunet --machine service …`"
-            .into(),
-        );
+      // Portable mode has no machine service: the core is a thread of the window
+      // (or, after `service start`, a process of its own). Only `install` and
+      // `uninstall` address the machine service, and running them here would
+      // register this very executable as the machine core while the user is
+      // looking at their own portable setup. The rest have a portable meaning
+      // and are handled in `portable_service`. `service-admin` is deliberately
+      // not gated (see its arm below).
+      if ipc::portable() {
+        if autostart::service_refused_in_portable(action) {
+          return Err(
+            "portable mode has no machine service to install: the core runs inside the window, \
+             so it lives exactly as long as the window does. `service start` runs a core of this \
+             state directory without a window, `service stop` ends it, and `service \
+             enable|disable` control this window's login entry. To act on the machine service, \
+             run `thunet --machine service …`"
+              .into(),
+          );
+        }
+        return portable_service(action, cli.minimized || cfg.start_minimized);
       }
       match autostart::Autostart::service(action, cli.minimized) {
         Ok(line) => {
@@ -870,15 +1021,15 @@ fn with_core() -> Result<ipc::Link, String> {
     // The reason matters: "nobody listens" and "something answered but is not
     // the service" are different problems, and the second one is exactly what
     // a trust anchor that cannot be read looks like. The hint has to match the
-    // mode: portable mode has no service, and `thunet service enable` is
-    // refused there, so pointing at it would send the user to a dead end. It
+    // mode: portable mode has no machine service, and `thunet service enable`
+    // is refused there, so pointing at it would send the user to a dead end. It
     // also has to name the state directory: a bare `thunet` is machine mode,
     // so "start the window" only helps if it is the same portable setup.
     let hint = if ipc::portable() {
       let dir = crate::config::dir();
       format!(
-        "portable mode: the core runs inside the window - start it with `thunet --state-dir {}`, \
-         or run `thunet core --state-dir {}` for one without a window",
+        "portable mode: start the window with `thunet --state-dir {}`, or a core without one \
+         with `thunet --state-dir {} service start`",
         dir.display(),
         dir.display()
       )
@@ -969,11 +1120,14 @@ fn core_snapshot(link: &ipc::Link) -> Result<proto::CoreInfo, String> {
   }
 }
 
-/// The three lines `thunet login` reads, once they were actually piped.
+/// The lines `thunet login` reads, once they were actually piped.
 struct Piped {
   account: String,
   password: String,
   remember: bool,
+  /// Only the interactive path answers this: the pipe has three lines, and a
+  /// script must not silently rewrite a preference it never saw.
+  auto_connect: Option<bool>,
 }
 
 /// Read account, password and remember from stdin, or `None` for "nothing was
@@ -994,39 +1148,43 @@ fn piped_pair() -> Option<Piped> {
   let account = prompt::piped_line()?.trim().to_string();
   // Only the terminator was stripped: a password may end in spaces.
   let password = prompt::piped_line().unwrap_or_default();
-  let remember = wants_remember(&prompt::piped_line().unwrap_or_default());
+  let remember = unless_negative(&prompt::piped_line().unwrap_or_default());
   Some(Piped {
     account,
     password,
     remember,
+    auto_connect: None,
   })
 }
 
-/// Whether the third line of the pipe asks for the password to be stored.
+/// Whether an answer means "yes" when the default is yes.
 ///
-/// The default is "store": the password is kept for the next start unless the
-/// answer is explicitly negative, so `n`, `no`, `0` and `false` mean "this
-/// session only" and everything else - `y`, `yes`, an empty line, a missing
-/// line, a typo - means "save it". The user's rule is "save by default", and a
-/// wrong password does not end up on disk in the case that matters: while online
-/// the core proves the pair before it writes and falls back to the credential it
+/// Only an explicit `n`, `no`, `0` or `false` means no; an empty line, a
+/// missing line or a typo keeps the default. Both questions that default to
+/// yes - remember the password and connect at startup - read answers this way.
+///
+/// For the password the default is "store": it is kept for the next start
+/// unless the answer is explicitly negative, so `n`, `no`, `0` and `false`
+/// mean "this session only" and everything else means "save it". A wrong
+/// password does not end up on disk in the case that matters: while online the
+/// core proves the pair before it writes and falls back to the credential it
 /// already had when the portal refuses it.
-fn wants_remember(answer: &str) -> bool {
+fn unless_negative(answer: &str) -> bool {
   !matches!(
     answer.trim().to_ascii_lowercase().as_str(),
     "n" | "no" | "0" | "false"
   )
 }
 
-/// Ask the account, the password and the remember question.
+/// Ask the account, the password, the remember question and the start-up one.
 ///
 /// Reads whatever stdin is - the console when `-i` was promised one. The stored
 /// account is offered as the default so that Enter keeps it, an empty password
-/// answer means "keep the one the service already holds", and Enter at the last
-/// question stores the password (only `n`/`no`/`0`/`false` does not).
-fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), String> {
+/// answer means "keep the one the service already holds", and Enter at either
+/// yes/no question takes its default, which is yes for both.
+fn ask_credentials(default: &str) -> Result<(String, String, bool, bool), String> {
   prompt::arm_cancel();
-  let default = cfg.username.trim();
+  let default = default.trim();
   let question = if default.is_empty() {
     format!("{ASK_ACCOUNT}: ")
   } else {
@@ -1040,8 +1198,9 @@ fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), Strin
     return Err("no account given".into());
   }
   let password = prompt::secret(&format!("{ASK_PASSWORD}: "))?;
-  let remember = wants_remember(&prompt::line(&format!("{ASK_REMEMBER} "))?);
-  Ok((username, password, remember))
+  let remember = unless_negative(&prompt::line(&format!("{ASK_REMEMBER} "))?);
+  let auto_connect = unless_negative(&prompt::line(&format!("{ASK_AUTO_CONNECT} "))?);
+  Ok((username, password, remember, auto_connect))
 }
 
 /// Print one line to stdout, ignoring a closed stdout.
@@ -1051,6 +1210,11 @@ fn ask_credentials(cfg: &config::Config) -> Result<(String, String, bool), Strin
 /// not leave a crash record behind.
 fn say(line: &str) {
   let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// `on`/`off`, the words the config switches are typed with.
+fn onoff(on: bool) -> &'static str {
+  if on { "on" } else { "off" }
 }
 
 /// Whether a bare `login` has nothing left to do: the service is already online
@@ -1073,6 +1237,182 @@ fn session_line(state: session::State, held: &str) -> String {
     (false, _) => format!("session: {verb} as {held}"),
     (true, _) => format!("session: {verb}"),
   }
+}
+
+/// The line `thunet login` prints about starting by itself.
+///
+/// Machine mode names the service; a portable window names its own login entry,
+/// because it has no service to point at. Both are read from the OS on every
+/// run, so deleting an entry by hand is reflected at once.
+fn autostart_line(minimized: bool) -> String {
+  let entry = if ipc::portable() {
+    autostart::Autostart::portable(minimized, config::dir())
+  } else {
+    autostart::Autostart::new(minimized)
+  };
+  match entry.map(|entry| entry.login_status()) {
+    Some(status) => autostart_words(&status),
+    // Both constructors need the executable path; without it there is nothing
+    // to check, and an "unknown" line beats one that looks like "off".
+    None => "autostart: unknown (cannot locate the executable)".into(),
+  }
+}
+
+/// `autostart: enabled (…)`, or a disabled answer plus the way to turn it on.
+fn autostart_words(status: &autostart::LoginStatus) -> String {
+  if status.enabled {
+    format!("autostart: enabled ({})", status.entry)
+  } else {
+    format!("autostart: disabled ({})\n  {}", status.entry, status.hint)
+  }
+}
+
+/// `thunet service <enable|disable|status>` in portable mode.
+///
+/// There is no machine service here; the only thing that can start this core is
+/// the window itself, so these three verbs address the window's login entry -
+/// the CLI half of the settings checkbox. `--machine service …` stays the way
+/// to the machine service, and the caller has already refused every other verb.
+fn portable_service(action: autostart::ServiceAction, minimized: bool) -> Result<(), String> {
+  match action {
+    autostart::ServiceAction::Status => {
+      say(&autostart_words(&portable_entry(minimized)?.login_status()));
+    }
+    autostart::ServiceAction::Enable => {
+      let entry = portable_entry(minimized)?;
+      entry.set_tray(true)?;
+      say(&format!(
+        "window autostart enabled ({})",
+        entry.login_status().entry
+      ));
+    }
+    autostart::ServiceAction::Disable => {
+      let entry = portable_entry(minimized)?;
+      entry.set_tray(false)?;
+      say(&format!(
+        "window autostart disabled ({})",
+        entry.login_status().entry
+      ));
+    }
+    autostart::ServiceAction::Start => portable_start()?,
+    autostart::ServiceAction::Stop => portable_stop()?,
+    autostart::ServiceAction::Restart => {
+      portable_stop()?;
+      portable_start()?;
+    }
+    // `service_refused_in_portable` filters these out before the call.
+    other => {
+      return Err(format!(
+        "`service {}` means nothing to a portable window",
+        other.name()
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// The login entry of this portable window, for the autostart verbs.
+fn portable_entry(minimized: bool) -> Result<autostart::Autostart, String> {
+  autostart::Autostart::portable(minimized, config::dir())
+    .ok_or_else(|| "cannot determine the executable path".to_string())
+}
+
+/// Start the core of this portable setup as a process of its own.
+///
+/// A CLI process cannot host the thread a window hosts, so this runs the
+/// documented headless core (`thunet core --state-dir …`) instead. An open
+/// window attaches to it like any other frontend. Its output goes next to the
+/// state directory: there is no console anybody would see it on.
+fn portable_start() -> Result<(), String> {
+  if ipc::open().is_some() {
+    say("the core is already running");
+    return Ok(());
+  }
+  let log = spawn_portable_core()?;
+  // The endpoint is bound before anything else happens in `serve`, so a short
+  // poll is enough to tell "started" from "died on the way".
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while Instant::now() < deadline {
+    if ipc::open().is_some() {
+      say(&format!(
+        "core started as a separate process (log: {})",
+        log.display()
+      ));
+      return Ok(());
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  Err(format!(
+    "the core did not answer within 5 s; see {}",
+    log.display()
+  ))
+}
+
+/// Stop the core of this portable setup, wherever it lives.
+///
+/// `Cmd::Shutdown` ends a thread hosted by the window or a process of its own;
+/// the window, if it is open, stays open in both cases.
+fn portable_stop() -> Result<(), String> {
+  let Some(link) = ipc::open() else {
+    say("the core is not running");
+    return Ok(());
+  };
+  link.send(CoreCmd::Shutdown);
+  // A hosted core cannot report this over the socket: both halves of the
+  // connection live in the window's process, so no EOF is sent and `alive()`
+  // would stay true. What does change is the endpoint - `serve` drops the
+  // listener when the host asked it to stop - so wait for that instead. This
+  // also covers the separate-process case, which exits outright.
+  drop(link);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while ipc::open().is_some() {
+    if Instant::now() >= deadline {
+      return Err("the core did not stop within 10 s".into());
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  say("core stopped");
+  Ok(())
+}
+
+/// Run `thunet core --state-dir …` detached, with its log in the state
+/// directory.
+fn spawn_portable_core() -> Result<std::path::PathBuf, String> {
+  let exe = crate::exe_path().ok_or("cannot determine the executable path")?;
+  let dir = config::dir();
+  std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+  let log_path = dir.join("core.log");
+  let log = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)
+    .map_err(|e| format!("{}: {e}", log_path.display()))?;
+  let mut cmd = std::process::Command::new(&exe);
+  cmd
+    .arg("core")
+    .arg("--state-dir")
+    .arg(&dir)
+    .stdin(std::process::Stdio::null())
+    .stdout(log.try_clone().map_err(|e| e.to_string())?)
+    .stderr(log);
+  // Outlive the shell that asked for it: a terminal hangup would otherwise end
+  // the core together with the CLI.
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::CommandExt as _;
+    cmd.process_group(0);
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt as _;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+  }
+  cmd
+    .spawn()
+    .map_err(|e| format!("cannot start the core: {e}"))?;
+  Ok(log_path)
 }
 
 /// One line about the pair the core now holds: which account, and whether it
@@ -1190,16 +1530,48 @@ mod tests {
       "", " ", "y", "Y", "yes", "YES", "maybe", "yess", "true", "1",
     ] {
       assert!(
-        wants_remember(answer),
+        unless_negative(answer),
         "{answer:?} should store the password"
       );
     }
     for answer in ["n", "N", "no", " NO ", "0", "false", "FALSE"] {
       assert!(
-        !wants_remember(answer),
+        !unless_negative(answer),
         "{answer:?} should keep the password for this session only"
       );
     }
+  }
+
+  /// The start-up question defaults to yes like the remember one: only an
+  /// explicit negative turns auto-connect off, so Enter keeps the default.
+  #[test]
+  fn the_startup_answer_defaults_to_yes() {
+    assert!(unless_negative(""));
+    assert!(unless_negative("\n"));
+    assert!(unless_negative("Y"));
+    assert!(!unless_negative("n"));
+    assert!(!unless_negative("no"));
+  }
+
+  /// The autostart line names the entry either way; only the disabled form
+  /// spends a second line on how to turn it on.
+  #[test]
+  fn a_disabled_autostart_line_names_the_way_out() {
+    let on = autostart::LoginStatus {
+      enabled: true,
+      entry: "thunet.service".into(),
+      hint: "unused".into(),
+    };
+    assert_eq!(autostart_words(&on), "autostart: enabled (thunet.service)");
+    let off = autostart::LoginStatus {
+      enabled: false,
+      entry: "thunet-portable-0badc0de.desktop".into(),
+      hint: "tick it in the settings page".into(),
+    };
+    assert_eq!(
+      autostart_words(&off),
+      "autostart: disabled (thunet-portable-0badc0de.desktop)\n  tick it in the settings page"
+    );
   }
 
   /// `--help` is the short form and `-v` the long one, so every fact the reader
@@ -1215,6 +1587,8 @@ mod tests {
       "n/no/0/false",
       "printf 'alice\\npw\\ny\\n' | thunet login",
       "thunet login --verbose",
+      "startup (default yes)",
+      "starts by itself",
     ] {
       assert!(
         LOGIN_HELP.contains(needle),
@@ -1234,6 +1608,8 @@ mod tests {
       "n, no, 0 or false",
       "deletes a password stored earlier",
       "proves a pair before it writes it",
+      "connects at startup",
+      "starts by itself at login",
       "argv",
       "nothing here",
     ] {
@@ -1272,6 +1648,63 @@ mod tests {
         "{both:?} should be refused"
       );
     }
+  }
+
+  /// The three core-owned switches take `on`/`off`; leaving them out keeps the
+  /// plain "show the file" form, and anything else is rejected.
+  #[test]
+  fn config_switches_are_on_or_off() {
+    let cli = Cli::try_parse_from([
+      "thunet",
+      "config",
+      "--auto-connect",
+      "on",
+      "--keep-online",
+      "off",
+      "--remember-password",
+      "on",
+    ])
+    .expect("the switches parse");
+    match cli.cmd {
+      Some(Cmd::Config {
+        auto_connect,
+        keep_online,
+        remember_password,
+      }) => {
+        assert_eq!(auto_connect, Some(Toggle::On));
+        assert_eq!(keep_online, Some(Toggle::Off));
+        assert_eq!(remember_password, Some(Toggle::On));
+      }
+      _ => panic!("wrong command"),
+    }
+    let bare = Cli::try_parse_from(["thunet", "config"]).expect("bare config parses");
+    match bare.cmd {
+      Some(Cmd::Config {
+        auto_connect,
+        keep_online,
+        remember_password,
+      }) => {
+        assert!(auto_connect.is_none() && keep_online.is_none() && remember_password.is_none());
+      }
+      _ => panic!("wrong command"),
+    }
+    assert!(
+      Cli::try_parse_from(["thunet", "config", "--auto-connect", "yes"]).is_err(),
+      "only on and off are accepted"
+    );
+    // The short spelling is an alias, not another switch: both reach the same
+    // field, and `--remember` alone is deliberately not a name any more.
+    let alias =
+      Cli::try_parse_from(["thunet", "config", "--remember-pwd", "off"]).expect("the alias parses");
+    match alias.cmd {
+      Some(Cmd::Config {
+        remember_password, ..
+      }) => {
+        assert_eq!(remember_password, Some(Toggle::Off));
+      }
+      _ => panic!("wrong command"),
+    }
+    assert!(Cli::try_parse_from(["thunet", "config", "--remember", "on"]).is_err());
   }
 
   #[test]

@@ -11,7 +11,7 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::CoreConfig;
 use crate::i18n::Lang;
 use crate::ipc::Sink;
 use crate::logline::Line;
@@ -48,6 +48,17 @@ const STATUS_LOG_REPEAT: Duration = Duration::from_secs(600);
 /// acting on that took the window offline and started a fresh login for
 /// nothing.
 const LINK_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Polls owed to a link that just came up, and the gap between them.
+///
+/// The portal's accounting row can appear a few seconds after the OS joined the
+/// network (DHCP, 802.1X, the portal's own lag), so the first answer names no
+/// session and the account row stays empty until the next scheduled poll - up to
+/// ten seconds. Asking again at a short interval fills it as soon as the row
+/// exists; the count is spent, so a link that never gets a session falls back to
+/// the normal cadence instead of polling forever.
+const LINK_CATCHUP_POLLS: u8 = 5;
+const LINK_CATCHUP_STEP: Duration = Duration::from_secs(2);
 
 /// How long the core keeps trying to establish a session when nothing keeps it
 /// online afterwards, measured in time the link is actually usable.
@@ -92,6 +103,10 @@ struct EnvProbe {
   /// Why the SSID could not be read, when it could not, so the log can say that
   /// the 802.1X shortcut was skipped instead of silently not applying.
   ssid_note: Option<String>,
+  /// What the campus portal answered, when it was asked. Logged once per
+  /// change: it is the evidence the campus verdict rests on, so a wrong
+  /// "other network" is diagnosable from the log alone.
+  portal_note: Option<String>,
 }
 
 /// Probe what the machine is attached to, plus the `ac_id` when a campus portal
@@ -118,7 +133,12 @@ fn probe_env(session: &Session) -> EnvProbe {
     crate::wifi::WifiKind::Enterprise(ssid) => {
       Some(format!("wifi: {ssid} authenticates below the portal"))
     }
-    crate::wifi::WifiKind::Campus(ssid) => Some(format!("wifi: {ssid} is a campus network")),
+    // A name is only a hint now: the campus verdict below comes from the
+    // portal, so a wired link, a router, a VPN or an emulator behind a campus
+    // host is classified the same way.
+    crate::wifi::WifiKind::Campus(ssid) => {
+      Some(format!("wifi: {ssid} (campus name; the portal decides)"))
+    }
     crate::wifi::WifiKind::Portal(ssid) => Some(format!("wifi: {ssid} uses the portal")),
     // Nothing wireless is connected: there is no verdict to explain, so this
     // stays quiet instead of claiming "no ssid" on every wired machine.
@@ -130,60 +150,93 @@ fn probe_env(session: &Session) -> EnvProbe {
       env: LoginEnv::EnterpriseWifi(ssid),
       ac_id: None,
       ssid_note,
+      portal_note: None,
     };
   }
-  let named_campus = matches!(&wifi, crate::wifi::WifiKind::Campus(_));
-  // The silent-drop case needs a second look: the campus gateway drops
-  // pre-login traffic on the wired network instead of redirecting it, so the
-  // probes see "nothing answers" while a portal login is exactly what is
-  // missing. Two local facts decide it: the SSID name, and the campus portal
-  // already talking to this machine's own address (true only while no NAT sits
-  // in between).
+  // The campus verdict is portal evidence, never the Wi-Fi name: a wired link,
+  // a router, a VPN and an emulator behind a campus host have no campus SSID,
+  // but all of them can reach the portal that a home connection cannot.
   //
-  // A link that *does* reach the internet is deliberately not upgraded to
-  // `Campus`: there a login is not needed, and the `ac_id` of the campus network
-  // is per link, so the one this machine has may belong to the network it came
-  // from - the portal then answers `BAS respond timeout` or `E2808` and nothing
-  // has been gained. Whether the portal is behind that link still matters for
-  // the *wording*, though: a campus link without a session is not a home Wi-Fi.
-  //
-  // Asking costs a request with the client timeout, so a link that cannot be
-  // the campus network skips it: a phone on mobile data (or a computer tethered
-  // to one) has no portal to look for, and probing anyway stalled the core for
-  // three seconds on every offline tick.
+  // Asking costs one request with the client timeout, so a link that cannot be
+  // the campus network skips it: mobile data and USB tethering have no portal
+  // to look for, and probing anyway stalled the core for three seconds on
+  // every offline tick.
   let portal_possible = !matches!(
     link,
     crate::proto::LinkKind::Mobile | crate::proto::LinkKind::Usb
   );
-  let campus_link =
-    |session: &Session| named_campus || (portal_possible && session.portal_owns_address());
-  let (env, ac_id) = match session.net_env() {
+  let net = session.net_env();
+  // Only the branches that can still be the campus network need the portal. A
+  // link the campus gateway redirects already carries the ac_id, and a foreign
+  // portal is not ours to ask.
+  let ask_portal = portal_possible && matches!(&net, NetEnv::DirectInternet | NetEnv::Unreachable);
+  let view = if ask_portal {
+    session.portal_view()
+  } else {
+    None
+  };
+  let portal_note = if ask_portal {
+    Some(match &view {
+      None => "portal: no answer".to_string(),
+      Some(view) => match &view.address {
+        Some(seen) if view.logged_in => format!("portal: answered, logged in on {seen}"),
+        Some(seen) => format!("portal: answered, nobody logged in (it sees {seen})"),
+        None => "portal: answered, nobody logged in".to_string(),
+      },
+    })
+  } else {
+    None
+  };
+  let (env, ac_id) = verdict(net, view.as_ref(), crate::srun::link_up());
+  EnvProbe {
+    env,
+    ac_id,
+    ssid_note,
+    portal_note,
+  }
+}
+
+/// Turn the probes into the environment the rest of the core acts on.
+///
+/// Two axes meet here:
+///
+/// * `NetEnv` is about the *path*: probes answered directly, a portal
+///   intercepted them, or nothing answered at all.
+/// * `PortalView` is about the *answer*: the campus portal replied, and whether
+///   it names a signed-in identity. It is the property every campus path shares
+///   - cable, campus Wi-Fi, a router or VPN in between, an emulator whose
+///   traffic leaves through a campus host - and none of them has to carry a
+///   campus SSID.
+///
+/// `NoPortal` is the "the internet works and there is nothing to log in to"
+/// verdict, so it needs both halves: no interception, and no session in the
+/// answer. A portal that names a session is simply a campus link whose session
+/// is up.
+fn verdict(
+  net: NetEnv,
+  portal: Option<&crate::srun::PortalView>,
+  link_up: bool,
+) -> (LoginEnv, Option<String>) {
+  match net {
     NetEnv::Campus { ac_id } => (LoginEnv::Campus, Some(ac_id)),
     NetEnv::OtherPortal => (LoginEnv::OtherPortal, None),
-    // The probe only proves the internet works. The portal answers the other
-    // half: it reports the caller's own address while the machine sits behind
-    // it, which a home network or mobile data cannot fake (NAT makes the two
-    // differ, and off campus it does not answer at all).
-    NetEnv::DirectInternet => {
-      if campus_link(session) {
-        (LoginEnv::NoPortal, None)
-      } else {
-        (LoginEnv::OtherNetwork, None)
-      }
-    }
+    NetEnv::DirectInternet => match portal {
+      Some(view) if !view.logged_in => (LoginEnv::NoPortal, None),
+      Some(_) => (LoginEnv::Campus, None),
+      None => (LoginEnv::OtherNetwork, None),
+    },
+    // The silent-drop case: the campus gateway drops pre-login traffic instead
+    // of redirecting it, so the probes see nothing while a login is exactly
+    // what is missing. `link_up` keeps a dead interface from being called a
+    // campus.
     NetEnv::Unreachable => (
-      if campus_link(session) && crate::srun::link_up() {
+      if portal.is_some() && link_up {
         LoginEnv::Campus
       } else {
         LoginEnv::NoNetwork
       },
       None,
     ),
-  };
-  EnvProbe {
-    env,
-    ac_id,
-    ssid_note,
   }
 }
 
@@ -214,6 +267,10 @@ fn core_info(
     auto_connect: session.cfg().auto_connect,
     keep_online: session.cfg().keep_online,
     wanted_online,
+    // The core's own fact, not the window's: only a machine core can be started
+    // by the service manager, and asking the OS from a portable core would
+    // report the *installed* service while this core is a thread of a window.
+    autostart: crate::ipc::is_machine() && crate::autostart::core_starts_at_boot(),
     failures: session.failures,
     frontends,
     endpoint: crate::ipc::endpoint_path(),
@@ -397,9 +454,12 @@ fn status_error_text(e: &(impl std::fmt::Display + ?Sized)) -> String {
   text
 }
 
-pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
+pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
-  let mut lang = Lang::from_setting(&cfg.lang);
+  // The window sends its language as soon as it attaches (`SetLang`); until
+  // then the core words its own messages in the OS language, which is what
+  // "auto" means for the window too.
+  let mut lang = Lang::from_setting("auto");
   // `load_machine` only fills `password` when `remember_password` is set and a
   // sealed blob could be opened, so this pair is exactly "the next start will
   // find a credential".
@@ -435,6 +495,9 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // Ask the portal again in this pass: a new link or a new Wi-Fi name can
   // invalidate the answer the window is showing before the next period is due.
   let mut force_status = false;
+  // Quick polls still owed to a link that just came up: see
+  // [`LINK_CATCHUP_POLLS`].
+  let mut catchup_polls = 0u8;
   let mut last_state = State::LoggedOut;
   // Backoff state so a rejected login does not hammer the portal every tick.
   let retry_delay = Duration::from_secs(session.cfg().reconnect_delay_secs.max(5));
@@ -472,6 +535,8 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
   // The last thing the log said about reading the SSID, so a read that Windows
   // refuses is reported once instead of on every probe.
   let mut last_ssid_note: Option<String> = None;
+  // The same for the portal evidence: one line per change, not per probe.
+  let mut last_portal_note: Option<String> = None;
   // After the path to the internet changes, the SSID is re-read for a while:
   // see [`SSID_WATCH_AFTER_LINK`].
   let mut ssid_watch_until = Instant::now();
@@ -1022,6 +1087,10 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         // ask again now, so the session found on the new one is not held back by
         // the offline poll period.
         force_status = true;
+        // The new link's first answer can arrive before the portal's own row
+        // does; keep asking for a few seconds so the account row fills without
+        // waiting out the whole period.
+        catchup_polls = LINK_CATCHUP_POLLS;
         // A different path to the internet: the verdict, the backoff in flight
         // and the reason last logged all belong to the old one. The SSID window
         // is *replaced*, never extended - a switch supersedes the watch started
@@ -1127,6 +1196,12 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         tx.send(Ev::Log(Line::debug(note.clone()))).ok();
         last_ssid_note = probe.ssid_note;
       }
+      if let Some(note) = &probe.portal_note
+        && last_portal_note.as_ref() != Some(note)
+      {
+        tx.send(Ev::Log(Line::debug(note.clone()))).ok();
+        last_portal_note = probe.portal_note;
+      }
       // The slow cadence is only for a machine with no route at all.
       // `link_ready` is maintained by the link watch, and that only runs while
       // an automatic attempt is possible; ask the route table directly for the
@@ -1147,6 +1222,19 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
         next_attempt = Instant::now();
         failures = 0;
         last_failure.clear();
+      }
+      // Only a campus path has a portal row to wait for. A change to one
+      // restarts the catch-up; any other verdict ends it instead of asking a
+      // portal that will never answer.
+      if matches!(
+        &env,
+        LoginEnv::Campus | LoginEnv::NoPortal | LoginEnv::EnterpriseWifi(_)
+      ) {
+        if env != last_env {
+          catchup_polls = LINK_CATCHUP_POLLS;
+        }
+      } else {
+        catchup_polls = 0;
       }
       last_env = env.clone();
       tx.send(Ev::Env(env)).ok();
@@ -1342,14 +1430,16 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
       };
     }
 
-    // Ask the portal what is actually going on, online or not: the session may
-    // have been created elsewhere, and "no password saved" is not "offline".
+    // Poll the portal on the period, plus the catch-up owed to a link that just
+    // came up. `last_status` is the last actual poll, so a forced one in this
+    // pass already restarts the gap.
+    let catchup_due = catchup_polls > 0 && last_status.elapsed() >= LINK_CATCHUP_STEP;
     let poll_every = if session.state == State::LoggedIn {
       POLL_ONLINE
     } else {
       POLL_OFFLINE
     };
-    if force_status || last_status.elapsed() >= poll_every {
+    if force_status || catchup_due || last_status.elapsed() >= poll_every {
       force_status = false;
       let answer = session.client().status(&session.cfg().ac_id);
       match &answer {
@@ -1382,7 +1472,24 @@ pub fn worker(cfg: Config, rx: Receiver<Cmd>, tx: Sink) {
           }
         }
       }
+      // An answer that names a session ends the catch-up; a missing one spends
+      // one of the owed polls and then falls back to the normal cadence.
+      if catchup_polls > 0 {
+        let online = answer
+          .as_ref()
+          .is_ok_and(|v| v.get("online").and_then(|b| b.as_bool()).unwrap_or(false));
+        catchup_polls = if online { 0 } else { catchup_polls - 1 };
+      }
       if let Ok(v) = answer {
+        // The portal just answered on this link, so a verdict that says the
+        // campus portal is not behind it (`OtherNetwork`) or that nothing is
+        // reachable (`NoNetwork`) cannot still be true. One failed request
+        // during a network change is enough to produce either, and while the
+        // session is up the timer never re-probes - which left the portal verbs
+        // greyed out until the link changed again. Ask again right away.
+        if matches!(last_env, LoginEnv::OtherNetwork | LoginEnv::NoNetwork) {
+          force_env = true;
+        }
         let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
         if online && session.state != State::LoggedIn {
           session.state = State::LoggedIn;
@@ -1455,6 +1562,64 @@ mod tests {
     assert!(!portal_verbs(&LoginEnv::EnterpriseWifi(
       "Tsinghua-Secure 2".into()
     )));
+  }
+
+  /// The campus verdict rests on the portal answering at all: a wired link, a
+  /// router, a VPN and an emulator behind a campus host carry no campus SSID.
+  #[test]
+  fn a_portal_answer_is_what_makes_a_link_campus() {
+    let answered = crate::srun::PortalView {
+      logged_in: true,
+      address: Some("192.0.2.10".into()),
+    };
+    // A session is a campus link with the session up: `NoPortal` would claim
+    // there is nothing signed in, which the answer contradicts.
+    assert_eq!(
+      verdict(NetEnv::DirectInternet, Some(&answered), true).0,
+      LoginEnv::Campus
+    );
+    // A session is not required: `not_online` is an answer too, and it is the
+    // case `NoPortal` is named for - internet, portal reachable, nothing
+    // signed in on this address.
+    let no_session = crate::srun::PortalView {
+      logged_in: false,
+      address: None,
+    };
+    assert_eq!(
+      verdict(NetEnv::DirectInternet, Some(&no_session), true).0,
+      LoginEnv::NoPortal
+    );
+    // No answer at all is a home network, mobile data, a hotspot.
+    assert_eq!(
+      verdict(NetEnv::DirectInternet, None, true).0,
+      LoginEnv::OtherNetwork
+    );
+    // The silent-drop case: probes see nothing, but the portal answers, so this
+    // is the campus link and a login is exactly what is missing.
+    assert_eq!(
+      verdict(NetEnv::Unreachable, Some(&no_session), true).0,
+      LoginEnv::Campus
+    );
+    // Without a route there is nothing to log in on, whatever answered before.
+    assert_eq!(
+      verdict(NetEnv::Unreachable, Some(&no_session), false).0,
+      LoginEnv::NoNetwork
+    );
+    // The interception cases never need the portal request.
+    assert_eq!(
+      verdict(
+        NetEnv::Campus {
+          ac_id: "169".into()
+        },
+        None,
+        true
+      ),
+      (LoginEnv::Campus, Some("169".into()))
+    );
+    assert_eq!(
+      verdict(NetEnv::OtherPortal, Some(&answered), true).0,
+      LoginEnv::OtherPortal
+    );
   }
 
   #[test]

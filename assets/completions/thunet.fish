@@ -48,7 +48,7 @@ complete -c thunet -n "__fish_thunet_needs_command" -f -a "service-admin" -d 'Pe
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "service-purge" -d 'Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "service-restore" -d 'Put the package back the way the install found it: start the core if it was running, then restore the windows the quit step closed (installer internal)'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "quit" -d 'Ask the running window to quit, then wait until it is really gone'
-complete -c thunet -n "__fish_thunet_needs_command" -f -a "config" -d 'Print the config path and effective settings'
+complete -c thunet -n "__fish_thunet_needs_command" -f -a "config" -d 'Print the core\'s effective settings'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "shortcut" -d 'Create a desktop shortcut for this executable'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "completions" -d 'Print a shell completion script'
 complete -c thunet -n "__fish_thunet_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
@@ -95,7 +95,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand login" -l ac-id -d 'ac_id 
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l state-dir -d 'Where `config.json` and `credential.bin` live. The Windows service is registered with the installing user\'s directory, because the token it runs under has no profile of its own' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l admin-error -d 'Internal: file where the elevated helper records a failure' -r -F
 complete -c thunet -n "__fish_thunet_using_subcommand login" -s v -l verbose -d 'Print the long explanation and exit'
-complete -c thunet -n "__fish_thunet_using_subcommand login" -s i -l interactive -d 'Ask for the account, the password and whether to remember, on this console'
+complete -c thunet -n "__fish_thunet_using_subcommand login" -s i -l interactive -d 'Ask for the account, the password, whether to remember, and whether to connect at startup, on this console'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l cmd -d 'Print the command line for cmd.exe and PowerShell, then exit'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l bash -d 'Print the command line for any POSIX shell, then exit'
 complete -c thunet -n "__fish_thunet_using_subcommand login" -l pwsh -d 'Alias for `--cmd`'
@@ -194,6 +194,12 @@ complete -c thunet -n "__fish_thunet_using_subcommand quit" -l visible -d 'Start
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -l signal-only -d 'Internal: raise the machine-wide quit signal and exit'
 complete -c thunet -n "__fish_thunet_using_subcommand quit" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c thunet -n "__fish_thunet_using_subcommand config" -l auto-connect -d 'Start online right after the core starts' -r -f -a "on\t''
+off\t''"
+complete -c thunet -n "__fish_thunet_using_subcommand config" -l keep-online -d 'Sign back in after the session is lost, until the user disconnects' -r -f -a "on\t''
+off\t''"
+complete -c thunet -n "__fish_thunet_using_subcommand config" -l remember-password -l remember-pwd -d 'Keep the password for the next start; `off` deletes the stored copy' -r -f -a "on\t''
+off\t''"
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l timeout -d 'Request timeout in seconds' -r
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
@@ -205,7 +211,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand config" -l minimized -d 'S
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l visible -d 'Start on screen even when the saved preference says to start in the tray'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l machine -d 'Act as if `THUNET_STATE_DIR` were unset: talk to the machine setup only'
 complete -c thunet -n "__fish_thunet_using_subcommand config" -l signal-only -d 'Internal: raise the machine-wide quit signal and exit'
-complete -c thunet -n "__fish_thunet_using_subcommand config" -s h -l help -d 'Print help'
+complete -c thunet -n "__fish_thunet_using_subcommand config" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l host -d 'Portal host (overrides the config file)' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l timeout -d 'Request timeout in seconds' -r
 complete -c thunet -n "__fish_thunet_using_subcommand shortcut" -l ip -d 'Local IP to authenticate; empty lets the portal infer it' -r
@@ -241,7 +247,7 @@ complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "service-purge" -d 'Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "service-restore" -d 'Put the package back the way the install found it: start the core if it was running, then restore the windows the quit step closed (installer internal)'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "quit" -d 'Ask the running window to quit, then wait until it is really gone'
-complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "config" -d 'Print the config path and effective settings'
+complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "config" -d 'Print the core\'s effective settings'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "shortcut" -d 'Create a desktop shortcut for this executable'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "completions" -d 'Print a shell completion script'
 complete -c thunet -n "__fish_thunet_using_subcommand help; and not __fish_seen_subcommand_from selftest ac-id status login logout core service service-admin service-purge service-restore quit config shortcut completions help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'

@@ -236,7 +236,7 @@ pub struct Texts {
   /// Status-page row describing the background service process.
   pub service: &'static str,
   /// The same row in portable mode, where the core is a thread of the window
-  /// rather than a service: there is nothing to start, stop or restart.
+  /// unless this process hosts none (`service start` runs one of its own).
   pub core_row: &'static str,
   /// Its status words. The same two pairs describe where the core lives: a
   /// thread of this window here, a process of its own there.
@@ -462,7 +462,7 @@ static ZH: Texts = Texts {
   service_running: "进程运行中",
   service_gone: "进程未运行",
   service_down: "后台服务当前没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
-  core_down: "本窗口的核心线程没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
+  core_down: "核心没有运行，暂时无法连接或保持在线，点「启动」按钮即可恢复。",
   service_stale: "后台服务还在运行旧版本（协议 {}），重启后才能恢复连接。",
   service_start: "启动",
   service_stop: "停止",
@@ -615,7 +615,7 @@ static EN: Texts = Texts {
   service_running: "process running",
   service_gone: "process not running",
   service_down: "The background service is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
-  core_down: "The core thread is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
+  core_down: "The core is not running, so you cannot sign in or stay online. Use the Start button to bring it back.",
   service_stale: "The background service still runs an older build (protocol {}); restart it to reconnect.",
   service_start: "Start",
   service_stop: "Stop",

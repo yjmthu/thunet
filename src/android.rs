@@ -76,6 +76,9 @@ fn prepare(dir: &str) {
   // SAFETY: this runs before any thread that reads the variable is spawned, and
   // the value never changes for the life of the process.
   unsafe { std::env::set_var("THUNET_STATE_DIR", dir) };
+  // A pre-split state directory kept the core's half in the window's file; do
+  // it before either half can save over the other.
+  crate::config::migrate();
   let path = Path::new(dir);
   crate::diag::set_file(path.join("core.log"));
   install_panic_log(path.to_path_buf());
@@ -173,7 +176,7 @@ fn logout() -> i32 {
     crate::diag::line("logout: asked the running core to disconnect");
     return 0;
   }
-  let cfg = crate::config::Config::load();
+  let cfg = crate::config::CoreConfig::load();
   if cfg.username.trim().is_empty() {
     crate::diag::line("logout: no account to log out");
     return 1;
@@ -202,7 +205,7 @@ fn ensure_online() -> i32 {
     crate::diag::line("wake: asked the running core to connect");
     return 0;
   }
-  let cfg = crate::config::Config::load();
+  let cfg = crate::config::CoreConfig::load();
   if cfg.username.trim().is_empty() || cfg.password.is_empty() {
     // Written before any request: a cold-started process may be reclaimed
     // before a slow answer arrives, and the next attempt has to be traceable.

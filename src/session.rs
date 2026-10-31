@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::CoreConfig;
 use crate::logline::Line;
 use crate::srun::{Client, NetEnv, NetError};
 
@@ -41,7 +41,7 @@ pub enum FailureKind {
 
 pub struct Session {
   client: Client,
-  cfg: Config,
+  cfg: CoreConfig,
   /// True when `ac_id` was auto-detected (so it must be refreshed per connect).
   auto_ac: bool,
   /// Diagnostics produced off the UI thread; drained into the window log.
@@ -68,7 +68,16 @@ fn error_msg(v: &serde_json::Value) -> String {
 
 #[allow(dead_code)] // some accessors are consumed only by the tray/UI layer
 impl Session {
-  pub fn new(mut cfg: Config) -> Self {
+  pub fn new(mut cfg: CoreConfig) -> Self {
+    // The account and the password are one credential: a name without a
+    // password cannot sign in, and keeping it would leave a half-set pair that
+    // `credential_state` reports and `--remember-password off` then "clears" -
+    // erasing a name the user never meant to give up. The config file may keep
+    // the name as a hint for the window's prompt; the core holds only complete
+    // pairs.
+    if cfg.password.is_empty() {
+      cfg.username.clear();
+    }
     // Three seconds: a portal poll that has not answered by then is treated as
     // silent, and waiting any longer only holds up the core's own loop. Logins
     // use `LOGIN_TIMEOUT` instead (see `Client::new`), so the challenge round
@@ -102,8 +111,15 @@ impl Session {
   }
 
   /// Update the credentials used by the next login attempt.
+  ///
+  /// The pair is atomic here as well: an empty password clears the name with
+  /// it, so no caller can leave the session holding half a credential.
   pub fn set_credentials(&mut self, username: String, password: String) {
-    self.cfg.username = username;
+    if password.is_empty() {
+      self.cfg.username.clear();
+    } else {
+      self.cfg.username = username;
+    }
     self.cfg.password = password;
   }
 
@@ -111,13 +127,13 @@ impl Session {
     &self.client
   }
 
-  pub fn cfg(&self) -> &Config {
+  pub fn cfg(&self) -> &CoreConfig {
     &self.cfg
   }
 
   /// The core owns the credential, so it also maintains the flags that decide
   /// whether that credential is read back on the next start.
-  pub fn cfg_mut(&mut self) -> &mut Config {
+  pub fn cfg_mut(&mut self) -> &mut CoreConfig {
     &mut self.cfg
   }
 
@@ -146,21 +162,14 @@ impl Session {
     self.client.net_env()
   }
 
-  /// Is the campus portal already talking to *this* machine?
+  /// What the campus portal says about this client: whether it has a live
+  /// session for the address it sees, and that address.
   ///
-  /// The portal reports the caller's own address, and on the campus network
-  /// that address is exactly the one the OS picked for the default route -
-  /// there is no NAT in between. From anywhere else the two differ (or the
-  /// portal does not answer at all), which is what keeps a hotel Wi-Fi from
-  /// being mistaken for a portal that is simply not intercepting.
-  pub fn portal_owns_address(&self) -> bool {
-    let Some(local) = crate::srun::link_id() else {
-      return false;
-    };
-    self
-      .client
-      .portal_address()
-      .is_some_and(|seen| seen == local.to_string())
+  /// The address may be a router's or a VPN's rather than this machine's own:
+  /// that is exactly what makes the answer useful behind NAT, where comparing
+  /// it with the local default-route address can never match.
+  pub fn portal_view(&self) -> Option<crate::srun::PortalView> {
+    self.client.portal_view()
   }
 
   /// Adopt an ac_id found by the caller's probe (only when auto-detecting).
@@ -321,5 +330,44 @@ impl Session {
     }
     self.state = State::LoggedOut;
     Ok("ok".to_string())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn named(username: &str, password: &str) -> CoreConfig {
+    let mut cfg = CoreConfig::default();
+    cfg.username = username.into();
+    cfg.password = password.into();
+    cfg
+  }
+
+  /// An account without a password cannot sign in, so the session does not
+  /// keep it: the pair is one credential, and a half-set one must not reach
+  /// `credential_state` or `--remember-password off`.
+  #[test]
+  fn a_name_without_a_password_is_dropped() {
+    let session = Session::new(named("alice", ""));
+    assert!(session.cfg().username.is_empty());
+    assert!(session.cfg().password.is_empty());
+  }
+
+  #[test]
+  fn a_complete_pair_is_kept() {
+    let session = Session::new(named("alice", "pw"));
+    assert_eq!(session.cfg().username, "alice");
+    assert_eq!(session.cfg().password, "pw");
+  }
+
+  /// The same rule when a frontend sets the pair: an empty password takes the
+  /// name with it instead of leaving half a credential behind.
+  #[test]
+  fn clearing_the_password_clears_the_name() {
+    let mut session = Session::new(named("alice", "pw"));
+    session.set_credentials("alice".into(), String::new());
+    assert!(session.cfg().username.is_empty());
+    assert!(session.cfg().password.is_empty());
   }
 }

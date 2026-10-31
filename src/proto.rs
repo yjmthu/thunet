@@ -101,7 +101,8 @@ pub enum ToastKind {
 /// this and the UI greys *Connect* out when an attempt could not possibly work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoginEnv {
-  /// A campus portal answered: logging in makes sense.
+  /// The campus portal answered: this is the campus network, and the portal
+  /// verbs (Connect/Disconnect) apply.
   Campus,
   /// The OS authenticates this Wi-Fi at layer 2 (802.1X); no portal involved.
   EnterpriseWifi(String),
@@ -109,10 +110,9 @@ pub enum LoginEnv {
   NoNetwork,
   /// A captive portal that is not the campus one (hotel, airport, ...).
   OtherPortal,
-  /// The internet works directly, so there is nothing to log in to. The probe
-  /// found the machine behind the campus portal, which answered but reported
-  /// no signed-in identity for this address - a campus link without a session,
-  /// not a different network.
+  /// The internet works directly, and the campus portal answered without
+  /// naming a signed-in identity for this address: the campus link, with no
+  /// session on it. Nothing to send until a login is wanted.
   NoPortal,
   /// The internet works directly and the portal is not behind this link at all:
   /// home Wi-Fi, mobile data, a hotspot. Nothing on this link is the campus
@@ -185,6 +185,11 @@ pub struct CoreInfo {
   /// intent behind every automatic login; it is true after a start with
   /// auto connect on, and after a manual connect.
   pub wanted_online: bool,
+  /// Whether the core itself starts with the machine: the service's start type,
+  /// read from the service manager. A portable core is a thread of its window,
+  /// so it always answers `false`. Absent on an old core (`false`).
+  #[serde(default)]
+  pub autostart: bool,
   pub failures: u32,
   pub frontends: usize,
   pub endpoint: String,
@@ -430,6 +435,7 @@ mod tests {
       auto_connect: true,
       keep_online: true,
       wanted_online: true,
+      autostart: true,
       failures: 0,
       frontends: 1,
       endpoint: "/run/user/1000/thunet/control.sock".into(),
@@ -460,6 +466,7 @@ mod tests {
     assert_eq!(info.link, LinkKind::None);
     assert_eq!(info.state, State::LoggedOut, "the old wire name parses");
     assert!(!info.keep_online, "an old core never reported it");
+    assert!(!info.autostart, "an old core never reported it");
     assert_eq!(info.version, "0.1.3");
   }
 

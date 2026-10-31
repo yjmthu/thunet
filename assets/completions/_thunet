@@ -100,8 +100,8 @@ _arguments "${_arguments_options[@]}" : \
 '--admin-error=[Internal\: file where the elevated helper records a failure]:ADMIN_ERROR:_files' \
 '-v[Print the long explanation and exit]' \
 '--verbose[Print the long explanation and exit]' \
-'-i[Ask for the account, the password and whether to remember, on this console]' \
-'--interactive[Ask for the account, the password and whether to remember, on this console]' \
+'-i[Ask for the account, the password, whether to remember, and whether to connect at startup, on this console]' \
+'--interactive[Ask for the account, the password, whether to remember, and whether to connect at startup, on this console]' \
 '--cmd[Print the command line for cmd.exe and PowerShell, then exit]' \
 '--bash[Print the command line for any POSIX shell, then exit]' \
 '--pwsh[Alias for \`--cmd\`]' \
@@ -256,6 +256,10 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (config)
 _arguments "${_arguments_options[@]}" : \
+'--auto-connect=[Start online right after the core starts]:on|off:(on off)' \
+'--keep-online=[Sign back in after the session is lost, until the user disconnects]:on|off:(on off)' \
+'--remember-password=[Keep the password for the next start; \`off\` deletes the stored copy]:on|off:(on off)' \
+'--remember-pwd=[Keep the password for the next start; \`off\` deletes the stored copy]:on|off:(on off)' \
 '--host=[Portal host (overrides the config file)]:HOST:_default' \
 '--timeout=[Request timeout in seconds]:TIMEOUT:_default' \
 '--ip=[Local IP to authenticate; empty lets the portal infer it]:IP:_default' \
@@ -267,8 +271,8 @@ _arguments "${_arguments_options[@]}" : \
 '--visible[Start on screen even when the saved preference says to start in the tray]' \
 '--machine[Act as if \`THUNET_STATE_DIR\` were unset\: talk to the machine setup only]' \
 '--signal-only[Internal\: raise the machine-wide quit signal and exit]' \
-'-h[Print help]' \
-'--help[Print help]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
 (shortcut)
@@ -401,7 +405,7 @@ _thunet_commands() {
 'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
 'service-restore:Put the package back the way the install found it\: start the core if it was running, then restore the windows the quit step closed (installer internal)' \
 'quit:Ask the running window to quit, then wait until it is really gone' \
-'config:Print the config path and effective settings' \
+'config:Print the core'\''s effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
 'help:Print this message or the help of the given subcommand(s)' \
@@ -442,7 +446,7 @@ _thunet__subcmd__help_commands() {
 'service-purge:Delete the machine state directory after a real uninstall (installer internal; never called for an upgrade or repair)' \
 'service-restore:Put the package back the way the install found it\: start the core if it was running, then restore the windows the quit step closed (installer internal)' \
 'quit:Ask the running window to quit, then wait until it is really gone' \
-'config:Print the config path and effective settings' \
+'config:Print the core'\''s effective settings' \
 'shortcut:Create a desktop shortcut for this executable' \
 'completions:Print a shell completion script' \
 'help:Print this message or the help of the given subcommand(s)' \

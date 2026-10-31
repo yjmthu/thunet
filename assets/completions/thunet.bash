@@ -227,12 +227,28 @@ _thunet() {
             return 0
             ;;
         thunet__subcmd__config)
-            opts="-h --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
+            opts="-h --auto-connect --keep-online --remember-pwd --remember-password --host --http --timeout --ip --ac-id --minimized --visible --state-dir --machine --admin-error --signal-only --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --auto-connect)
+                    COMPREPLY=($(compgen -W "on off" -- "${cur}"))
+                    return 0
+                    ;;
+                --keep-online)
+                    COMPREPLY=($(compgen -W "on off" -- "${cur}"))
+                    return 0
+                    ;;
+                --remember-password)
+                    COMPREPLY=($(compgen -W "on off" -- "${cur}"))
+                    return 0
+                    ;;
+                --remember-pwd)
+                    COMPREPLY=($(compgen -W "on off" -- "${cur}"))
+                    return 0
+                    ;;
                 --host)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
