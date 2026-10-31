@@ -27,9 +27,48 @@ pub fn set_file(path: PathBuf) {
   let _ = FILE.set(path);
 }
 
+#[cfg(target_os = "android")]
+mod logcat_impl {
+  use std::ffi::{CString, c_char};
+
+  #[link(name = "log")]
+  unsafe extern "C" {
+    fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
+  }
+
+  /// `ANDROID_LOG_INFO`.
+  const INFO: i32 = 4;
+
+  pub fn write(text: &str) {
+    let Ok(text) = CString::new(text) else {
+      return;
+    };
+    // SAFETY: both pointers are valid NUL-terminated strings for the duration of
+    // the call, and liblog copies what it needs.
+    unsafe { __android_log_write(INFO, c"THUnet".as_ptr(), text.as_ptr()) };
+  }
+}
+
+/// Mirror one line to logcat.
+///
+/// Android gives a process no stderr until a window exists - and a process the
+/// keep-alive service starts never has one - so a core that fails to come up
+/// would fail invisibly: the service is restarted, the notification reappears,
+/// and only `core.log` (unreadable without root) would say why. The service
+/// path is exactly the one that cannot be watched from the window, so it has to
+/// be visible from logcat.
+#[cfg(target_os = "android")]
+pub fn logcat(text: &str) {
+  logcat_impl::write(text);
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn logcat(_text: &str) {}
+
 /// Write one line to stderr and, when configured, to the log file.
 pub fn line(text: &str) {
   eprintln!("{text}");
+  logcat(text);
   let Some(path) = FILE.get() else {
     return;
   };

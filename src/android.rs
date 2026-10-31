@@ -90,6 +90,8 @@ fn install_panic_log(dir: PathBuf) {
 
   let previous = std::panic::take_hook();
   std::panic::set_hook(Box::new(move |info| {
+    // A panic in a thread of a service-only process has nowhere else to go.
+    crate::diag::logcat(&format!("panic: {info}"));
     if let Ok(mut file) = std::fs::OpenOptions::new()
       .create(true)
       .append(true)

@@ -28,6 +28,7 @@ public class KeepAliveService extends Service {
   @Override
   public void onCreate() {
     super.onCreate();
+    Log.i(Wake.TAG, "keep-alive: onCreate");
     createChannel();
     ConnectivityManager manager = getSystemService(ConnectivityManager.class);
     if (manager != null) {
@@ -47,6 +48,38 @@ public class KeepAliveService extends Service {
         // The core's own poll still covers the change.
       }
     }
+    // Belt and braces: on this ROM a sticky restart sometimes delivers only the
+    // create transaction, leaving the start call pending in ActivityManager
+    // (`callStart=true`) and `onStartCommand` never running - the service then
+    // exists without a notification and without a core. Both calls are
+    // idempotent, so doing them here as well costs nothing when the normal path
+    // does run.
+    //
+    // Only the resident level hosts a core: at the `wake` level the service is
+    // merely the target of a one-shot network callback and must stop itself
+    // again, so a core there would defeat the level the user chose.
+    if (Wake.MODE_SERVICE.equals(Wake.mode(this))) {
+      startTheCore();
+    }
+  }
+
+  /**
+   * Become a foreground service and host the core.
+   *
+   * Called from both lifecycle entry points on purpose; see {@link #onCreate}.
+   */
+  private void startTheCore() {
+    // Every step is logged: a service-only start has no window, so this journal
+    // is the only place that can say whether `startCore` ran and what it said.
+    try {
+      Log.i(Wake.TAG, "keep-alive: startForeground");
+      startForeground(Wake.NOTIFICATION_ID, buildNotification());
+      Log.i(Wake.TAG, "keep-alive: startCore");
+      int ranked = Native.startCore(getFilesDir().getAbsolutePath());
+      Log.i(Wake.TAG, "keep-alive: startCore -> " + ranked);
+    } catch (Throwable error) {
+      Log.e(Wake.TAG, "keep-alive: start failed", error);
+    }
   }
 
   @Override
@@ -61,8 +94,10 @@ public class KeepAliveService extends Service {
       stopSelf();
       return START_NOT_STICKY;
     }
-    startForeground(Wake.NOTIFICATION_ID, buildNotification());
-    Native.startCore(getFilesDir().getAbsolutePath());
+    // Every step is logged while a service-only start is being diagnosed: the
+    // restart after a swipe has no window, so this journal is the only place
+    // that can say whether `startCore` ran and what it answered.
+    startTheCore();
     // The user asked for this to survive; a restart after a low-memory kill is
     // the point of the setting.
     return START_STICKY;
