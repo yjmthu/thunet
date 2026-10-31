@@ -1186,11 +1186,7 @@ impl App {
   /// Bounded ring buffer: the log keeps the newest lines only.
   fn push_log(&mut self, line: Line) {
     const MAX_LINES: usize = 500;
-    self.logs.push(line);
-    if self.logs.len() > MAX_LINES {
-      let drop = self.logs.len() - MAX_LINES;
-      self.logs.drain(..drop);
-    }
+    insert_log(&mut self.logs, line, MAX_LINES);
   }
 
   /// Every account name this window knows: the one it configured, the one the
@@ -3449,6 +3445,22 @@ fn core_version_uptime(ui: &mut egui::Ui, version: &str, uptime_secs: u64) {
   );
 }
 
+/// Insert a line where its timestamp belongs, keeping at most `cap` lines.
+///
+/// Lines normally arrive in order, so this is an append. A window that has just
+/// attached is the exception: it pushes its own startup lines first and only
+/// then drains the history the core logged before, and appending that history
+/// showed 14:40 lines *under* 14:42 ones. The pane is chronological, so an
+/// older line goes where it belongs.
+fn insert_log(logs: &mut Vec<Line>, line: Line, cap: usize) {
+  let at = logs.partition_point(|older| older.at <= line.at);
+  logs.insert(at, line);
+  if logs.len() > cap {
+    let drop = logs.len() - cap;
+    logs.drain(..drop);
+  }
+}
+
 /// The core row's status: "process running v0.1.5 ~1m", or why nothing
 /// answers. `running`/`gone` are the words for the same two states, which are
 /// "process" for a service and "thread" for a core hosted by its window.
@@ -5578,6 +5590,30 @@ mod tests {
       state_words(State::Authenticating, &LoginEnv::Campus, true, t),
       (t.authenticating, State::Authenticating)
     );
+  }
+
+  /// A window pushes its own startup lines before the core's history arrives;
+  /// the pane must still read chronologically.
+  #[test]
+  fn a_replayed_history_lands_where_its_timestamps_belong() {
+    let base = chrono::Local::now();
+    let at = |seconds: i64, msg: &str| Line {
+      at: base + chrono::Duration::seconds(seconds),
+      level: Level::Info,
+      msg: msg.to_string(),
+    };
+    let mut logs = Vec::new();
+    insert_log(&mut logs, at(120, "status ready"), 8);
+    insert_log(&mut logs, at(0, "core: listening"), 8);
+    insert_log(&mut logs, at(1, "login ok"), 8);
+    let order: Vec<&str> = logs.iter().map(|l| l.msg.as_str()).collect();
+    assert_eq!(order, ["core: listening", "login ok", "status ready"]);
+    // The cap still drops the oldest line, whichever end it arrived from.
+    for n in 2..11 {
+      insert_log(&mut logs, at(n, &format!("line {n}")), 8);
+    }
+    assert_eq!(logs.len(), 8);
+    assert_eq!(logs.first().unwrap().msg, "line 4");
   }
 }
 
