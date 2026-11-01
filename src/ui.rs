@@ -7165,6 +7165,16 @@ fn run_all(cfg: Config, minimized: bool, android_app: AndroidApp) -> Result<(), 
   let force_wgpu = std::env::var("THUNET_RENDERER")
     .map(|v| v.eq_ignore_ascii_case("wgpu"))
     .unwrap_or(false);
+  // Android ships one backend: EGL/glow is the only path a phone has, and wgpu
+  // is most of the `.so`'s size there. The desktop keeps both - glow first, and
+  // wgpu for the machines whose OpenGL is too old to start it (the winget
+  // validation VM is one, RDP sessions and old drivers are the others).
+  #[cfg(target_os = "android")]
+  let attempts: &[eframe::Renderer] = {
+    let _ = force_wgpu;
+    &[eframe::Renderer::Glow]
+  };
+  #[cfg(not(target_os = "android"))]
   let attempts: &[eframe::Renderer] = if force_wgpu {
     &[eframe::Renderer::Wgpu]
   } else {
@@ -7183,6 +7193,8 @@ fn run_all(cfg: Config, minimized: bool, android_app: AndroidApp) -> Result<(), 
 fn renderer_name(renderer: &eframe::Renderer) -> &'static str {
   match renderer {
     eframe::Renderer::Glow => "glow",
+    // The variant itself only exists where the backend is compiled in.
+    #[cfg(not(target_os = "android"))]
     eframe::Renderer::Wgpu => "wgpu",
   }
 }

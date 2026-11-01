@@ -36,7 +36,6 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 eframe = { version = "0.37.0", default-features = false, features = [
   "glow",
-  "wgpu",
   "default_fonts",
   "clipboard",
   # `Hyperlink` / `Context::open_url` only reach the browser through
@@ -77,8 +76,14 @@ inherits = "dev"
 [build-dependencies]
 winresource = "0.1"
 
-# The tray exists on every desktop; Android has no notification area.
+# The tray exists on every desktop, and so does the wgpu fallback renderer:
+# Android has neither (no notification area, and EGL/glow is its only path).
+#
+# The desktop keeps wgpu because the winget installation validation runs the exe
+# on a machine whose only OpenGL is 1.1, where `egui_glow` refuses to start
+# (commit 30c8e20); Android is glow only, and wgpu is most of the APK's `.so`.
 [target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu"] }
 tray-icon = "0.26.1"
 
 # `AndroidApp` comes from winit; the Android feature itself is enabled through
