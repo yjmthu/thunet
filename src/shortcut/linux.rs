@@ -45,11 +45,13 @@ fn desktop_dir() -> PathBuf {
 }
 
 /// Text-only icon so no PNG encoder (and no extra crate) is needed.
-const ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <circle cx="32" cy="32" r="26" fill="#2ea043"/>
-  <path d="M21 32h22M32 21v22" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
-</svg>
-"##;
+/// The packaged icon, embedded rather than typed again here.
+///
+/// A shortcut used to install a second, hand-written drawing (a circle with a
+/// plus) under the same icon name, and that user-level file shadowed the one
+/// the package put in `/usr/share/icons`: the desktop and the app grid showed
+/// the plus while the window, tray and Windows shortcut showed the "T".
+const ICON_SVG: &str = include_str!("../../assets/thunet.svg");
 
 fn make_executable(path: &Path) -> Result<(), String> {
   let mut perm = fs::metadata(path)
