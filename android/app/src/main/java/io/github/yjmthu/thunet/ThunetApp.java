@@ -2,10 +2,16 @@ package io.github.yjmthu.thunet;
 
 import android.app.Application;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.util.Log;
+
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 
 /**
  * Process-wide wiring: which link the app talks over, and the state the Rust
@@ -18,6 +24,8 @@ import android.util.Log;
 public class ThunetApp extends Application {
   /** The Wi-Fi network the process is bound to, if any. */
   private Network boundWifi;
+  /** Wi-Fi networks the system has lost and must not be named as a link again. */
+  private final java.util.Set<Network> lostWifi = new java.util.HashSet<>();
   private ConnectivityManager manager;
   private ConnectivityManager.NetworkCallback wifiCallback;
   private ConnectivityManager.NetworkCallback defaultCallback;
@@ -91,6 +99,7 @@ public class ThunetApp extends Application {
             @Override
             public void onAvailable(Network network) {
               Log.i(Wake.TAG, "link: wifi available " + network);
+              lostWifi.remove(network);
               manager.bindProcessToNetwork(network);
               boundWifi = network;
               refreshLink();
@@ -109,6 +118,12 @@ public class ThunetApp extends Application {
                 manager.bindProcessToNetwork(null);
                 boundWifi = null;
               }
+              // The active-network read below can still name this network, or
+              // an older one the system has not forgotten yet, for a while.
+              // Remember them all, so `refreshLink` writes the loss at once
+              // instead of keeping "wlan" - and the account and address that
+              // belong to it - on screen until the handover finishes.
+              lostWifi.add(network);
               refreshLink();
               // Not a single `arm()`: the system still lists the network that
               // just went away, so one attempt here usually reads "a wifi is
@@ -164,37 +179,81 @@ public class ThunetApp extends Application {
     // A binding the system no longer knows is not a link: drop it here too, so
     // a lost `onLost` cannot leave the row and the core describing a network
     // that is gone.
-    if (boundWifi != null && manager.getNetworkCapabilities(boundWifi) == null) {
+    if (boundWifi != null
+        && (lostWifi.contains(boundWifi)
+            || manager.getNetworkCapabilities(boundWifi) == null)) {
+      lostWifi.add(boundWifi);
       manager.bindProcessToNetwork(null);
       boundWifi = null;
     }
     if (boundWifi != null) {
-      write("wlan");
+      write("wlan", boundWifi);
       return;
     }
     Network active = manager.getActiveNetwork();
-    NetworkCapabilities caps = active == null ? null : manager.getNetworkCapabilities(active);
+    // A network the system has lost is no link, even if the active-network
+    // read still returns it for a moment: naming it would keep the old Link row
+    // on screen until the real handover finished.
+    NetworkCapabilities caps =
+        active == null || lostWifi.contains(active)
+            ? null
+            : manager.getNetworkCapabilities(active);
     if (caps == null) {
-      write("none");
+      write("none", null);
     } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-      write("wlan");
+      write("wlan", active);
     } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
-      write("ethernet");
+      write("ethernet", active);
+    } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_USB)) {
+      write("usb", active);
     } else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
       // The one link this app falls back to on a phone: named so the status
       // page says "mobile data" instead of the useless "other".
-      write("mobile");
+      write("mobile", active);
     } else {
-      write("other");
+      write("other", active);
     }
   }
 
-  private void write(String value) {
+  /**
+   * Write the link the process is using, with the addresses it holds on it.
+   *
+   * The core publishes these as one fact, so the transport and the address can
+   * never describe different networks; the old one-line format could keep
+   * "wlan" beside a mobile-data address while a handover was in progress. The
+   * log names only the transport: an address must not end up in a log that gets
+   * pasted into an issue.
+   */
+  private void write(String kind, Network network) {
+    String ip4 = "";
+    String ip6 = "";
+    LinkProperties props = network == null ? null : manager.getLinkProperties(network);
+    if (props != null) {
+      for (LinkAddress link : props.getLinkAddresses()) {
+        InetAddress address = link.getAddress();
+        if (address.isAnyLocalAddress()
+            || address.isLoopbackAddress()
+            || address.isLinkLocalAddress()) {
+          continue;
+        }
+        String text = address.getHostAddress();
+        int scope = text.indexOf('%');
+        if (scope >= 0) {
+          text = text.substring(0, scope);
+        }
+        if (address instanceof Inet4Address && ip4.isEmpty()) {
+          ip4 = text;
+        } else if (address instanceof Inet6Address && ip6.isEmpty()) {
+          ip6 = text;
+        }
+      }
+    }
     try {
       java.io.FileWriter writer =
           new java.io.FileWriter(new java.io.File(getFilesDir(), "link.txt"), false);
-      writer.write(value + "\n");
+      writer.write(kind + "\n" + ip4 + "\n" + ip6 + "\n");
       writer.close();
+      Log.i(Wake.TAG, "link: now " + kind);
     } catch (Throwable ignored) {
       // The Rust side then falls back to the route table.
     }

@@ -358,6 +358,7 @@ impl Hub {
 
 /// Anything with the same `send` shape as the `mpsc` sender the worker used
 /// before the split, so the session loop itself did not have to change.
+#[derive(Clone)]
 pub struct Sink(Hub);
 
 impl Sink {

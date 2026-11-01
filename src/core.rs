@@ -8,7 +8,9 @@
 //! boot (`thunet core` from a systemd system unit or the Windows service) with
 //! nobody logged in.
 
-use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::config::CoreConfig;
@@ -87,7 +89,7 @@ struct EnvProbe {
 
 /// Probe what the machine is attached to: the path to the internet, whether the
 /// campus portal is behind it, and whether the OS owns the session.
-fn probe_env(session: &Session) -> EnvProbe {
+fn probe_env(client: &crate::srun::Client, os_session: Option<String>) -> EnvProbe {
   // A route is not a link: the interface that carries it has to be up as well.
   // Without that, a driver that keeps an address on an adapter whose media went
   // away makes the window show a link that is not there.
@@ -98,13 +100,13 @@ fn probe_env(session: &Session) -> EnvProbe {
   // describes the phone's radio rather than the session. The link kind is not
   // consulted either: a tethered phone or a mobile link can carry a tunnel into
   // the campus just as well.
-  let net = session.net_env();
+  let net = client.net_env();
   // Only the branches that can still be the campus network need the portal. A
   // link the campus gateway redirects already carries the ac_id, and a foreign
   // portal is not ours to ask.
   let ask_portal = matches!(net, Probe::Direct | Probe::NothingAnswered);
   let view = if ask_portal {
-    session.portal_view()
+    client.portal_view()
   } else {
     None
   };
@@ -121,7 +123,7 @@ fn probe_env(session: &Session) -> EnvProbe {
     None
   };
   EnvProbe {
-    env: classify(net, view.as_ref(), connected, session.os_session()),
+    env: classify(net, view.as_ref(), connected, os_session.as_deref()),
     portal_note,
   }
 }
@@ -176,6 +178,38 @@ fn classify(
     internet,
     portal,
     os_session: os_session.map(str::to_owned),
+  }
+}
+
+/// How often a request in flight checks whether the link has moved.
+const REQUEST_LINK_TICK: Duration = Duration::from_millis(100);
+
+/// Run a portal request on its own thread and stop waiting for it when the link
+/// moves.
+///
+/// `ureq` has no way to cancel a call already on the wire, so the request
+/// finishes in the background and its answer is dropped: an answer from the
+/// link this machine has just left must not be applied to the new one. The
+/// caller gets `Err(())` and decides whether the new link needs another try.
+fn await_request<T: Send + 'static>(
+  link_gen: &AtomicU64,
+  request: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ()> {
+  let start = link_gen.load(Ordering::Acquire);
+  let (tx, rx) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    let _ = tx.send(request());
+  });
+  loop {
+    match rx.recv_timeout(REQUEST_LINK_TICK) {
+      Ok(value) => return Ok(value),
+      Err(RecvTimeoutError::Timeout) => {
+        if link_gen.load(Ordering::Acquire) != start {
+          return Err(());
+        }
+      }
+      Err(RecvTimeoutError::Disconnected) => return Err(()),
+    }
   }
 }
 
@@ -395,10 +429,12 @@ fn status_error_text(e: &(impl std::fmt::Display + ?Sized)) -> String {
 
 pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   let started = Instant::now();
-  // The window sends its language as soon as it attaches (`SetLang`); until
-  // then the core words its own messages in the OS language, which is what
-  // "auto" means for the window too.
-  let mut lang = Lang::from_setting("auto");
+  // The window's own setting when this process can see it: a portable core
+  // reads the same file as the window, so its first toast already speaks the
+  // language the page is drawn in. A machine core starts before any window and
+  // reads the service account's file (usually absent), which means "auto"; the
+  // window sends `SetLang` as soon as it attaches.
+  let mut lang = Lang::from_setting(&crate::config::Config::load().lang);
   // `load_machine` only fills `password` when `remember_password` is set and a
   // sealed blob could be opened, so this pair is exactly "the next start will
   // find a credential".
@@ -496,10 +532,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
     Option<std::net::IpAddr>,
   ) = ((None, None), None);
-  // The physical link last published to the window: kind plus the addresses on
-  // it. The window draws the Link and address rows from this and never reads
-  // the interface itself.
-  let mut last_link_state: Option<LinkState> = None;
+  // The last transport the loop acted on: a new one means the kept-alive
+  // sockets and the verdict belong to the link just left. The publication
+  // itself happens on the link thread below.
+  let mut last_link_kind: Option<LinkKind> = None;
+  // Bumped by the link thread on every published change. A request in flight
+  // compares it (see `await_request`) and is abandoned when the link moves.
+  let link_gen = Arc::new(AtomicU64::new(0));
   let mut force_env = true;
   // The last thing the log said about the portal evidence: one line per change,
   // not per probe.
@@ -510,6 +549,53 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   }
   tx.send(Ev::Log(Line::debug(format!("lang: start {lang:?}"))))
     .ok();
+
+  // The physical link is published from its own thread, not from this loop: a
+  // status poll or a probe can hold the loop for seconds, and the window must
+  // not keep showing the link it just left while it waits. `Sink` is the
+  // thread-safe hub handle, so the thread shares nothing with the loop below,
+  // which keeps only the consequences of a move (socket pool, verdict).
+  {
+    let link_tx = tx.clone();
+    let generation = link_gen.clone();
+    std::thread::spawn(move || {
+      let mut last: Option<LinkState> = None;
+      loop {
+        let kind = crate::srun::link_kind();
+        let id = if kind != LinkKind::None {
+          crate::srun::link_addrs()
+        } else {
+          (None, None)
+        };
+        let state = LinkState {
+          kind,
+          ip4: id.0,
+          ip6: id.1,
+        };
+        if last != Some(state) {
+          last = Some(state);
+          generation.fetch_add(1, Ordering::Release);
+          let families = match (state.ip4.is_some(), state.ip6.is_some()) {
+            (true, true) => "v4+v6",
+            (true, false) => "v4",
+            (false, true) => "v6",
+            (false, false) => "no address",
+          };
+          link_tx
+            .send(Ev::Log(Line::debug(format!(
+              "link: {:?} ({families})",
+              state.kind
+            ))))
+            .ok();
+          link_tx.send(Ev::Link(state)).ok();
+          // Keep the cached answer in step: a frontend that attaches later
+          // must not replay the account of the link just left.
+          link_tx.send(Ev::Info(serde_json::json!({}))).ok();
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+      }
+    });
+  }
 
   // All state news goes through here, because `last_state` is what the window
   // has actually been told. `refresh()` and `ensure_online()` change the state
@@ -538,14 +624,28 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // A manual connect is the user's intent whatever state the machine is
           // in, and it is what lifts a rejected password.
           want_online = true;
-          // Check the current state first so an existing session is not re-authenticated.
-          if session.is_online_now() {
-            if let Ok(v) = session.refresh() {
-              // This answer is a poll as much as the scheduled one: measure the
-              // next poll from here, or it lands right behind this one.
-              last_status = Instant::now();
-              tx.send(Ev::Info(v)).ok();
+          // Check the current state first so an existing session is not
+          // re-authenticated. The query runs off this loop, so a link change
+          // during it does not hold the loop for the request's timeout.
+          let client = session.client().clone();
+          let was_online = match await_request(&link_gen, move || client.status()) {
+            Ok(Ok(v)) => {
+              session.apply_status(&v);
+              if session.state == State::LoggedIn {
+                // This answer is a poll as much as the scheduled one: measure the
+                // next poll from here, or it lands right behind this one.
+                last_status = Instant::now();
+                tx.send(Ev::Info(v)).ok();
+                true
+              } else {
+                false
+              }
             }
+            // No answer, or the link moved: treat it like "not online" and let
+            // the connect attempt find out on the current link.
+            _ => false,
+          };
+          if was_online {
             send_state!();
             set_banner(&tx, &mut banner, None);
             tx.send(Ev::Log(Line::info("already online"))).ok();
@@ -596,41 +696,57 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             // online. This is the one place besides a rejected password that
             // drops the intent, so an offline machine still obeys the click.
             want_online = false;
-            if !session.is_online_now() {
-              if let Ok(v) = session.refresh() {
-                // Same as above: a fresh answer restarts the poll schedule.
-                last_status = Instant::now();
-                tx.send(Ev::Info(v)).ok();
+            let client = session.client().clone();
+            match await_request(&link_gen, move || client.status()) {
+              Ok(Ok(v)) => {
+                session.apply_status(&v);
+                if session.state == State::LoggedIn {
+                  match session.logout() {
+                    Ok(m) => {
+                      // The gateway starts intercepting again, so the link's verdict
+                      // changes with the session and must be re-derived.
+                      force_env = true;
+                      tx.send(Ev::Log(Line::info(format!("logout: {m}")))).ok();
+                      tx.send(Ev::Notify {
+                        msg: t.disconnected.into(),
+                        kind: ToastKind::Ok,
+                      })
+                      .ok();
+                    }
+                    Err(e) => {
+                      set_banner(&tx, &mut banner, Some(failure_of(t.disconnect_failed, &e)));
+                      tx.send(Ev::Notify {
+                        msg: t.disconnect_failed.into(),
+                        kind: ToastKind::Err,
+                      })
+                      .ok();
+                    }
+                  };
+                } else {
+                  // Same as above: a fresh answer restarts the poll schedule.
+                  last_status = Instant::now();
+                  tx.send(Ev::Info(v)).ok();
+                  send_state!();
+                  tx.send(Ev::Log(Line::info("not connected"))).ok();
+                  tx.send(Ev::Notify {
+                    msg: t.not_connected.into(),
+                    kind: ToastKind::Info,
+                  })
+                  .ok();
+                }
               }
-              send_state!();
-              tx.send(Ev::Log(Line::info("not connected"))).ok();
-              tx.send(Ev::Notify {
-                msg: t.not_connected.into(),
-                kind: ToastKind::Info,
-              })
-              .ok();
-            } else {
-              match session.logout() {
-                Ok(m) => {
-                  // The gateway starts intercepting again, so the link's verdict
-                  // changes with the session and must be re-derived.
-                  force_env = true;
-                  tx.send(Ev::Log(Line::info(format!("logout: {m}")))).ok();
-                  tx.send(Ev::Notify {
-                    msg: t.disconnected.into(),
-                    kind: ToastKind::Ok,
-                  })
-                  .ok();
-                }
-                Err(e) => {
-                  set_banner(&tx, &mut banner, Some(failure_of(t.disconnect_failed, &e)));
-                  tx.send(Ev::Notify {
-                    msg: t.disconnect_failed.into(),
-                    kind: ToastKind::Err,
-                  })
-                  .ok();
-                }
-              };
+              _ => {
+                // The portal did not answer (or the link moved under the
+                // query): as far as this click can tell, there is no session
+                // to end.
+                send_state!();
+                tx.send(Ev::Log(Line::info("not connected"))).ok();
+                tx.send(Ev::Notify {
+                  msg: t.not_connected.into(),
+                  kind: ToastKind::Info,
+                })
+                .ok();
+              }
             }
           }
         }
@@ -644,8 +760,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // and what the button is for is the verdict ("this is not the campus
           // network"), not a failed request.
           if last_env.polls_portal(session.state) {
-            match session.refresh() {
-              Ok(v) => {
+            let client = session.client().clone();
+            match await_request(&link_gen, move || client.status()) {
+              Ok(Ok(v)) => {
+                session.apply_status(&v);
                 refresh_failures = 0;
                 // The scheduled poll measures from the last answer, and this is
                 // one: without this the next poll kept its old phase, so a manual
@@ -681,7 +799,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                   .ok();
                 }
               }
-              Err(e) => {
+              Ok(Err(e)) => {
                 refresh_failures = refresh_failures.saturating_add(1);
                 // The wording waits for the probe in this pass: the old verdict
                 // can still name a link the machine has already left (a phone
@@ -689,6 +807,22 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                 // until something asks), and "refresh failed" is only true
                 // where the portal turned out to be on the link.
                 pending_refresh = Some((quiet, e));
+              }
+              Err(()) => {
+                // The link moved under the query. The page already describes
+                // the new link (the link thread cleared the rows); the click
+                // gets the same answer as a refresh on a link without a portal.
+                refresh_failures = 0;
+                last_status = Instant::now();
+                if !quiet {
+                  tx.send(Ev::Log(Line::debug("status refreshed: the link changed")))
+                    .ok();
+                  tx.send(Ev::Notify {
+                    msg: t.status_refreshed.into(),
+                    kind: ToastKind::Info,
+                  })
+                  .ok();
+                }
               }
             }
           } else {
@@ -1129,23 +1263,11 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           force_env = true;
         }
       }
-      // The physical link and its addresses go to the window from here: it must
-      // not read the interface itself, or its Link row could move a beat before
-      // the account and address the core clears with it. All three rows then
-      // move on this one event.
-      let link_state = LinkState {
-        kind,
-        ip4: id.0,
-        ip6: id.1,
-      };
-      if last_link_state != Some(link_state) {
-        last_link_state = Some(link_state);
-        tx.send(Ev::Link(link_state)).ok();
-        // The portal rows belonged to the link just left: blank the cached
-        // answer so a late frontend does not replay the old account, and let
-        // the window clear the page and restart its heartbeat on the same
-        // event.
-        tx.send(Ev::Info(serde_json::json!({}))).ok();
+      // The link facts themselves are published by the thread above; here only
+      // their consequences for this loop. The path block below covers a changed
+      // address; this covers a changed transport.
+      if last_link_kind != Some(kind) {
+        last_link_kind = Some(kind);
         session.reset_pool();
         force_env = true;
       }
@@ -1205,64 +1327,77 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     // There is no timer: a verdict nobody changed cannot change by itself.
     if force_env {
       force_env = false;
-      let probe = probe_env(&session);
-      let env = probe.env;
-      // The portal's address is what the link watch compares a route to, so it
-      // is resolved here, once per probe, and kept when the name does not answer
-      // (a hotspot whose DNS is not up yet, a link that filters it).
-      if let Some(addr) = crate::srun::resolve_host(&session.cfg().host)
-        && portal_addr != Some(addr)
-      {
-        portal_addr = Some(addr);
-        let route = crate::srun::route_source(std::net::SocketAddr::new(addr, 443));
-        if route != portal_route {
-          portal_route = route;
-          // The path the portal is reached on is what its rows belong to; the
-          // probe can move that path too, not only the link watch.
-          if info_path.1 != route {
-            info_path.1 = route;
-            tx.send(Ev::Info(serde_json::json!({}))).ok();
-            session.reset_pool();
+      let client = session.client().clone();
+      let os_session = session.os_session().map(str::to_owned);
+      let host = session.cfg().host.clone();
+      let probe = await_request(&link_gen, move || {
+        let probe = probe_env(&client, os_session);
+        let addr = crate::srun::resolve_host(&host);
+        let route = addr.and_then(|a| crate::srun::route_source(std::net::SocketAddr::new(a, 443)));
+        (probe, addr, route)
+      });
+      if let Ok((probe, addr, route)) = probe {
+        let env = probe.env;
+        // The portal's address is what the link watch compares a route to, so it
+        // is resolved here, once per probe, and kept when the name does not answer
+        // (a hotspot whose DNS is not up yet, a link that filters it).
+        if let Some(addr) = addr
+          && portal_addr != Some(addr)
+        {
+          portal_addr = Some(addr);
+          if route != portal_route {
+            portal_route = route;
+            // The path the portal is reached on is what its rows belong to; the
+            // probe can move that path too, not only the link watch.
+            if info_path.1 != route {
+              info_path.1 = route;
+              tx.send(Ev::Info(serde_json::json!({}))).ok();
+              session.reset_pool();
+            }
           }
         }
-      }
-      if let Portal::Ours { ac_id: Some(ac_id) } = &env.portal {
-        session.set_ac_id(ac_id.clone());
-      }
-      if let Some(note) = &probe.portal_note
-        && last_portal_note.as_ref() != Some(note)
-      {
-        tx.send(Ev::Log(Line::debug(note.clone()))).ok();
-        last_portal_note = probe.portal_note;
-      }
-      // The verdict changed (no link → campus, or back), so decide again in this
-      // pass instead of sitting out a backoff chosen for the old one.
-      if env != last_env {
-        tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
-          .ok();
-        next_attempt = Instant::now();
-        failures = 0;
-        last_failure.clear();
-      }
-      // Only a link that carries our portal has a session row to wait for. A
-      // change to one restarts the catch-up; any other verdict ends it instead
-      // of asking a portal that will never answer.
-      if env.portal_answers() {
-        if env != last_env {
-          catchup_polls = LINK_CATCHUP_POLLS;
+        if let Portal::Ours { ac_id: Some(ac_id) } = &env.portal {
+          session.set_ac_id(ac_id.clone());
         }
+        if let Some(note) = &probe.portal_note
+          && last_portal_note.as_ref() != Some(note)
+        {
+          tx.send(Ev::Log(Line::debug(note.clone()))).ok();
+          last_portal_note = probe.portal_note;
+        }
+        // The verdict changed (no link → campus, or back), so decide again in this
+        // pass instead of sitting out a backoff chosen for the old one.
+        if env != last_env {
+          tx.send(Ev::Log(Line::debug(format!("network: {env:?}"))))
+            .ok();
+          next_attempt = Instant::now();
+          failures = 0;
+          last_failure.clear();
+        }
+        // Only a link that carries our portal has a session row to wait for. A
+        // change to one restarts the catch-up; any other verdict ends it instead
+        // of asking a portal that will never answer.
+        if env.portal_answers() {
+          if env != last_env {
+            catchup_polls = LINK_CATCHUP_POLLS;
+          }
+        } else {
+          catchup_polls = 0;
+        }
+        // A red band about reaching the portal cannot outlive the link it was
+        // measured on. Once the verdict says the portal is not here, the band and
+        // the verdict below it state the same fact in opposite tones; a rejection
+        // is about the account rather than the link, so it stays.
+        if !env.portal_answers() && matches!(banner, Some(Failure::Network(_))) {
+          set_banner(&tx, &mut banner, None);
+        }
+        last_env = env.clone();
+        tx.send(Ev::Env(env)).ok();
       } else {
-        catchup_polls = 0;
+        // The link moved while the probe was in flight; its verdict describes
+        // the network this machine has left. Ask again on the next pass.
+        force_env = true;
       }
-      // A red band about reaching the portal cannot outlive the link it was
-      // measured on. Once the verdict says the portal is not here, the band and
-      // the verdict below it state the same fact in opposite tones; a rejection
-      // is about the account rather than the link, so it stays.
-      if !env.portal_answers() && matches!(banner, Some(Failure::Network(_))) {
-        set_banner(&tx, &mut banner, None);
-      }
-      last_env = env.clone();
-      tx.send(Ev::Env(env)).ok();
     }
 
     // Answer a manual refresh now that the verdict has been re-derived: a
@@ -1350,10 +1485,14 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // the portal is not gating (a VPN's egress, a router already signed in).
         // A login here would authenticate that shared address for everybody
         // behind it, so one answer is all this gets.
-        let online = session
-          .refresh()
-          .map(|_| session.state)
-          .unwrap_or(State::Unknown);
+        let client = session.client().clone();
+        let online = match await_request(&link_gen, move || client.status()) {
+          Ok(Ok(v)) => {
+            session.apply_status(&v);
+            session.state
+          }
+          _ => State::Unknown,
+        };
         if online != State::LoggedIn {
           skip = Some((
             t.no_login_needed.to_string(),
@@ -1384,6 +1523,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       drain_warnings(&tx, &mut session);
       match outcome {
         Ok(m) => {
+          // A click is what a toast answers. An automatic attempt is not news,
+          // and at startup it would flash in the OS language before the window
+          // has sent its own.
+          let answered = user_connect;
           failures = 0;
           last_failure.clear();
           user_connect = false;
@@ -1401,11 +1544,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // ended the shared session. The poll below is that answer.
           force_status = true;
           tx.send(Ev::Log(Line::info(m))).ok();
-          tx.send(Ev::Notify {
-            msg: t.connect_ok.into(),
-            kind: ToastKind::Ok,
-          })
-          .ok();
+          if answered {
+            tx.send(Ev::Notify {
+              msg: t.connect_ok.into(),
+              kind: ToastKind::Ok,
+            })
+            .ok();
+          }
         }
         Err(e) => {
           failures = failures.saturating_add(1);
@@ -1434,6 +1579,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             Duration::from_secs_f64(backoff.min(120.0))
           };
           next_attempt = Instant::now() + next_retry;
+          let answered = user_connect;
           user_connect = false;
           // A credential rejection carries a long JSON blob that only helps
           // when debugging, so it goes to the log pane while the red banner
@@ -1477,7 +1623,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           let detail = e.to_string();
           if detail != last_failure {
             last_failure = detail;
-            if !bad_credentials && !ac_unreachable {
+            if answered && !bad_credentials && !ac_unreachable {
               tx.send(Ev::Notify {
                 msg: t.connect_failed.into(),
                 kind: ToastKind::Err,
@@ -1506,98 +1652,107 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     if poll_due {
       if last_env.polls_portal(session.state) {
         force_status = false;
-        let answer = session.client().status();
-        match &answer {
-          Ok(v) => {
-            status_failures = 0;
-            last_status_log = None;
-            // The answer names the service behind the session; when that changes,
-            // the verdict that quotes it ("the OS owns this session") is stale.
-            if session.note_session_service(v) {
-              force_env = true;
+        let client = session.client().clone();
+        if let Ok(answer) = await_request(&link_gen, move || client.status()) {
+          match &answer {
+            Ok(v) => {
+              status_failures = 0;
+              last_status_log = None;
+              // The answer names the service behind the session; when that changes,
+              // the verdict that quotes it ("the OS owns this session") is stale.
+              if session.note_session_service(v) {
+                force_env = true;
+              }
             }
-          }
-          Err(e) => {
-            // The portal did not answer at all: no route, a dead link, or a host
-            // that stopped responding. While the machine sits on such a link
-            // every poll fails the same way, so a message is logged once and then
-            // only again when it changes or STATUS_LOG_REPEAT has passed.
-            let text = status_error_text(e);
-            let repeat_due = match &last_status_log {
-              Some((last, at)) => last != &text || at.elapsed() >= STATUS_LOG_REPEAT,
-              None => true,
-            };
-            if repeat_due {
-              tx.send(Ev::Log(Line::debug(text.clone()))).ok();
-              last_status_log = Some((text, Instant::now()));
-            }
-            if session.state == State::LoggedIn {
-              status_failures = status_failures.saturating_add(1);
-              if status_failures >= STATUS_FAILURES {
-                // Not "logged out": the portal never answered, so whether a
-                // session exists is unknown. Claiming one or the other is how the
-                // window ended up saying "offline" on a link that was working.
-                session.state = State::Unknown;
-                tx.send(Ev::Log(Line::warn("portal not answering, no answer yet")))
-                  .ok();
-                tx.send(Ev::Info(serde_json::json!({}))).ok();
+            Err(e) => {
+              // The portal did not answer at all: no route, a dead link, or a host
+              // that stopped responding. While the machine sits on such a link
+              // every poll fails the same way, so a message is logged once and then
+              // only again when it changes or STATUS_LOG_REPEAT has passed.
+              let text = status_error_text(e);
+              let repeat_due = match &last_status_log {
+                Some((last, at)) => last != &text || at.elapsed() >= STATUS_LOG_REPEAT,
+                None => true,
+              };
+              if repeat_due {
+                tx.send(Ev::Log(Line::debug(text.clone()))).ok();
+                last_status_log = Some((text, Instant::now()));
+              }
+              if session.state == State::LoggedIn {
+                status_failures = status_failures.saturating_add(1);
+                if status_failures >= STATUS_FAILURES {
+                  // Not "logged out": the portal never answered, so whether a
+                  // session exists is unknown. Claiming one or the other is how the
+                  // window ended up saying "offline" on a link that was working.
+                  session.state = State::Unknown;
+                  tx.send(Ev::Log(Line::warn("portal not answering, no answer yet")))
+                    .ok();
+                  tx.send(Ev::Info(serde_json::json!({}))).ok();
+                }
               }
             }
           }
-        }
-        // An answer that names a session ends the catch-up; a missing one spends
-        // one of the owed polls and then falls back to the normal cadence.
-        if catchup_polls > 0 {
-          let online = answer
-            .as_ref()
-            .is_ok_and(|v| v.get("online").and_then(|b| b.as_bool()).unwrap_or(false));
-          catchup_polls = if online { 0 } else { catchup_polls - 1 };
-        }
-        if let Ok(v) = answer {
-          // An answer proves the portal is reachable, so a band about failing to
-          // reach it is out of date. The scheduled poll counts as proof, not just
-          // a manual refresh: without this a single outage left the band up until
-          // somebody pressed *Refresh* again.
-          if matches!(banner, Some(Failure::Network(_))) {
-            set_banner(&tx, &mut banner, None);
+          // An answer that names a session ends the catch-up; a missing one spends
+          // one of the owed polls and then falls back to the normal cadence.
+          if catchup_polls > 0 {
+            let online = answer
+              .as_ref()
+              .is_ok_and(|v| v.get("online").and_then(|b| b.as_bool()).unwrap_or(false));
+            catchup_polls = if online { 0 } else { catchup_polls - 1 };
           }
-          // The portal just answered on this link, so a verdict that says it is
-          // not behind the link cannot still be true. One failed request during a
-          // network change is enough to produce one, and while the session is up
-          // the probe timer never runs - which left the portal verbs greyed out
-          // until the link changed again. Ask again right away.
-          if !last_env.portal_answers() {
-            force_env = true;
+          if let Ok(v) = answer {
+            // An answer proves the portal is reachable, so a band about failing to
+            // reach it is out of date. The scheduled poll counts as proof, not just
+            // a manual refresh: without this a single outage left the band up until
+            // somebody pressed *Refresh* again.
+            if matches!(banner, Some(Failure::Network(_))) {
+              set_banner(&tx, &mut banner, None);
+            }
+            // The portal just answered on this link, so a verdict that says it is
+            // not behind the link cannot still be true. One failed request during a
+            // network change is enough to produce one, and while the session is up
+            // the probe timer never runs - which left the portal verbs greyed out
+            // until the link changed again. Ask again right away.
+            if !last_env.portal_answers() {
+              force_env = true;
+            }
+            let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
+            if online && session.state != State::LoggedIn {
+              session.state = State::LoggedIn;
+              failures = 0;
+              // Being online is what the connect window was for: it is done. A
+              // session found here may have been opened elsewhere, which is still
+              // "online" as far as the machine is concerned.
+              connect_budget = Duration::ZERO;
+              set_banner(&tx, &mut banner, None);
+              tx.send(Ev::Log(Line::info("already online"))).ok();
+            } else if !online && session.state == State::LoggedIn {
+              // Session ended outside our control (timeout / kicked / unplugged).
+              session.state = State::LoggedOut;
+              tx.send(Ev::Log(Line::warn("session ended, logged out")))
+                .ok();
+            } else if online
+              && matches!(
+                banner.as_ref(),
+                Some(Failure::Credentials | Failure::AcUnreachable)
+              )
+            {
+              // A credential banner is only true while the machine cannot sign in.
+              // This session proves the stored pair works, so drop it even though
+              // the state did not change: that is the case after a refused switch
+              // that signed the previous account back in. The same goes for the
+              // "already online" notice - this session *is* the account's session.
+              set_banner(&tx, &mut banner, None);
+            }
+            tx.send(Ev::Info(v)).ok();
           }
-          let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
-          if online && session.state != State::LoggedIn {
-            session.state = State::LoggedIn;
-            failures = 0;
-            // Being online is what the connect window was for: it is done. A
-            // session found here may have been opened elsewhere, which is still
-            // "online" as far as the machine is concerned.
-            connect_budget = Duration::ZERO;
-            set_banner(&tx, &mut banner, None);
-            tx.send(Ev::Log(Line::info("already online"))).ok();
-          } else if !online && session.state == State::LoggedIn {
-            // Session ended outside our control (timeout / kicked / unplugged).
-            session.state = State::LoggedOut;
-            tx.send(Ev::Log(Line::warn("session ended, logged out")))
-              .ok();
-          } else if online
-            && matches!(
-              banner.as_ref(),
-              Some(Failure::Credentials | Failure::AcUnreachable)
-            )
-          {
-            // A credential banner is only true while the machine cannot sign in.
-            // This session proves the stored pair works, so drop it even though
-            // the state did not change: that is the case after a refused switch
-            // that signed the previous account back in. The same goes for the
-            // "already online" notice - this session *is* the account's session.
-            set_banner(&tx, &mut banner, None);
-          }
-          tx.send(Ev::Info(v)).ok();
+        } else {
+          // The link moved while the poll was in flight; its answer would
+          // describe the network this machine has left. The new link asks again
+          // on the next pass.
+          tx.send(Ev::Log(Line::debug("status: dropped, the link changed")))
+            .ok();
+          force_status = true;
         }
       } else {
         // A forced poll is spent here as well, and a catch-up owed to a link
@@ -1762,6 +1917,32 @@ mod tests {
     assert_eq!(
       status_error_text("io: timeout: global"),
       "status: io: timeout: global"
+    );
+  }
+
+  #[test]
+  fn a_finished_request_comes_back() {
+    let link_gen = AtomicU64::new(0);
+    assert_eq!(await_request(&link_gen, || 7u32), Ok(7));
+  }
+
+  #[test]
+  fn a_request_is_abandoned_when_the_link_moves() {
+    let link_gen = Arc::new(AtomicU64::new(0));
+    let bumper = link_gen.clone();
+    std::thread::spawn(move || {
+      std::thread::sleep(Duration::from_millis(150));
+      bumper.fetch_add(1, Ordering::Release);
+    });
+    let started = Instant::now();
+    let result = await_request(&link_gen, || {
+      std::thread::sleep(Duration::from_secs(2));
+      7u32
+    });
+    assert_eq!(result, Err(()), "the answer belongs to the old link");
+    assert!(
+      started.elapsed() < Duration::from_secs(1),
+      "the waiter must not wait out the request"
     );
   }
 }

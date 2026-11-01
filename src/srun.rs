@@ -155,7 +155,7 @@ fn looks_unresolved(text: &str) -> bool {
   .any(|needle| text.contains(needle))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
   host: String,
   https: bool,
@@ -1007,8 +1007,56 @@ pub fn link_up() -> bool {
 /// changes the first, and a v6-only network has only the second. Watching the
 /// pair is what lets the link watch notice a move on a network that has no
 /// IPv4 at all.
+///
+/// On Android the Activity writes the transport and the addresses it holds in
+/// one file (`files/link.txt`); that is the same answer the Link row shows, so
+/// the two can never describe different networks. The route lookup is only the
+/// fallback for a file this build cannot read.
 pub fn link_addrs() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+  #[cfg(target_os = "android")]
+  if let Some((_, ip4, ip6)) = android_link() {
+    return (ip4, ip6);
+  }
   (link_id(), link_id6().map(std::net::IpAddr::V6))
+}
+
+/// Parse `files/link.txt`, written by the Android Activity.
+///
+/// The first line is the transport, the next two are the addresses on it (empty
+/// when absent). `None` for a file this build does not understand, so the
+/// caller can fall back to the route table.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn parse_link_file(
+  text: &str,
+) -> Option<(
+  crate::proto::LinkKind,
+  Option<std::net::IpAddr>,
+  Option<std::net::IpAddr>,
+)> {
+  use crate::proto::LinkKind;
+  let mut lines = text.lines();
+  let kind = match lines.next()?.trim() {
+    "wlan" => LinkKind::Wlan,
+    "ethernet" => LinkKind::Ethernet,
+    "mobile" => LinkKind::Mobile,
+    "usb" => LinkKind::Usb,
+    "other" => LinkKind::Other,
+    "none" => LinkKind::None,
+    _ => return None,
+  };
+  let parse = |line: Option<&str>| line.and_then(|s| s.trim().parse().ok());
+  Some((kind, parse(lines.next()), parse(lines.next())))
+}
+
+/// The link the Activity last wrote, if the file is readable and understood.
+#[cfg(target_os = "android")]
+fn android_link() -> Option<(
+  crate::proto::LinkKind,
+  Option<std::net::IpAddr>,
+  Option<std::net::IpAddr>,
+)> {
+  let text = std::fs::read_to_string(crate::config::dir().join("link.txt")).ok()?;
+  parse_link_file(&text)
 }
 
 /// The IPv6 counterpart of [`link_id`].
@@ -1402,35 +1450,19 @@ mod link_imp {
 }
 
 /// Android: a `NativeActivity` cannot reach `ConnectivityManager` without JNI,
-/// so the Activity answers the question and writes the transport behind the
-/// default network to `files/link.txt`. Reading a five-byte file is cheaper
-/// than a JNI call and keeps the core free of a Java dependency.
+/// so the Activity answers the question and writes the transport and the
+/// addresses it holds to `files/link.txt`. Reading that file is cheaper than a
+/// JNI call and keeps the core free of a Java dependency.
 #[cfg(target_os = "android")]
 mod link_imp {
   use crate::proto::LinkKind;
 
   pub fn link_kind() -> LinkKind {
-    // The Activity's file names a transport, not a route: with mobile data off
-    // and no Wi-Fi it can still say "wlan". No route, no link.
-    if !crate::srun::link_up() {
-      return LinkKind::None;
-    }
-    let path = crate::config::dir().join("link.txt");
-    match std::fs::read_to_string(path) {
-      Ok(text) => match text.trim() {
-        "wlan" => LinkKind::Wlan,
-        "ethernet" => LinkKind::Ethernet,
-        "mobile" => LinkKind::Mobile,
-        "usb" => LinkKind::Usb,
-        "other" => LinkKind::Other,
-        "none" => LinkKind::None,
-        // A word this build does not know: fall through to the route check
-        // rather than claim there is no link.
-        _ => fallback(),
-      },
+    match super::android_link() {
+      Some((kind, _, _)) => kind,
       // Before the first write (the Activity registers its callback while the
       // core is already probing) the route table still answers.
-      Err(_) => fallback(),
+      None => fallback(),
     }
   }
 
@@ -1882,5 +1914,28 @@ mod tests {
     assert_eq!(expanded_device_detail(&Value::String("n/a".into())), None);
     assert_eq!(expanded_device_detail(&Value::String("[1,2]".into())), None);
     assert_eq!(expanded_device_detail(&json!({ "a": 1 })), None);
+  }
+
+  /// The Activity's link file carries the transport and the addresses on it, so
+  /// the core can publish them as one fact.
+  #[test]
+  fn the_activity_link_file_carries_the_addresses() {
+    let (kind, ip4, ip6) = parse_link_file("wlan\n192.0.2.10\n2001:db8::7\n").unwrap();
+    assert_eq!(kind, crate::proto::LinkKind::Wlan);
+    assert_eq!(ip4.map(|ip| ip.to_string()).as_deref(), Some("192.0.2.10"));
+    assert_eq!(ip6.map(|ip| ip.to_string()).as_deref(), Some("2001:db8::7"));
+
+    let (kind, ip4, ip6) = parse_link_file("none\n\n\n").unwrap();
+    assert_eq!(kind, crate::proto::LinkKind::None);
+    assert!(ip4.is_none() && ip6.is_none());
+
+    // A one-line file from before the addresses were added still names the
+    // transport.
+    let (kind, ip4, ip6) = parse_link_file("mobile\n").unwrap();
+    assert_eq!(kind, crate::proto::LinkKind::Mobile);
+    assert!(ip4.is_none() && ip6.is_none());
+
+    assert!(parse_link_file("garbage\n").is_none());
+    assert!(parse_link_file("").is_none());
   }
 }

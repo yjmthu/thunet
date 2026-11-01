@@ -153,7 +153,16 @@ impl Session {
   /// Query the portal and sync the local state with reality.
   pub fn refresh(&mut self) -> Result<serde_json::Value, NetError> {
     let v = self.client.status()?;
-    self.note_session_service(&v);
+    self.apply_status(&v);
+    Ok(v)
+  }
+
+  /// Apply one portal answer to the local state, without asking the portal.
+  ///
+  /// The query itself runs off the core's loop (see `core::await_request`), and
+  /// this is the half that must stay on it.
+  pub fn apply_status(&mut self, v: &serde_json::Value) {
+    self.note_session_service(v);
     let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
     self.state = if online {
       State::LoggedIn
@@ -163,7 +172,6 @@ impl Session {
     if online {
       self.failures = 0;
     }
-    Ok(v)
   }
 
   /// The service the portal named for this address's session, when it is the
