@@ -573,6 +573,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           ip6: id.1,
         };
         if last != Some(state) {
+          // The transport is what the account and the heartbeat hang on; a
+          // changed address on the same one is a DHCP renew, a roam to the
+          // same network or an IPv6 privacy address, and it must not look like
+          // a new link. Every address change is still published, because it is
+          // what the IP row shows, and it still abandons the requests that
+          // were sent from the address that is gone.
+          let moved = last.is_none_or(|l| l.kind != kind);
           last = Some(state);
           generation.fetch_add(1, Ordering::Release);
           let families = match (state.ip4.is_some(), state.ip6.is_some()) {
@@ -588,9 +595,11 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             ))))
             .ok();
           link_tx.send(Ev::Link(state)).ok();
-          // Keep the cached answer in step: a frontend that attaches later
-          // must not replay the account of the link just left.
-          link_tx.send(Ev::Info(serde_json::json!({}))).ok();
+          if moved {
+            // Keep the cached answer in step: a frontend that attaches later
+            // must not replay the account of the link just left.
+            link_tx.send(Ev::Info(serde_json::json!({}))).ok();
+          }
         }
         std::thread::sleep(Duration::from_millis(1000));
       }
