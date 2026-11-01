@@ -253,8 +253,19 @@ impl Client {
   }
 
   fn agents(timeout: Duration) -> (ureq::Agent, ureq::Agent) {
+    // The portal session belongs to one address, and `rad_user_info` without
+    // `ip` answers about the *source* of the request. `auth.tsinghua.edu.cn`
+    // publishes an AAAA as well as an A, so a dual-stack machine would send
+    // that request over IPv6, get `not_online_error` for an IPv6 address with
+    // no session, and show an empty account while the IPv4 address was online
+    // (with `internet: true` from the IPv6 probes, the core would not even
+    // sign back in). The srun session is an IPv4 one - `auth4` has no AAAA and
+    // the login's `ip` parameter is IPv4 - so talk to the portal over IPv4
+    // whenever there is an IPv4 route, and over IPv6 only on a v6-only link.
+    let family = portal_family();
     let agent = |t: Duration| -> ureq::Agent {
       ureq::Agent::config_builder()
+        .ip_family(family)
         .timeout_global(Some(t))
         .build()
         .into()
@@ -319,6 +330,9 @@ impl Client {
     let v4 = link_id().is_some();
     let probes = if v4 { PROBES_V4 } else { PROBES_V6 };
     let agent: ureq::Agent = ureq::Agent::config_builder()
+      // The same family the portal is judged in: an open IPv6 path must not
+      // make an intercepted IPv4 path look like a link that already routes.
+      .ip_family(portal_family())
       .timeout_global(Some(Duration::from_secs(2)))
       .build()
       .into();
@@ -980,6 +994,20 @@ pub fn link_id() -> Option<std::net::IpAddr> {
   let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
   socket.connect("223.5.5.5:53").ok()?;
   socket.local_addr().ok().map(|a| a.ip())
+}
+
+/// Which family the portal's requests travel over.
+///
+/// IPv4 whenever there is an IPv4 route, IPv6 only on a v6-only link. The srun
+/// session is an IPv4 one (see [`Client::agents`]), so a dual-stack machine must
+/// not ask `rad_user_info` over IPv6: the portal answers for that IPv6 address,
+/// which has no session, and the account row stays empty while IPv4 is online.
+fn portal_family() -> ureq::config::IpFamily {
+  if link_id().is_some() {
+    ureq::config::IpFamily::Ipv4Only
+  } else {
+    ureq::config::IpFamily::Ipv6Only
+  }
 }
 
 /// Is there a link to send on: a route whose interface reports itself up.
