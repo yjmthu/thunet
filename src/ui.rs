@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
-use crate::core::{POLL_OFFLINE, POLL_ONLINE};
+use crate::core::{POLL_OFFLINE, POLL_ONLINE, polls_portal};
 use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
@@ -2036,7 +2036,15 @@ impl App {
             );
             ui.label(egui::RichText::new(label).size(18.0).strong());
             ui.add_space(6.0);
-            status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
+            // The core skips the poll where the portal cannot answer, so there
+            // is no beat to draw: the track stays quiet instead of turning
+            // amber for a beat that is not late but cancelled.
+            let beat = if polls_portal(self.state, &self.env) {
+              self.last_heartbeat
+            } else {
+              None
+            };
+            status_track(ui, self.state, beat, self.turtle.as_ref(), t);
           } else {
             // The same gear as the button that opened this page, so the two
             // read as the same place.

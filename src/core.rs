@@ -96,6 +96,32 @@ fn portal_verbs(env: &LoginEnv) -> bool {
   !matches!(env, LoginEnv::EnterpriseWifi(_))
 }
 
+/// The campus portal is not reachable from this link at all: `OtherNetwork`
+/// (asked on this link, and it stayed silent) or `NoNetwork` (no route to ask
+/// on).
+///
+/// A request to the portal from such a link is expected to fail, and the window
+/// already draws the verdict as its own band, so a red "the connection timed
+/// out" above it would be the same fact in the opposite tone.
+fn portal_absent(env: &LoginEnv) -> bool {
+  matches!(env, LoginEnv::OtherNetwork | LoginEnv::NoNetwork)
+}
+
+/// Is a status poll of the portal worth making, in this state, on this verdict?
+///
+/// `OtherNetwork` is the verdict the probe reaches after the portal was asked on
+/// this link and did not answer, so polling again is a guaranteed timeout whose
+/// answer is already known. `NoNetwork` keeps its poll: a poll that *succeeds* is
+/// how one failed probe during a link change stops miscalling the link, and that
+/// correction is the reason the poll block below re-probes on a good answer.
+///
+/// A session that is up keeps its poll as well. While online the timer that
+/// re-probes the network is off, so there the poll is the only thing that would
+/// notice a machine that moved somewhere the portal does answer.
+pub(crate) fn polls_portal(state: State, env: &LoginEnv) -> bool {
+  state == State::LoggedIn || !matches!(env, LoginEnv::OtherNetwork)
+}
+
 /// One network probe.
 struct EnvProbe {
   env: LoginEnv,
@@ -704,9 +730,11 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             // a band, so the log keeps it. One failed refresh is not news for
             // the page either - the next one clears it - so only a failure that
             // repeats raises the banner; the toast answers the button press.
+            // A link the portal is not on has nothing to report: there the
+            // verdict band already says the portal is not reachable here.
             tx.send(Ev::Log(Line::warn(format!("refresh failed: {e}"))))
               .ok();
-            if refresh_failures >= 2 {
+            if refresh_failures >= 2 && !portal_absent(&last_env) {
               set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
             }
             if !quiet {
@@ -1236,6 +1264,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       } else {
         catchup_polls = 0;
       }
+      // A red band about reaching the portal cannot outlive the link it was
+      // measured on. Once the verdict says the portal is not reachable here, the
+      // band and the verdict below it state the same fact in opposite tones; a
+      // rejection is about the account rather than the link, so it stays.
+      if portal_absent(&env) && matches!(banner, Some(Failure::Network(_))) {
+        set_banner(&tx, &mut banner, None);
+      }
       last_env = env.clone();
       tx.send(Ev::Env(env)).ok();
     }
@@ -1432,14 +1467,18 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
 
     // Poll the portal on the period, plus the catch-up owed to a link that just
     // came up. `last_status` is the last actual poll, so a forced one in this
-    // pass already restarts the gap.
+    // pass already restarts the gap. A poll is only made where the portal can
+    // answer (see `polls_portal`): on a hotspot or a home network every beat was
+    // a three-second timeout whose failure the verdict already explains, and
+    // nothing it found could change the page.
     let catchup_due = catchup_polls > 0 && last_status.elapsed() >= LINK_CATCHUP_STEP;
     let poll_every = if session.state == State::LoggedIn {
       POLL_ONLINE
     } else {
       POLL_OFFLINE
     };
-    if force_status || catchup_due || last_status.elapsed() >= poll_every {
+    let poll_due = force_status || catchup_due || last_status.elapsed() >= poll_every;
+    if poll_due && polls_portal(session.state, &last_env) {
       force_status = false;
       let answer = session.client().status(&session.cfg().ac_id);
       match &answer {
@@ -1562,6 +1601,42 @@ mod tests {
     assert!(!portal_verbs(&LoginEnv::EnterpriseWifi(
       "Tsinghua-Secure 2".into()
     )));
+  }
+
+  /// A link the portal is not on has no status to ask for, and no timeout to
+  /// report: the window draws the verdict itself.
+  #[test]
+  fn a_portal_that_is_not_here_is_neither_polled_nor_blamed() {
+    assert!(portal_absent(&LoginEnv::OtherNetwork));
+    assert!(portal_absent(&LoginEnv::NoNetwork));
+    for env in [
+      LoginEnv::Campus,
+      LoginEnv::NoPortal,
+      LoginEnv::OtherPortal,
+      LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
+    ] {
+      assert!(!portal_absent(&env), "{env:?}");
+    }
+
+    // The hotspot this was reported from: offline, nothing to ask, so the beat
+    // that used to time out every ten seconds is skipped.
+    assert!(!polls_portal(State::LoggedOut, &LoginEnv::OtherNetwork));
+    // Every other verdict can still carry a portal answer, including the one
+    // with no route: a poll there succeeds as soon as the link comes back, and
+    // that is what corrects a verdict one failed probe left behind.
+    for env in [
+      LoginEnv::Campus,
+      LoginEnv::NoPortal,
+      LoginEnv::OtherPortal,
+      LoginEnv::NoNetwork,
+      LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
+    ] {
+      assert!(polls_portal(State::LoggedOut, &env), "{env:?}");
+    }
+    // With a session up the poll is the only thing watching the link (the
+    // network timer is off while online), so a stale `OtherNetwork` keeps its
+    // beat until an answer clears it.
+    assert!(polls_portal(State::LoggedIn, &LoginEnv::OtherNetwork));
   }
 
   /// The campus verdict rests on the portal answering at all: a wired link, a
