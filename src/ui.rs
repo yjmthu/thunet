@@ -6290,9 +6290,10 @@ impl eframe::App for App {
     let focused = ctx.input(|i| i.focused);
     if focused && !self.was_focused {
       self.push_log(Line::debug("app: window focused"));
-      // Coming to the front is a trigger like any other: the network verdict is
-      // only re-derived on one, so this is where "what did I miss" is answered.
-      self.refresh(true);
+      // Coming to the front is not a trigger: the core's link watch and poll
+      // keep the verdict current on their own, and refreshing here restarted
+      // the heartbeat, so the turtle jumped back to the start every time the
+      // window was raised.
     }
     self.was_focused = focused;
     // The autofill service answers from Java; wake the loop when it does and

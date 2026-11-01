@@ -1201,9 +1201,8 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
 
     // Probe the network when something asked for it: the link watch saw a new
     // route or address, the route toward the portal changed, the portal answered
-    // with a different session owner, or the user asked (a click, a refresh, the
-    // window coming to the front). There is no timer: a verdict nobody changed
-    // cannot change by itself.
+    // with a different session owner, or the user asked (a click or a refresh).
+    // There is no timer: a verdict nobody changed cannot change by itself.
     if force_env {
       force_env = false;
       let probe = probe_env(&session);
