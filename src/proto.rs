@@ -32,7 +32,9 @@ use crate::session::State;
 /// 3: [`Ev::Env`] carries [`LinkEnv`] instead of the old flat verdict, and the
 /// state variants travel under the names they have in code (`LoggedOut` where
 /// the wire used to say `Offline`).
-pub const VERSION: u8 = 3;
+/// 4: [`Ev::Link`] was added: the core publishes the physical link and its
+/// addresses instead of the window reading the interface itself.
+pub const VERSION: u8 = 4;
 
 /// What the frontend asks the core to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +232,23 @@ pub enum LinkKind {
   Other,
 }
 
+/// The physical link the core is using, and the addresses the machine holds on
+/// it.
+///
+/// The core publishes this from its own watch so the window never reads the
+/// interface behind its back: a local read could move the Link row before the
+/// account and address the core clears with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkState {
+  pub kind: LinkKind,
+  /// The IPv4 address that link carries, when it has one.
+  #[serde(default)]
+  pub ip4: Option<std::net::IpAddr>,
+  /// The IPv6 address that link carries, when it has one.
+  #[serde(default)]
+  pub ip6: Option<std::net::IpAddr>,
+}
+
 /// The core's own state, as reported by [`Cmd::CoreInfo`].
 ///
 /// The same value is embedded in the `core` half of an [`Ev::Status`] dump, so
@@ -339,6 +358,11 @@ impl std::fmt::Display for Failure {
 pub enum Ev {
   State(State),
   Info(Value),
+  /// The physical link the core is using and the addresses on it. Sent whenever
+  /// that changes, and replayed to a frontend that attaches late. The window
+  /// draws the Link and address rows from this and never reads the interface
+  /// itself.
+  Link(LinkState),
   /// One status poll finished, whether or not the portal answered. The window
   /// walks the turtle from this beat; [`Ev::Info`] carries what the answer
   /// said.
@@ -471,6 +495,16 @@ mod tests {
           ac_id: Some("169".into()),
         },
         os_session: Some("Tsinghua-Secure".into()),
+      }),
+      Ev::Link(LinkState {
+        kind: LinkKind::Wlan,
+        ip4: Some("192.0.2.10".parse().unwrap()),
+        ip6: Some("2001:db8::7".parse().unwrap()),
+      }),
+      Ev::Link(LinkState {
+        kind: LinkKind::None,
+        ip4: None,
+        ip6: None,
       }),
       Ev::Error(None),
       Ev::Error(Some(Failure::Credentials)),

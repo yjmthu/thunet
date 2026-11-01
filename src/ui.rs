@@ -725,12 +725,15 @@ pub struct App {
   pass_checked: String,
   next_core_query: Instant,
   core_version_warned: bool,
-  /// Which interface carries the default route. Read locally and re-read
-  /// often: a cable plugged in has to show up long before the 30 s service
-  /// poll, and a laptop can have a cable and Wi-Fi up at once - which link the
-  /// session rides on is the first thing to check when it comes and goes.
+  /// Which interface carries the default route, as the core publishes it. A
+  /// cable plugged in shows up with the next `Ev::Link`, not with the 30 s
+  /// service poll, and a laptop can have a cable and Wi-Fi up at once - which
+  /// link the session rides on is the first thing to check when it comes and
+  /// goes.
   uplink: LinkKind,
-  next_uplink: Instant,
+  /// When the Activity's slow reads (theme, keep-alive state) are due again.
+  #[cfg(target_os = "android")]
+  next_local: Instant,
   /// The addresses this machine holds on the current link. The portal row wins
   /// while the portal answers; these fill in on mobile data, another network,
   /// or a campus link without a session, where the portal has nothing to say.
@@ -1030,8 +1033,9 @@ impl App {
       pass_checked: String::new(),
       next_core_query: Instant::now(),
       core_version_warned: false,
-      uplink: crate::srun::link_kind(),
-      next_uplink: Instant::now(),
+      uplink: LinkKind::None,
+      #[cfg(target_os = "android")]
+      next_local: Instant::now(),
       local_ip4: String::new(),
       local_ip6: String::new(),
       state: State::Unknown,
@@ -2011,16 +2015,17 @@ impl App {
           self.state = s;
         }
         Ev::Info(v) => {
-          // An empty answer is the core saying the rows belonged to the link it
-          // just left. Clear them here, restart the heartbeat so the turtle
-          // begins the new link's walk at the start of the track, and re-read
-          // the interface next frame instead of waiting for the two-second
-          // tick: the Link and address rows must move with the account.
-          if v.as_object().is_some_and(|o| o.is_empty()) {
-            self.last_heartbeat = Some(Instant::now());
-            self.next_uplink = Instant::now();
-          }
           self.info = info_from(&v);
+        }
+        Ev::Link(link) => {
+          // The core's one notice for "the link moved": the rows below belong
+          // to the new link, so the account is cleared rather than carried
+          // over, and the heartbeat starts the new link's walk at zero.
+          self.uplink = link.kind;
+          self.local_ip4 = link.ip4.map(|ip| ip.to_string()).unwrap_or_default();
+          self.local_ip6 = link.ip6.map(|ip| ip.to_string()).unwrap_or_default();
+          self.info = Info::default();
+          self.last_heartbeat = Some(Instant::now());
         }
         Ev::Beat => self.last_heartbeat = Some(Instant::now()),
         Ev::Log(line) => self.push_log(line),
@@ -6594,49 +6599,18 @@ impl eframe::App for App {
       self.push_log(Line::warn("credentials: no answer from the core"));
     }
 
-    // Which link carries the session is a local fact, so it is read here
-    // instead of being asked of the core: the row has to follow a cable being
-    // plugged in within a couple of seconds, and the service poll is 30 s.
-    if Instant::now() >= self.next_uplink {
-      self.next_uplink = Instant::now() + Duration::from_secs(2);
-      self.uplink = crate::srun::link_kind();
-      let no_link = self.uplink == LinkKind::None;
-      // The portal rows are not cleared from here: the core owns that call and
-      // sends an empty `Ev::Info` when the link it read them on is gone. This
-      // row only shows what the interface says.
-      // The address the machine holds on that link. Two route lookups, no
-      // packet sent; cheap enough for the same tick the link kind is read on.
-      // With no link there is nothing to report either: a stale address on a
-      // downed adapter is not the machine's address on any network.
-      self.local_ip4 = if no_link {
-        String::new()
-      } else {
-        crate::srun::link_id()
-          .map(|ip| ip.to_string())
-          .unwrap_or_default()
-      };
-      self.local_ip6 = if no_link {
-        String::new()
-      } else {
-        crate::srun::link_id6()
-          .map(|ip| ip.to_string())
-          .unwrap_or_default()
-      };
-      // The Activity rewrites the night mode when the system theme changes;
-      // re-reading it on the same slow tick keeps the per-frame theme check
-      // free of file access.
-      #[cfg(target_os = "android")]
+    // The Activity rewrites the night mode and the keep-alive state; re-reading
+    // them on a slow tick keeps the per-frame work free of file access. The link
+    // itself is not read here: the core publishes it in `Ev::Link`.
+    #[cfg(target_os = "android")]
+    if Instant::now() >= self.next_local {
+      self.next_local = Instant::now() + Duration::from_secs(2);
       crate::theme::refresh(ctx);
-      // The keep-alive state is owned by the Activity (the permission dialog
-      // answers asynchronously), so the rows follow the files, not the click.
-      #[cfg(target_os = "android")]
-      {
-        self.background = crate::background::Mode::read();
-        self.background_denied = crate::background::denied();
-        self.background_allowed = crate::background::allowed();
-        self.background_power = crate::background::power_ok();
-        self.background_oem_power = crate::background::oem_power();
-      }
+      self.background = crate::background::Mode::read();
+      self.background_denied = crate::background::denied();
+      self.background_allowed = crate::background::allowed();
+      self.background_power = crate::background::power_ok();
+      self.background_oem_power = crate::background::oem_power();
     }
 
     // Ask the service about itself now and then; the row it fills is advisory,

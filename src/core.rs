@@ -15,7 +15,7 @@ use crate::config::CoreConfig;
 use crate::i18n::Lang;
 use crate::ipc::Sink;
 use crate::logline::Line;
-use crate::proto::{Cmd, Ev, Failure, LinkEnv, Portal, ToastKind};
+use crate::proto::{Cmd, Ev, Failure, LinkEnv, LinkKind, LinkState, Portal, ToastKind};
 use crate::session::{Session, State};
 use crate::srun::{NetCause, NetError, Probe};
 
@@ -496,12 +496,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
     Option<std::net::IpAddr>,
   ) = ((None, None), None);
-  // Android: the transport is written to `files/link.txt` by the Activity, and
-  // that write can land a moment after the route changed. A verdict computed in
-  // between would describe the link the machine just left, so the kind itself
-  // is watched as well.
-  #[cfg(target_os = "android")]
-  let mut last_kind = crate::srun::link_kind();
+  // The physical link last published to the window: kind plus the addresses on
+  // it. The window draws the Link and address rows from this and never reads
+  // the interface itself.
+  let mut last_link_state: Option<LinkState> = None;
   let mut force_env = true;
   // The last thing the log said about the portal evidence: one line per change,
   // not per probe.
@@ -1040,7 +1038,8 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       // A route is not a link: a driver can keep one on an adapter whose media
       // went away. Gating the identity on the interface's own state is what
       // clears the rows when the cable is out while the address is still cached.
-      let id = if crate::srun::link_present() {
+      let kind = crate::srun::link_kind();
+      let id = if kind != LinkKind::None {
         crate::srun::link_addrs()
       } else {
         (None, None)
@@ -1130,21 +1129,25 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           force_env = true;
         }
       }
-      #[cfg(target_os = "android")]
-      {
-        let kind = crate::srun::link_kind();
-        if kind != last_kind {
-          last_kind = kind;
-          // The Activity names the transport the process is using before the
-          // route lookup above can follow it: right after Wi-Fi goes away the
-          // sockets can still be bound to the network the system just left.
-          // This is the same evidence the window's Link row reads, so blank
-          // the portal rows on it; the window clears the account, fills the
-          // address from the new link and restarts its heartbeat with them.
-          tx.send(Ev::Info(serde_json::json!({}))).ok();
-          session.reset_pool();
-          force_env = true;
-        }
+      // The physical link and its addresses go to the window from here: it must
+      // not read the interface itself, or its Link row could move a beat before
+      // the account and address the core clears with it. All three rows then
+      // move on this one event.
+      let link_state = LinkState {
+        kind,
+        ip4: id.0,
+        ip6: id.1,
+      };
+      if last_link_state != Some(link_state) {
+        last_link_state = Some(link_state);
+        tx.send(Ev::Link(link_state)).ok();
+        // The portal rows belonged to the link just left: blank the cached
+        // answer so a late frontend does not replay the old account, and let
+        // the window clear the page and restart its heartbeat on the same
+        // event.
+        tx.send(Ev::Info(serde_json::json!({}))).ok();
+        session.reset_pool();
+        force_env = true;
       }
       // The portal rows were read on one path to the portal: the default-route
       // address, plus the local address this machine reaches the portal from

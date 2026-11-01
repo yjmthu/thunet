@@ -207,6 +207,7 @@ struct Shared {
   history: VecDeque<Ev>,
   state: Option<crate::session::State>,
   env: Option<crate::proto::LinkEnv>,
+  link: Option<crate::proto::LinkState>,
   info: Option<serde_json::Value>,
   error: Option<Failure>,
 }
@@ -243,6 +244,7 @@ impl Hub {
     match &ev {
       Ev::State(state) => shared.state = Some(*state),
       Ev::Env(env) => shared.env = Some(env.clone()),
+      Ev::Link(link) => shared.link = Some(*link),
       Ev::Info(info) => shared.info = Some(info.clone()),
       Ev::Error(err) => shared.error = err.clone(),
       // Diagnostics also go to the journal / the service log file; the
@@ -284,6 +286,11 @@ impl Hub {
     }
     if let Some(env) = shared.env.clone() {
       backlog.push(Ev::Env(env));
+    }
+    // Before the info: the window clears the portal rows when the link moves,
+    // so a replayed answer has to land after the link it belongs to.
+    if let Some(link) = shared.link {
+      backlog.push(Ev::Link(link));
     }
     if let Some(info) = shared.info.clone() {
       backlog.push(Ev::Info(info));
@@ -1527,7 +1534,7 @@ mod tests {
 
   use super::*;
   use crate::logline::Line;
-  use crate::proto::{LinkEnv, Portal, ToastKind};
+  use crate::proto::{LinkEnv, LinkKind, LinkState, Portal, ToastKind};
   use crate::session::State;
 
   #[test]
@@ -1656,14 +1663,24 @@ mod tests {
       portal: Portal::Ours { ac_id: None },
       os_session: None,
     }));
+    hub.publish(Ev::Link(LinkState {
+      kind: LinkKind::Wlan,
+      ip4: Some("192.0.2.10".parse().unwrap()),
+      ip6: None,
+    }));
+    hub.publish(Ev::Info(serde_json::json!({"user_name": "alice"})));
     hub.publish(Ev::Log(Line::info("first")));
     hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
     let (_rx, backlog, _live) = hub.attach();
-    // Snapshot first, then the replayed log lines.
+    // Snapshot first, then the replayed log lines. The link has to arrive
+    // before the info: the window clears the portal rows on the link event, so
+    // the answer that is replayed after it belongs to the link it names.
     assert!(matches!(backlog[0], Ev::State(State::LoggedIn)));
     assert!(matches!(&backlog[1], Ev::Env(env) if env.portal_answers()));
-    assert!(matches!(&backlog[2], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
+    assert!(matches!(&backlog[2], Ev::Link(link) if link.kind == LinkKind::Wlan));
+    assert!(matches!(&backlog[3], Ev::Info(v) if v.get("user_name").is_some()));
+    assert!(matches!(&backlog[4], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
     assert!(matches!(backlog.last(), Some(Ev::Log(_))));
   }
 
