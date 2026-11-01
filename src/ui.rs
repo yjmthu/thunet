@@ -458,23 +458,30 @@ fn link_words(env: &LinkEnv, state: State, core_answered: bool, t: &Texts) -> Li
   }
 }
 
-/// How far one status-poll cycle has run, 0.0 .. 1.0.
-fn heartbeat_fraction(elapsed: Duration, period: Duration) -> f32 {
+/// Advance the turtle's free-running walk by one frame, wrapping at the end
+/// of the track.
+///
+/// The walk is not anchored to the beats: the core beats on the loop's
+/// cadence, and a link that just came up owes several catch-up polls two
+/// seconds apart. Restarting the walk on each of those made one Wi-Fi switch
+/// look like five refreshes in a row, so the turtle keeps walking and only an
+/// explicit Refresh starts it over.
+fn advance_walk(walk: f32, dt: Duration, period: Duration) -> f32 {
   if period.is_zero() {
     return 0.0;
   }
-  (elapsed.as_secs_f32() / period.as_secs_f32()).clamp(0.0, 1.0)
+  (walk + dt.as_secs_f32() / period.as_secs_f32()).fract()
 }
 
 /// The turtle that walks the status track.
 ///
-/// It stands on a fixed-length line and its position is how far the current
-/// poll period has run, so the line itself never changes length. It waits at
-/// the right end, and the line turns amber, once the core has missed a whole
-/// cycle.
+/// It stands on a fixed-length line and walks it at the poll period, looping
+/// at the right end; the line itself never changes length. It turns amber once
+/// the core has missed a whole cycle.
 fn status_track(
   ui: &mut egui::Ui,
   state: State,
+  walk: f32,
   at: Option<Instant>,
   turtle: Option<&egui::TextureHandle>,
   t: &Texts,
@@ -517,7 +524,7 @@ fn status_track(
   );
 
   if let Some(turtle) = turtle {
-    let x = rect.left() + turtle_x(heartbeat_fraction(elapsed, period), rect.width(), TURTLE);
+    let x = rect.left() + turtle_x(walk, rect.width(), TURTLE);
     painter.image(
       turtle.id(),
       egui::Rect::from_min_size(egui::pos2(x, mid - TURTLE), egui::vec2(TURTLE, TURTLE)),
@@ -741,9 +748,13 @@ pub struct App {
   local_ip6: String,
   state: State,
   info: Info,
-  /// When the last status answer arrived. The turtle beside the state label
-  /// walks one poll period from here.
+  /// When the last beat arrived. Only the track's amber colour reads it: the
+  /// walk itself is free-running, so a poll or a link change cannot send the
+  /// turtle back to the start.
   last_heartbeat: Option<Instant>,
+  /// How far along its track the turtle is, 0.0 .. 1.0. Advanced by the frame
+  /// clock at the current poll period and reset by an explicit Refresh only.
+  walk: f32,
   /// The turtle sprite, uploaded on first use and kept alive by the handle.
   turtle: Option<egui::TextureHandle>,
   /// The device badge was clicked and its list is showing.
@@ -1041,6 +1052,7 @@ impl App {
       state: State::Unknown,
       info: Info::default(),
       last_heartbeat: None,
+      walk: 0.0,
       turtle: None,
       devices_open: false,
       logs,
@@ -1142,6 +1154,7 @@ impl App {
   /// there until the next scheduled beat - which is exactly what a refresh that
   /// "succeeded but did nothing" looked like.
   fn refresh(&mut self, quiet: bool) {
+    self.walk = 0.0;
     self.last_heartbeat = Some(Instant::now());
     self.send(Cmd::Refresh { quiet });
   }
@@ -1166,6 +1179,9 @@ impl App {
     self.state = State::Unknown;
     self.info = Info::default();
     self.last_heartbeat = None;
+    // Nothing is beating any more, so the turtle stops where it is rather than
+    // walking on and pretending the core is alive.
+    self.walk = 0.0;
     if let Some(v) = stale
       && self.core_stale != Some(v)
     {
@@ -2006,12 +2022,10 @@ impl App {
       }
       match ev {
         Ev::State(s) => {
-          if s != self.state {
-            // A new state starts a new poll cadence (15 s online, 10 s offline),
-            // so the last cycle's position cannot be carried into it: a Turtle
-            // at the old period's end would sit still until the next beat.
-            self.last_heartbeat = Some(Instant::now());
-          }
+          // The walk is not restarted here. A state change usually comes with a
+          // link change, and one Wi-Fi switch churns through several of them
+          // (LoggedIn, Unknown, LoggedIn again) within a few seconds; the
+          // turtle kept jumping back to the start for each one.
           self.state = s;
         }
         Ev::Info(v) => {
@@ -2020,18 +2034,17 @@ impl App {
         Ev::Link(link) => {
           // The core's notice that the link moved. The addresses are always
           // taken: they are what the IP row shows on a network the portal does
-          // not answer on. The account and the heartbeat follow the transport
-          // only: DHCP hands out v4 and v6 in separate steps and a roam or a
-          // renew changes the address on the same network, and clearing the
-          // account and restarting the walk for each of those made one Wi-Fi
-          // switch look like several refreshes in a row.
+          // not answer on. The account follows the transport only: DHCP hands
+          // out v4 and v6 in separate steps and a roam or a renew changes the
+          // address on the same network, so clearing it for each of those made
+          // one Wi-Fi switch look like several refreshes in a row. The walk is
+          // not touched at all - it is the liveness pulse, not a progress bar.
           let moved = link.kind != self.uplink;
           self.uplink = link.kind;
           self.local_ip4 = link.ip4.map(|ip| ip.to_string()).unwrap_or_default();
           self.local_ip6 = link.ip6.map(|ip| ip.to_string()).unwrap_or_default();
           if moved {
             self.info = Info::default();
-            self.last_heartbeat = Some(Instant::now());
           }
         }
         Ev::Beat => self.last_heartbeat = Some(Instant::now()),
@@ -2201,7 +2214,14 @@ impl App {
             // The core beats on its own cadence whether or not the portal is
             // asked, so the turtle walks on a link with no portal too; the
             // track only turns amber when the beats themselves stop.
-            status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
+            status_track(
+              ui,
+              self.state,
+              self.walk,
+              self.last_heartbeat,
+              self.turtle.as_ref(),
+              t,
+            );
           } else {
             // The same gear as the button that opened this page, so the two
             // read as the same place.
@@ -5408,16 +5428,23 @@ mod tests {
     assert_eq!(service_name("ipv4-only"), "ipv4-only");
   }
 
-  /// The walk is a full period long and never wraps.
+  /// The walk is a full period long, wraps at the end, and a beat cannot
+  /// restart it.
   #[test]
-  fn heartbeat_tracks_one_poll_period() {
+  fn the_walk_wraps_at_the_poll_period() {
     let period = Duration::from_secs(15);
-    assert_eq!(heartbeat_fraction(Duration::ZERO, period), 0.0);
-    assert!((heartbeat_fraction(Duration::from_secs_f32(7.5), period) - 0.5).abs() < 0.01);
-    assert_eq!(heartbeat_fraction(period, period), 1.0);
-    assert_eq!(heartbeat_fraction(Duration::from_secs(40), period), 1.0);
+    assert_eq!(advance_walk(0.0, Duration::ZERO, period), 0.0);
+    assert!((advance_walk(0.0, Duration::from_secs_f32(7.5), period) - 0.5).abs() < 0.01);
+    // Two catch-up polls two seconds apart keep walking instead of jumping
+    // back to the start.
+    let after_one = advance_walk(0.0, Duration::from_secs(2), period);
+    let after_two = advance_walk(after_one, Duration::from_secs(2), period);
+    assert!(after_two > after_one);
+    assert!(after_two < 0.3);
+    // A full period returns to the start, which is the only "restart" left.
+    assert!(advance_walk(0.9, Duration::from_secs_f32(1.5), period).abs() < 0.01);
     assert_eq!(
-      heartbeat_fraction(Duration::from_secs(1), Duration::ZERO),
+      advance_walk(0.5, Duration::from_secs(1), Duration::ZERO),
       0.0
     );
   }
@@ -6290,6 +6317,22 @@ impl eframe::App for App {
   fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     if self.turtle.is_none() {
       self.turtle = load_turtle(ctx);
+    }
+    // The turtle walks on its own clock, at the poll period that matches the
+    // state. Tying it to the beats instead made a link switch restart it once
+    // per catch-up poll, which is what looked like several refreshes in a row.
+    // A hidden window still runs this (eframe calls `logic`), so the walk is
+    // where it should be when the window comes back.
+    if self.last_heartbeat.is_some() {
+      let period = if self.state == State::LoggedIn {
+        POLL_ONLINE
+      } else {
+        POLL_OFFLINE
+      };
+      // A resumed process can hand us a multi-second frame; letting that jump
+      // the walk would look like the jump the beats used to cause.
+      let dt = ctx.input(|i| i.stable_dt).min(0.5);
+      self.walk = advance_walk(self.walk, Duration::from_secs_f32(dt), period);
     }
     // A phone parks the event loop while the app is in the background and
     // resumes it on return. The focus edge is the one local trace of that, and
