@@ -2177,15 +2177,10 @@ impl App {
               text.on_hover_text(detail);
             }
             ui.add_space(6.0);
-            // The core skips the poll where the portal cannot answer, so there
-            // is no beat to draw: the track stays quiet instead of turning
-            // amber for a beat that is not late but cancelled.
-            let beat = if self.env.polls_portal(self.state) {
-              self.last_heartbeat
-            } else {
-              None
-            };
-            status_track(ui, self.state, beat, self.turtle.as_ref(), t);
+            // The core beats on its own cadence whether or not the portal is
+            // asked, so the turtle walks on a link with no portal too; the
+            // track only turns amber when the beats themselves stop.
+            status_track(ui, self.state, self.last_heartbeat, self.turtle.as_ref(), t);
           } else {
             // The same gear as the button that opened this page, so the two
             // read as the same place.

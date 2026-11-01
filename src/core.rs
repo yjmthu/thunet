@@ -437,6 +437,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   // Quick polls still owed to a link that just came up: see
   // [`LINK_CATCHUP_POLLS`].
   let mut catchup_polls = 0u8;
+  // A manual refresh whose portal query failed, held until this pass has
+  // re-derived the link's verdict: whether that failure is news depends on
+  // whether the portal is on this link at all.
+  let mut pending_refresh: Option<(bool, NetError)> = None;
   // What the window has been told. Starting at `Unknown` matches the session's
   // own start, so the first state is announced rather than assumed equal.
   let mut last_state = State::Unknown;
@@ -637,63 +641,73 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // re-derived as well as the session: it is only re-derived on a
           // trigger, and the user is one.
           force_env = true;
-          match session.refresh() {
-            Ok(v) => {
-              refresh_failures = 0;
-              // The scheduled poll measures from the last answer, and this is
-              // one: without this the next poll kept its old phase, so a manual
-              // refresh was followed by another answer seconds later and the
-              // progress line restarted twice in a row.
-              last_status = Instant::now();
-              tx.send(Ev::Info(v)).ok();
-              send_state!();
-              // A refresh proves the portal answers, not that the stored
-              // password is right: a rejection stays on screen through it,
-              // unless the session turns out to be online.
-              if session.state == State::LoggedIn
-                || !matches!(
-                  banner.as_ref(),
-                  Some(Failure::Credentials | Failure::AcUnreachable)
-                )
-              {
-                set_banner(&tx, &mut banner, None);
+          // The portal is only asked where it can answer - the same rule as the
+          // scheduled poll below. Elsewhere the query is a guaranteed timeout,
+          // and what the button is for is the verdict ("this is not the campus
+          // network"), not a failed request.
+          if last_env.polls_portal(session.state) {
+            match session.refresh() {
+              Ok(v) => {
+                refresh_failures = 0;
+                // The scheduled poll measures from the last answer, and this is
+                // one: without this the next poll kept its old phase, so a manual
+                // refresh was followed by another answer seconds later and the
+                // progress line restarted twice in a row.
+                last_status = Instant::now();
+                tx.send(Ev::Info(v)).ok();
+                send_state!();
+                // A refresh proves the portal answers, not that the stored
+                // password is right: a rejection stays on screen through it,
+                // unless the session turns out to be online.
+                if session.state == State::LoggedIn
+                  || !matches!(
+                    banner.as_ref(),
+                    Some(Failure::Credentials | Failure::AcUnreachable)
+                  )
+                {
+                  set_banner(&tx, &mut banner, None);
+                }
+                if session.state == State::LoggedIn {
+                  // Whatever the connect window was still waiting for, the machine
+                  // is online now.
+                  connect_budget = Duration::ZERO;
+                }
+                // A refresh the window started by itself only exists to make the
+                // page current; it is not news.
+                if !quiet {
+                  tx.send(Ev::Log(Line::info("status refreshed"))).ok();
+                  tx.send(Ev::Notify {
+                    msg: t.status_refreshed.into(),
+                    kind: ToastKind::Ok,
+                  })
+                  .ok();
+                }
               }
-              if session.state == State::LoggedIn {
-                // Whatever the connect window was still waiting for, the machine
-                // is online now.
-                connect_budget = Duration::ZERO;
-              }
-              // A refresh the window started by itself only exists to make the
-              // page current; it is not news.
-              if !quiet {
-                tx.send(Ev::Log(Line::info("status refreshed"))).ok();
-                tx.send(Ev::Notify {
-                  msg: t.status_refreshed.into(),
-                  kind: ToastKind::Ok,
-                })
-                .ok();
+              Err(e) => {
+                refresh_failures = refresh_failures.saturating_add(1);
+                // The wording waits for the probe in this pass: the old verdict
+                // can still name a link the machine has already left (a phone
+                // swapping its upstream behind a hotspot is invisible here
+                // until something asks), and "refresh failed" is only true
+                // where the portal turned out to be on the link.
+                pending_refresh = Some((quiet, e));
               }
             }
-            Err(e) => {
-              refresh_failures = refresh_failures.saturating_add(1);
-              // The technical sentence (a TLS or DNS message) is far too long for
-              // a band, so the log keeps it. One failed refresh is not news for
-              // the page either - the next one clears it - so only a failure that
-              // repeats raises the banner; the toast answers the button press.
-              // A link the portal is not on has nothing to report: there the
-              // verdict band already says the portal is not reachable here.
-              tx.send(Ev::Log(Line::warn(format!("refresh failed: {e}"))))
-                .ok();
-              if refresh_failures >= 2 && last_env.portal_answers() {
-                set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
-              }
-              if !quiet {
-                tx.send(Ev::Notify {
-                  msg: t.refresh_failed.into(),
-                  kind: ToastKind::Err,
-                })
-                .ok();
-              }
+          } else {
+            // Nothing to ask on this link. The probe in this pass publishes what
+            // it actually is, and the click is answered without an error.
+            refresh_failures = 0;
+            last_status = Instant::now();
+            if !quiet {
+              tx.send(Ev::Log(Line::debug(
+                "status refreshed: no campus portal on this link",
+              )))
+              .ok();
+              tx.send(Ev::Notify {
+                msg: t.status_refreshed.into(),
+                kind: ToastKind::Info,
+              })
+              .ok();
             }
           }
         }
@@ -1241,6 +1255,44 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       tx.send(Ev::Env(env)).ok();
     }
 
+    // Answer a manual refresh now that the verdict has been re-derived: a
+    // failed portal query is news only where the portal is on this link. On a
+    // link that works without it, the verdict above is the answer, and calling
+    // that a failure would contradict the page and the probes.
+    if let Some((quiet, e)) = pending_refresh.take() {
+      if last_env.portal_answers() {
+        // The technical sentence (a TLS or DNS message) is far too long for a
+        // band, so the log keeps it. One failed refresh is not news for the page
+        // either - the next one clears it - so only a failure that repeats
+        // raises the banner; the toast answers the button press.
+        tx.send(Ev::Log(Line::warn(format!("refresh failed: {e}"))))
+          .ok();
+        if refresh_failures >= 2 {
+          set_banner(&tx, &mut banner, Some(failure_of(t.refresh_failed, &e)));
+        }
+        if !quiet {
+          tx.send(Ev::Notify {
+            msg: t.refresh_failed.into(),
+            kind: ToastKind::Err,
+          })
+          .ok();
+        }
+      } else {
+        refresh_failures = 0;
+        tx.send(Ev::Log(Line::debug(format!(
+          "status refreshed: no campus portal on this link ({e})"
+        ))))
+        .ok();
+        if !quiet {
+          tx.send(Ev::Notify {
+            msg: t.status_refreshed.into(),
+            kind: ToastKind::Info,
+          })
+          .ok();
+        }
+      }
+    }
+
     // Whether an automatic attempt may be made at all. `keep_online` is the
     // standing permission for it; without it, only an open connect window
     // allows one, which is what makes "connect at start" mean exactly that.
@@ -1430,9 +1482,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     // Poll the portal on the period, plus the catch-up owed to a link that just
     // came up. `last_status` is the last actual poll, so a forced one in this
     // pass already restarts the gap. A poll is only made where the portal can
-    // answer (see `LinkEnv::polls_portal`): elsewhere every beat was a
-    // three-second timeout whose failure the verdict already explains, and
-    // nothing it found could change the page.
+    // answer (see [`LinkEnv::polls_portal`]): elsewhere it was a three-second
+    // timeout whose failure the verdict already explains, and nothing it found
+    // could change the page. The beat is sent either way - it is the core's own
+    // liveness, and a link with no portal still has to show that the loop runs.
     let catchup_due = catchup_polls > 0 && last_status.elapsed() >= LINK_CATCHUP_STEP;
     let poll_every = if session.state == State::LoggedIn {
       POLL_ONLINE
@@ -1440,104 +1493,111 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       POLL_OFFLINE
     };
     let poll_due = force_status || catchup_due || last_status.elapsed() >= poll_every;
-    if poll_due && last_env.polls_portal(session.state) {
-      force_status = false;
-      let answer = session.client().status();
-      match &answer {
-        Ok(v) => {
-          status_failures = 0;
-          last_status_log = None;
-          // The answer names the service behind the session; when that changes,
-          // the verdict that quotes it ("the OS owns this session") is stale.
-          if session.note_session_service(v) {
-            force_env = true;
+    if poll_due {
+      if last_env.polls_portal(session.state) {
+        force_status = false;
+        let answer = session.client().status();
+        match &answer {
+          Ok(v) => {
+            status_failures = 0;
+            last_status_log = None;
+            // The answer names the service behind the session; when that changes,
+            // the verdict that quotes it ("the OS owns this session") is stale.
+            if session.note_session_service(v) {
+              force_env = true;
+            }
           }
-        }
-        Err(e) => {
-          // The portal did not answer at all: no route, a dead link, or a host
-          // that stopped responding. While the machine sits on such a link
-          // every poll fails the same way, so a message is logged once and then
-          // only again when it changes or STATUS_LOG_REPEAT has passed.
-          let text = status_error_text(e);
-          let repeat_due = match &last_status_log {
-            Some((last, at)) => last != &text || at.elapsed() >= STATUS_LOG_REPEAT,
-            None => true,
-          };
-          if repeat_due {
-            tx.send(Ev::Log(Line::debug(text.clone()))).ok();
-            last_status_log = Some((text, Instant::now()));
-          }
-          if session.state == State::LoggedIn {
-            status_failures = status_failures.saturating_add(1);
-            if status_failures >= STATUS_FAILURES {
-              // Not "logged out": the portal never answered, so whether a
-              // session exists is unknown. Claiming one or the other is how the
-              // window ended up saying "offline" on a link that was working.
-              session.state = State::Unknown;
-              tx.send(Ev::Log(Line::warn("portal not answering, no answer yet")))
-                .ok();
-              tx.send(Ev::Info(serde_json::json!({}))).ok();
+          Err(e) => {
+            // The portal did not answer at all: no route, a dead link, or a host
+            // that stopped responding. While the machine sits on such a link
+            // every poll fails the same way, so a message is logged once and then
+            // only again when it changes or STATUS_LOG_REPEAT has passed.
+            let text = status_error_text(e);
+            let repeat_due = match &last_status_log {
+              Some((last, at)) => last != &text || at.elapsed() >= STATUS_LOG_REPEAT,
+              None => true,
+            };
+            if repeat_due {
+              tx.send(Ev::Log(Line::debug(text.clone()))).ok();
+              last_status_log = Some((text, Instant::now()));
+            }
+            if session.state == State::LoggedIn {
+              status_failures = status_failures.saturating_add(1);
+              if status_failures >= STATUS_FAILURES {
+                // Not "logged out": the portal never answered, so whether a
+                // session exists is unknown. Claiming one or the other is how the
+                // window ended up saying "offline" on a link that was working.
+                session.state = State::Unknown;
+                tx.send(Ev::Log(Line::warn("portal not answering, no answer yet")))
+                  .ok();
+                tx.send(Ev::Info(serde_json::json!({}))).ok();
+              }
             }
           }
         }
-      }
-      // An answer that names a session ends the catch-up; a missing one spends
-      // one of the owed polls and then falls back to the normal cadence.
-      if catchup_polls > 0 {
-        let online = answer
-          .as_ref()
-          .is_ok_and(|v| v.get("online").and_then(|b| b.as_bool()).unwrap_or(false));
-        catchup_polls = if online { 0 } else { catchup_polls - 1 };
-      }
-      if let Ok(v) = answer {
-        // An answer proves the portal is reachable, so a band about failing to
-        // reach it is out of date. The scheduled poll counts as proof, not just
-        // a manual refresh: without this a single outage left the band up until
-        // somebody pressed *Refresh* again.
-        if matches!(banner, Some(Failure::Network(_))) {
-          set_banner(&tx, &mut banner, None);
+        // An answer that names a session ends the catch-up; a missing one spends
+        // one of the owed polls and then falls back to the normal cadence.
+        if catchup_polls > 0 {
+          let online = answer
+            .as_ref()
+            .is_ok_and(|v| v.get("online").and_then(|b| b.as_bool()).unwrap_or(false));
+          catchup_polls = if online { 0 } else { catchup_polls - 1 };
         }
-        // The portal just answered on this link, so a verdict that says it is
-        // not behind the link cannot still be true. One failed request during a
-        // network change is enough to produce one, and while the session is up
-        // the probe timer never runs - which left the portal verbs greyed out
-        // until the link changed again. Ask again right away.
-        if !last_env.portal_answers() {
-          force_env = true;
+        if let Ok(v) = answer {
+          // An answer proves the portal is reachable, so a band about failing to
+          // reach it is out of date. The scheduled poll counts as proof, not just
+          // a manual refresh: without this a single outage left the band up until
+          // somebody pressed *Refresh* again.
+          if matches!(banner, Some(Failure::Network(_))) {
+            set_banner(&tx, &mut banner, None);
+          }
+          // The portal just answered on this link, so a verdict that says it is
+          // not behind the link cannot still be true. One failed request during a
+          // network change is enough to produce one, and while the session is up
+          // the probe timer never runs - which left the portal verbs greyed out
+          // until the link changed again. Ask again right away.
+          if !last_env.portal_answers() {
+            force_env = true;
+          }
+          let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
+          if online && session.state != State::LoggedIn {
+            session.state = State::LoggedIn;
+            failures = 0;
+            // Being online is what the connect window was for: it is done. A
+            // session found here may have been opened elsewhere, which is still
+            // "online" as far as the machine is concerned.
+            connect_budget = Duration::ZERO;
+            set_banner(&tx, &mut banner, None);
+            tx.send(Ev::Log(Line::info("already online"))).ok();
+          } else if !online && session.state == State::LoggedIn {
+            // Session ended outside our control (timeout / kicked / unplugged).
+            session.state = State::LoggedOut;
+            tx.send(Ev::Log(Line::warn("session ended, logged out")))
+              .ok();
+          } else if online
+            && matches!(
+              banner.as_ref(),
+              Some(Failure::Credentials | Failure::AcUnreachable)
+            )
+          {
+            // A credential banner is only true while the machine cannot sign in.
+            // This session proves the stored pair works, so drop it even though
+            // the state did not change: that is the case after a refused switch
+            // that signed the previous account back in. The same goes for the
+            // "already online" notice - this session *is* the account's session.
+            set_banner(&tx, &mut banner, None);
+          }
+          tx.send(Ev::Info(v)).ok();
         }
-        let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
-        if online && session.state != State::LoggedIn {
-          session.state = State::LoggedIn;
-          failures = 0;
-          // Being online is what the connect window was for: it is done. A
-          // session found here may have been opened elsewhere, which is still
-          // "online" as far as the machine is concerned.
-          connect_budget = Duration::ZERO;
-          set_banner(&tx, &mut banner, None);
-          tx.send(Ev::Log(Line::info("already online"))).ok();
-        } else if !online && session.state == State::LoggedIn {
-          // Session ended outside our control (timeout / kicked / unplugged).
-          session.state = State::LoggedOut;
-          tx.send(Ev::Log(Line::warn("session ended, logged out")))
-            .ok();
-        } else if online
-          && matches!(
-            banner.as_ref(),
-            Some(Failure::Credentials | Failure::AcUnreachable)
-          )
-        {
-          // A credential banner is only true while the machine cannot sign in.
-          // This session proves the stored pair works, so drop it even though
-          // the state did not change: that is the case after a refused switch
-          // that signed the previous account back in. The same goes for the
-          // "already online" notice - this session *is* the account's session.
-          set_banner(&tx, &mut banner, None);
-        }
-        tx.send(Ev::Info(v)).ok();
+      } else {
+        // A forced poll is spent here as well, and a catch-up owed to a link
+        // with no portal can never be answered.
+        force_status = false;
+        catchup_polls = 0;
       }
-      // The beat is the poll itself, not its answer: the window draws it as a
-      // heartbeat, and a portal that stays silent must not look like a core
-      // that stopped.
+      // The beat is the loop, not the poll's answer: the window draws it as a
+      // heartbeat, and neither a silent portal nor a link without one may look
+      // like a core that stopped.
       tx.send(Ev::Beat).ok();
       last_status = Instant::now();
     }
