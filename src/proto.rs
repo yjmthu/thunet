@@ -43,8 +43,9 @@ pub enum Cmd {
   Disconnect,
   /// Re-read the portal and publish state/traffic.
   Refresh {
-    /// A refresh the window started on its own (it just came to the front)
-    /// exists to make the page current, so it neither logs nor toasts.
+    /// A refresh the window started as a consequence of its own edit (the
+    /// stored pair is asked about again after a refused one is taken back),
+    /// not a click on *Refresh*: it neither logs nor toasts.
     #[serde(default)]
     quiet: bool,
   },

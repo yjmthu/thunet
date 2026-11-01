@@ -1833,10 +1833,10 @@ impl App {
       self.cloaked = false;
     }
     self.shown = true;
-    // The window is what the user reads the verdict from, and the verdict is
-    // only re-derived when something changes: bringing the window up is the
-    // one moment it has to be current.
-    self.refresh(true);
+    // Showing the window is not a trigger, exactly like gaining the focus: the
+    // core keeps publishing the link and the verdict while the window is
+    // hidden, so the page is current when it comes back. Refreshing here reset
+    // the heartbeat and made the turtle restart its walk on every Show.
     // A session that changed scale while the window was hidden (an unmapped
     // window may keep the size it was last given) gets its fixed size back on
     // the first pass after this.
@@ -2018,14 +2018,21 @@ impl App {
           self.info = info_from(&v);
         }
         Ev::Link(link) => {
-          // The core's one notice for "the link moved": the rows below belong
-          // to the new link, so the account is cleared rather than carried
-          // over, and the heartbeat starts the new link's walk at zero.
+          // The core's notice that the link moved. The addresses are always
+          // taken: they are what the IP row shows on a network the portal does
+          // not answer on. The account and the heartbeat follow the transport
+          // only: DHCP hands out v4 and v6 in separate steps and a roam or a
+          // renew changes the address on the same network, and clearing the
+          // account and restarting the walk for each of those made one Wi-Fi
+          // switch look like several refreshes in a row.
+          let moved = link.kind != self.uplink;
           self.uplink = link.kind;
           self.local_ip4 = link.ip4.map(|ip| ip.to_string()).unwrap_or_default();
           self.local_ip6 = link.ip6.map(|ip| ip.to_string()).unwrap_or_default();
-          self.info = Info::default();
-          self.last_heartbeat = Some(Instant::now());
+          if moved {
+            self.info = Info::default();
+            self.last_heartbeat = Some(Instant::now());
+          }
         }
         Ev::Beat => self.last_heartbeat = Some(Instant::now()),
         Ev::Log(line) => self.push_log(line),
