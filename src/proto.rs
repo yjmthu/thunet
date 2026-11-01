@@ -154,6 +154,17 @@ pub enum Portal {
 }
 
 impl LinkEnv {
+  /// The verdict before any core has said anything, and again once the one that
+  /// said it is gone.
+  pub fn empty() -> Self {
+    Self {
+      connected: false,
+      internet: false,
+      portal: Portal::Silent,
+      os_session: None,
+    }
+  }
+
   /// A link where a failed request to the campus portal is worth a red band.
   ///
   /// Only where the portal is ours: on any other link the band would repeat, in

@@ -1084,14 +1084,9 @@ impl App {
       user_edit: String::new(),
       pass_edit: String::new(),
       remember: false,
-      // Until the worker's first probe lands, assume a login is possible: a
-      // wrongly disabled button is worse than a click that reports why not.
-      env: LinkEnv {
-        connected: false,
-        internet: false,
-        portal: Portal::Silent,
-        os_session: None,
-      },
+      // Pessimistic until the worker's first probe lands, like a core that has
+      // gone away: no portal is claimed on a link nothing has looked at yet.
+      env: LinkEnv::empty(),
       page: Page::Status,
       toast: None,
       cfg,
@@ -1182,6 +1177,13 @@ impl App {
     // Nothing is beating any more, so the turtle stops where it is rather than
     // walking on and pretending the core is alive.
     self.walk = 0.0;
+    // The link report came from that core too. Without it the Link row and the
+    // addresses would keep naming the network the stopped core last saw, and a
+    // stale verdict would keep *Connect* lit for a service that is not there.
+    self.uplink = LinkKind::None;
+    self.local_ip4.clear();
+    self.local_ip6.clear();
+    self.env = LinkEnv::empty();
     if let Some(v) = stale
       && self.core_stale != Some(v)
     {
