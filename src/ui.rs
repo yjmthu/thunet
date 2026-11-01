@@ -5649,6 +5649,20 @@ mod tests {
     assert!(layout.grid <= layout.planned + 0.5, "{layout:?}");
   }
 
+  /// A tooltip may not be wider than the window it hangs in: at egui's default
+  /// of 500 pt it covered the page on a phone and on a narrow desktop window.
+  #[test]
+  fn a_tooltip_stays_inside_its_window() {
+    assert!((tooltip_width(420.0) - 373.33).abs() < 0.01);
+    assert_eq!(
+      tooltip_width(3000.0),
+      500.0,
+      "a wide window keeps the default"
+    );
+    assert_eq!(tooltip_width(100.0), TOOLTIP_WIDTH_MIN);
+    assert!(tooltip_width(420.0) <= 420.0 * 8.0 / 9.0 + 0.01);
+  }
+
   #[test]
   fn disconnect_is_off_while_the_page_says_offline() {
     let ours = LinkEnv {
@@ -6040,6 +6054,17 @@ mod tests {
 /// Space between stacked bands, and between the last band and the page.
 const BANNER_GAP: f32 = 8.0;
 
+/// Narrowest a tooltip may get, so a very narrow window still shows a readable
+/// line rather than one word per row.
+const TOOLTIP_WIDTH_MIN: f32 = 160.0;
+
+/// How wide a tooltip may be in a window this wide: eight ninths of it, never
+/// narrower than [`TOOLTIP_WIDTH_MIN`] and never wider than egui's own default,
+/// so a wide window keeps the tooltips it always had.
+fn tooltip_width(window_width: f32) -> f32 {
+  (window_width * 8.0 / 9.0).clamp(TOOLTIP_WIDTH_MIN, 500.0)
+}
+
 /// How many lines a band may take before it ends in an ellipsis.
 ///
 /// Every message the window writes itself fits in this many lines at the
@@ -6339,6 +6364,14 @@ impl eframe::App for App {
     if self.applied_theme != Some(theme) {
       ctx.set_theme(theme);
       self.applied_theme = Some(theme);
+    }
+
+    // A tooltip wider than the window hides the very text it explains, and
+    // egui's default is 500 pt - wider than a phone, and wider than a narrow
+    // window on the desktop.
+    let tooltip = tooltip_width(ctx.content_rect().width());
+    if (ctx.style_of(ctx.theme()).spacing.tooltip_width - tooltip).abs() > 0.5 {
+      ctx.all_styles_mut(|style| style.spacing.tooltip_width = tooltip);
     }
 
     // GTK delivers the appindicator menu callbacks through its own event loop,
