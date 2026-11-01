@@ -1135,6 +1135,14 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         let kind = crate::srun::link_kind();
         if kind != last_kind {
           last_kind = kind;
+          // The Activity names the transport the process is using before the
+          // route lookup above can follow it: right after Wi-Fi goes away the
+          // sockets can still be bound to the network the system just left.
+          // This is the same evidence the window's Link row reads, so blank
+          // the portal rows on it; the window clears the account, fills the
+          // address from the new link and restarts its heartbeat with them.
+          tx.send(Ev::Info(serde_json::json!({}))).ok();
+          session.reset_pool();
           force_env = true;
         }
       }

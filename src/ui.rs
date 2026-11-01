@@ -2011,6 +2011,15 @@ impl App {
           self.state = s;
         }
         Ev::Info(v) => {
+          // An empty answer is the core saying the rows belonged to the link it
+          // just left. Clear them here, restart the heartbeat so the turtle
+          // begins the new link's walk at the start of the track, and re-read
+          // the interface next frame instead of waiting for the two-second
+          // tick: the Link and address rows must move with the account.
+          if v.as_object().is_some_and(|o| o.is_empty()) {
+            self.last_heartbeat = Some(Instant::now());
+            self.next_uplink = Instant::now();
+          }
           self.info = info_from(&v);
         }
         Ev::Beat => self.last_heartbeat = Some(Instant::now()),
@@ -6590,16 +6599,11 @@ impl eframe::App for App {
     // plugged in within a couple of seconds, and the service poll is 30 s.
     if Instant::now() >= self.next_uplink {
       self.next_uplink = Instant::now() + Duration::from_secs(2);
-      let before = self.uplink;
       self.uplink = crate::srun::link_kind();
       let no_link = self.uplink == LinkKind::None;
-      // No link, no session to describe: the portal rows were read on the link
-      // that just went, and this read of the interface can be a beat ahead of
-      // the core's clear. Blank them here so `No link` never carries a service
-      // tag from the link just left.
-      if no_link && before != LinkKind::None {
-        self.info = Info::default();
-      }
+      // The portal rows are not cleared from here: the core owns that call and
+      // sends an empty `Ev::Info` when the link it read them on is gone. This
+      // row only shows what the interface says.
       // The address the machine holds on that link. Two route lookups, no
       // packet sent; cheap enough for the same tick the link kind is read on.
       // With no link there is nothing to report either: a stale address on a
