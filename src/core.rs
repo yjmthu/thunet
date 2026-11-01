@@ -579,7 +579,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // a new link. Every address change is still published, because it is
           // what the IP row shows, and it still abandons the requests that
           // were sent from the address that is gone.
-          let moved = last.is_none_or(|l| l.kind != kind);
+          //
+          // The rows are blanked on the way *out* of a link, not on the way in:
+          // the departure already blanked them, and an answer fetched while
+          // the new link was coming up is about that new link. Blanking on the
+          // arrival wiped such an answer half a second later, and the page sat
+          // empty until the next poll.
+          let moved = last.is_some_and(|l| l.kind != LinkKind::None && l.kind != kind);
           last = Some(state);
           generation.fetch_add(1, Ordering::Release);
           let families = match (state.ip4.is_some(), state.ip6.is_some()) {
