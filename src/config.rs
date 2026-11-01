@@ -23,6 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::secret;
 
+/// The portal's name with both an A and an AAAA record.
+///
+/// The v4-only name this client used to ship (`auth4`) has no AAAA, and a link
+/// with no IPv4 address cannot even resolve it: Windows drops A-only names when
+/// the machine holds no IPv4 address. Both names reach the same portal over
+/// IPv4, so this one is the default for every link.
+pub const DEFAULT_HOST: &str = "auth.tsinghua.edu.cn";
+
+/// What this client stored before [`DEFAULT_HOST`]; only read to migrate it.
+const LEGACY_HOST: &str = "auth4.tsinghua.edu.cn";
+
 /// Settings the window owns: they only change how it renders and starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -91,7 +102,7 @@ impl Default for CoreConfig {
       username: String::new(),
       password: String::new(),
       remember_password: false,
-      host: "auth4.tsinghua.edu.cn".into(),
+      host: DEFAULT_HOST.into(),
       https: true,
       ac_id: "auto".into(),
       ip: String::new(),
@@ -327,6 +338,13 @@ impl CoreConfig {
       Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
       Err(_) => CoreConfig::default(),
     };
+    // A stored `auth4` is moved to the dual-stack name: both reach the same
+    // portal over IPv4, and the old one has no AAAA at all, so on a link with no
+    // IPv4 address (Windows drops A-only names there) the request could never
+    // even be resolved. Rewriting it in memory lets the next save carry it.
+    if cfg.host.eq_ignore_ascii_case(LEGACY_HOST) {
+      cfg.host = DEFAULT_HOST.into();
+    }
     // The sealed blob is the authoritative record of the account: it survives a
     // lost or unreadable `core.json`, and it is bound to this machine, so it
     // cannot have been written by somebody else.

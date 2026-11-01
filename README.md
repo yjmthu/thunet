@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A small cross-platform app that logs you into the Tsinghua University campus network (`auth4.tsinghua.edu.cn`, SRun3K portal) and keeps the connection alive. On the desktop it lives in the tray; on Android it is a plain APK.
+A small cross-platform app that logs you into the Tsinghua University campus network (`auth.tsinghua.edu.cn`, SRun3K portal) and keeps the connection alive. On the desktop it lives in the tray; on Android it is a plain APK. IPv4 and IPv6 work alike, including the IPv6-only `Tsinghua-IPv6` Wi-Fi.
 
 One executable, no runtime dependencies, no console window; runs on Windows, Linux, macOS and Android, and speaks Chinese or English.
 
@@ -90,10 +90,12 @@ Log lines look like this:
 
 ```
 [2026-10-20 12:56:26] [INFO] connected
-[2026-10-20 12:56:41] [DEBUG] portal: auth4.tsinghua.edu.cn
+[2026-10-20 12:56:41] [DEBUG] portal: auth.tsinghua.edu.cn
 ```
 
 Each level (`DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) has its own colour. Log text is always English — it is developer-facing diagnostics, so it does not follow the *Language* setting; everything else in the window does. The strip shows the newest lines and scrolls.
+
+No log line carries an address or the portal's own answer: a log is what gets pasted into a bug report, and the machine's address is the one thing there that identifies it. `thunet status` is where the addresses are, and it prints them only when asked.
 
 *Settings → Log level* hides lines below the chosen level (`DEBUG` shows everything, then `INFO`, `WARN`, `ERROR`). Hiding is display-only: the lines are still kept, so lowering the level again brings them back.
 
@@ -315,7 +317,7 @@ A pair that was piped or asked for always produces the `credentials:` line (`sav
   "core":   { "version": "0.1.5", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
-              "host": "auth4.tsinghua.edu.cn",
+              "host": "auth.tsinghua.edu.cn",
               "credential": { "username": "1234567890", "has_password": true,
                               "remembered": true, "revision": 2, "matches": null },
               "auto_connect": true, "keep_online": true,

@@ -221,6 +221,25 @@ pub fn decode_body(bytes: &[u8], charset: Option<&str>) -> String {
   encoding.decode(bytes).0.into_owned()
 }
 
+/// External HTTP targets the campus gateway intercepts while a login is needed,
+/// and that answer directly once it is not.
+///
+/// Two lists, because a link with no IPv4 address cannot resolve the first one:
+/// Windows drops A-only names when the machine holds no IPv4 address, so the v6
+/// list names hosts that publish an AAAA of their own. The campus one is last
+/// there on purpose - it is the target most likely to be reachable for reasons
+/// other than "the internet works".
+const PROBES_V4: [&str; 3] = [
+  "http://connect.rom.miui.com/generate_204",
+  "http://www.msftconnecttest.com/connecttest.txt",
+  "http://www.baidu.com/",
+];
+const PROBES_V6: [&str; 3] = [
+  "http://ipv6.baidu.com/",
+  "http://www.taobao.com/",
+  "http://www.tsinghua.edu.cn/",
+];
+
 impl Client {
   pub fn new(host: impl Into<String>, https: bool, timeout: Duration) -> Self {
     let (agent, login_agent) = Self::agents(timeout);
@@ -291,16 +310,19 @@ impl Client {
   /// even when nobody asked to log in (it decides whether *Connect* is usable),
   /// so the timeout is deliberately shorter than a normal request.
   pub fn net_env(&self) -> Probe {
-    const PROBES: [&str; 3] = [
-      "http://connect.rom.miui.com/generate_204",
-      "http://www.msftconnecttest.com/connecttest.txt",
-      "http://www.baidu.com/",
-    ];
+    // No live link: nothing can answer, and probing would only spend three
+    // timeouts to learn that. On a phone this is the case that has to stay
+    // quiet.
+    if !link_present() {
+      return Probe::NothingAnswered;
+    }
+    let v4 = link_id().is_some();
+    let probes = if v4 { PROBES_V4 } else { PROBES_V6 };
     let agent: ureq::Agent = ureq::Agent::config_builder()
       .timeout_global(Some(Duration::from_secs(2)))
       .build()
       .into();
-    for url in PROBES {
+    for url in probes {
       match agent.get(url).header("User-Agent", UA).call() {
         Ok(mut resp) => {
           let body = resp.body_mut().read_to_string().unwrap_or_default();
@@ -339,7 +361,18 @@ impl Client {
       .and_then(|r| r.strip_prefix('('))
       .and_then(|r| r.strip_suffix(')'))
       .unwrap_or(t);
-    serde_json::from_str(inner).map_err(|e| NetError::msg(format!("bad JSON: {e}: {inner}")))
+    serde_json::from_str(inner).map_err(|e| {
+      // What kind of answer it was, never the answer itself: the body carries
+      // this machine's own address, and an error message ends up in the log.
+      let what = if inner.trim_start().starts_with('<') {
+        "an HTML page"
+      } else if inner.is_empty() {
+        "an empty body"
+      } else {
+        "something that is not JSON"
+      };
+      NetError::msg(format!("portal answered {what}: {e}"))
+    })
   }
 
   pub fn challenge(&self, username: &str, ip: &str) -> Result<String, NetError> {
@@ -355,12 +388,19 @@ impl Client {
       .map_err(|e| e.context("get_challenge"))?;
     let v = Self::jsonp(&body)?;
     if v.get("res").and_then(Value::as_str) != Some("ok") {
-      return Err(NetError::msg(format!("challenge rejected: {v}")));
+      // Code and reason only; the answer carries the caller's address.
+      let code = v.get("ecode").map(|c| c.to_string()).unwrap_or_default();
+      let why = v
+        .get("error_msg")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("no reason given");
+      return Err(NetError::msg(format!("challenge rejected ({code}): {why}")));
     }
     v.get("challenge")
       .and_then(Value::as_str)
       .map(str::to_owned)
-      .ok_or_else(|| NetError::msg(format!("no challenge field: {v}")))
+      .ok_or_else(|| NetError::msg("the challenge answer has no challenge field"))
   }
 
   /// Detect the AC id the campus gateway assigned to this client.
@@ -376,12 +416,9 @@ impl Client {
   pub fn detect_ac_id(&self) -> Result<(String, bool), NetError> {
     // External targets can only answer through the gateway, so a hit here
     // means we were intercepted and the id is the real AC.
-    const PROBES: [&str; 3] = [
-      "http://connect.rom.miui.com/generate_204",
-      "http://www.baidu.com/",
-      "http://www.msftconnecttest.com/connecttest.txt",
-    ];
-    for url in PROBES {
+    let v4 = link_id().is_some();
+    let probes = if v4 { PROBES_V4 } else { PROBES_V6 };
+    for url in probes {
       if let Ok(body) = self.get(url) {
         if let Some(id) = scan_ac_id(&body) {
           return Ok((id, true));
@@ -404,9 +441,9 @@ impl Client {
   }
 
   /// True when `/cgi-bin/rad_user_info` reports an active session.
-  pub fn is_online(&self, ac_id: &str) -> bool {
+  pub fn is_online(&self) -> bool {
     self
-      .status(ac_id)
+      .status()
       .ok()
       .and_then(|v| v.get("online").and_then(|b| b.as_bool()))
       .unwrap_or(false)
@@ -416,10 +453,10 @@ impl Client {
   ///
   /// THU's accounting row appears ~20 s after an accepted login, so a single
   /// immediate check is not enough.
-  pub fn wait_online(&self, ac_id: &str, timeout: Duration) -> bool {
+  pub fn wait_online(&self, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-      if self.is_online(ac_id) {
+      if self.is_online() {
         return true;
       }
       if start.elapsed() >= timeout {
@@ -429,17 +466,21 @@ impl Client {
     }
   }
 
-  pub fn status(&self, ac_id: &str) -> Result<Value, NetError> {
-    let page = self.get(&format!(
-      "{}://{}/srun_portal_pc?ac_id={}",
-      self.scheme(),
-      self.host,
-      enc(ac_id)
-    ))?;
-    let ip = scrape_ip(&page).ok_or_else(|| NetError::msg("public ip not found on portal page"))?;
-    let url = self.url("/cgi-bin/rad_user_info", &[("ip", &ip)]);
+  /// Ask the portal about this client's own session.
+  ///
+  /// `rad_user_info` without `ip` answers about the address the request came
+  /// from, which is the only address this client can vouch for - and the only
+  /// form that works on both families. The old `srun_portal_pc` page exists to
+  /// name the client's public IPv4, so on a v6-only link it could not be read
+  /// at all (`public ip not found on portal page`).
+  pub fn status(&self) -> Result<Value, NetError> {
+    let url = self.url("/cgi-bin/rad_user_info", &[]);
     let mut v = Self::jsonp(&self.get(&url)?)?;
     let online = v.get("error").and_then(Value::as_str) == Some("ok");
+    // Read before taking the object apart: the answer names the address it saw
+    // in more than one field, and which of them is filled depends on the
+    // session (a v6 login answers `client_ip: "0.0.0.0"`).
+    let seen = seen_address(&v);
     if let Some(obj) = v.as_object_mut() {
       // The portal nests the per-device list in a JSON *string*; hand it on as
       // the object it describes. See [`expanded_device_detail`].
@@ -449,7 +490,9 @@ impl Client {
       {
         obj.insert("online_device_detail".into(), devices);
       }
-      obj.insert("ip".into(), json!(ip));
+      if let Some(seen) = seen {
+        obj.insert("ip".into(), json!(seen));
+      }
       obj.insert("online".into(), json!(online));
     }
     Ok(v)
@@ -508,19 +551,9 @@ impl Client {
   fn portal_view_of(body: &str) -> Option<PortalView> {
     let v = Self::jsonp(body).ok()?;
     let error = v.get("error").and_then(Value::as_str)?;
-    // The portal speaks two shapes: the older answers carry `client_ip`, the
-    // current one reports the address as `online_ip` (and has no `client_ip`
-    // at all).
-    let address = v
-      .get("client_ip")
-      .or_else(|| v.get("online_ip"))
-      .and_then(Value::as_str)
-      .map(str::trim)
-      .filter(|ip| !ip.is_empty())
-      .map(str::to_owned);
     Some(PortalView {
       logged_in: error == "ok",
-      address,
+      address: seen_address(&v),
     })
   }
 
@@ -949,12 +982,33 @@ pub fn link_id() -> Option<std::net::IpAddr> {
   socket.local_addr().ok().map(|a| a.ip())
 }
 
+/// Is there a link to send on: a route whose interface reports itself up.
+///
+/// `link_up()` alone only says the kernel has a route. A driver can keep one on
+/// an adapter whose cable is out or whose Wi-Fi lost its access point, and the
+/// window then shows a link kind and an address for a network that is gone.
+pub fn link_present() -> bool {
+  link_kind() != crate::proto::LinkKind::None
+}
+
 /// Cheap "is there a route to the internet at all?" check.
 ///
 /// Used to start a login attempt the moment the network comes up instead of
-/// waiting for a poll interval.
+/// waiting for a poll interval. Either family is enough: a v6-only network has
+/// no IPv4 route at all, and calling that "no link" is how the app used to sit
+/// still on `Tsinghua-IPv6`.
 pub fn link_up() -> bool {
-  link_id().is_some()
+  link_id().is_some() || link_id6().is_some()
+}
+
+/// The machine's own address on the default route, in both families.
+///
+/// This is the identity of the link it is on: a cable swap or a change of Wi-Fi
+/// changes the first, and a v6-only network has only the second. Watching the
+/// pair is what lets the link watch notice a move on a network that has no
+/// IPv4 at all.
+pub fn link_addrs() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
+  (link_id(), link_id6().map(std::net::IpAddr::V6))
 }
 
 /// The IPv6 counterpart of [`link_id`].
@@ -1044,6 +1098,32 @@ fn default_route(table: &str) -> Option<String> {
   best.map(|(_, iface)| iface)
 }
 
+/// The default-route interface in `/proc/net/ipv6_route`.
+///
+/// Each line is hex: destination prefix (32 digits), its length, source prefix,
+/// its length, next hop, metric, ref, use, flags, interface. A default route has
+/// an all-zero destination and a zero prefix length, and the kernel uses the
+/// lowest metric among them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn default_route6(table: &str) -> Option<String> {
+  let mut best: Option<(u32, String)> = None;
+  for line in table.lines() {
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() < 10 {
+      continue;
+    }
+    let (destination, prefix_len, metric, iface) = (cols[0], cols[1], cols[5], cols[9]);
+    if destination.len() != 32 || destination.bytes().any(|b| b != b'0') || prefix_len != "00" {
+      continue;
+    }
+    let metric = u32::from_str_radix(metric, 16).unwrap_or(0);
+    if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+      best = Some((metric, iface.to_string()));
+    }
+  }
+  best.map(|(_, iface)| iface)
+}
+
 #[cfg(windows)]
 mod link_imp {
   use crate::proto::LinkKind;
@@ -1051,8 +1131,10 @@ mod link_imp {
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
     GetBestInterfaceEx, IP_ADAPTER_ADDRESSES_LH,
   };
+  use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_UNSPEC, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN,
+    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_IN6_0,
   };
 
   /// `IF_TYPE_ETHERNET_CSMACD` and `IF_TYPE_IEEE80211` from `ipifcons.h`.
@@ -1065,24 +1147,67 @@ mod link_imp {
   const MAX_LIST_BYTES: u32 = 4 * 1024 * 1024;
 
   pub fn link_kind() -> LinkKind {
+    // An interface is not a link. `GetBestInterfaceEx` still names an adapter
+    // when no route exists at all, which is how the row kept saying "WLAN"
+    // after every network had been turned off. The route lookup is what decides
+    // whether there is anywhere to send.
+    if !crate::srun::link_up() {
+      return LinkKind::None;
+    }
     match best_index().and_then(adapter_info) {
+      // Media down on the adapter the route points at: whatever address or
+      // route is still cached there is not a link.
+      Some(Adapter { up: false, .. }) => LinkKind::None,
       // A phone sharing its connection over USB is an ordinary Ethernet
       // adapter to Windows; only its driver description says otherwise.
-      Some((IF_TYPE_ETHERNET_CSMACD, true)) => LinkKind::Usb,
-      Some((IF_TYPE_ETHERNET_CSMACD, false)) => LinkKind::Ethernet,
-      Some((IF_TYPE_IEEE80211, _)) => LinkKind::Wlan,
+      Some(Adapter {
+        if_type: IF_TYPE_ETHERNET_CSMACD,
+        tethered: true,
+        up: true,
+      }) => LinkKind::Usb,
+      Some(Adapter {
+        if_type: IF_TYPE_ETHERNET_CSMACD,
+        up: true,
+        ..
+      }) => LinkKind::Ethernet,
+      Some(Adapter {
+        if_type: IF_TYPE_IEEE80211,
+        up: true,
+        ..
+      }) => LinkKind::Wlan,
       // A route that exists but belongs to some other adapter (a tunnel, a
       // virtual switch) still is not "no link".
       Some(_) => LinkKind::Other,
-      None if crate::srun::link_up() => LinkKind::Other,
-      None => LinkKind::None,
+      // The adapter list could not name what carries the route.
+      None => LinkKind::Other,
     }
   }
 
   /// The index of the interface the routing table would send to `223.5.5.5`,
   /// which is the same destination `link_id()` asks the kernel about.
+  ///
+  /// A link that carries only IPv6 has no answer for that destination, so the
+  /// same question is asked again about a v6 address: otherwise the row read
+  /// "other" on a network whose interface is plain Wi-Fi.
   fn best_index() -> Option<u32> {
-    let target = SOCKADDR_IN {
+    best_index_to(&v4_target()).or_else(|| {
+      let target = v6_target();
+      unsafe { best_interface(&target as *const SOCKADDR_IN6 as *const SOCKADDR) }
+    })
+  }
+
+  fn best_index_to(target: &SOCKADDR_IN) -> Option<u32> {
+    unsafe { best_interface(target as *const SOCKADDR_IN as *const SOCKADDR) }
+  }
+
+  unsafe fn best_interface(target: *const SOCKADDR) -> Option<u32> {
+    let mut index = 0u32;
+    let rc = unsafe { GetBestInterfaceEx(target, &mut index) };
+    (rc == 0 && index != 0).then_some(index)
+  }
+
+  fn v4_target() -> SOCKADDR_IN {
+    SOCKADDR_IN {
       sin_family: AF_INET,
       sin_port: 53u16.to_be(),
       // Network order in memory, so the four octets land in the intended order.
@@ -1092,17 +1217,40 @@ mod link_imp {
         },
       },
       sin_zero: [0; 8],
-    };
-    let mut index = 0u32;
-    let rc =
-      unsafe { GetBestInterfaceEx(&target as *const SOCKADDR_IN as *const SOCKADDR, &mut index) };
-    (rc == 0 && index != 0).then_some(index)
+    }
   }
 
-  /// `IfType` of the adapter with that index and whether it is a phone on the
-  /// end of a USB cable, or `None` when the list cannot be read (which is a
-  /// different case from "not found" only for the log).
-  fn adapter_info(index: u32) -> Option<(u32, bool)> {
+  /// `2400:3200::1`, the address `link_id6()` asks about.
+  fn v6_target() -> SOCKADDR_IN6 {
+    SOCKADDR_IN6 {
+      sin6_family: AF_INET6,
+      sin6_port: 53u16.to_be(),
+      sin6_flowinfo: 0,
+      sin6_addr: IN6_ADDR {
+        u: IN6_ADDR_0 {
+          Byte: [
+            0x24, 0x00, 0x32, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+          ],
+        },
+      },
+      Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+    }
+  }
+
+  /// What the adapter list says about one interface: its `IfType`, whether it is
+  /// a phone on the end of a USB cable, and whether the media is up.
+  struct Adapter {
+    if_type: u32,
+    tethered: bool,
+    /// `IfOperStatusUp`. A driver can keep an address (and even a route) on an
+    /// adapter whose media went away, and the row would then name a link that is
+    /// no longer there.
+    up: bool,
+  }
+
+  /// The details of the adapter with that index, or `None` when the list cannot
+  /// be read (which is a different case from "not found" only for the log).
+  fn adapter_info(index: u32) -> Option<Adapter> {
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut size = 16 * 1024u32;
     loop {
@@ -1127,7 +1275,11 @@ mod link_imp {
         let adapter = unsafe { &*entry };
         let this = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
         if this == index {
-          return Some((adapter.IfType, is_tethered(&description(adapter))));
+          return Some(Adapter {
+            if_type: adapter.IfType,
+            tethered: is_tethered(&description(adapter)),
+            up: adapter.OperStatus == IfOperStatusUp,
+          });
         }
         entry = adapter.Next;
       }
@@ -1172,13 +1324,30 @@ mod link_imp {
   use crate::proto::LinkKind;
 
   pub fn link_kind() -> LinkKind {
-    let Ok(table) = std::fs::read_to_string("/proc/net/route") else {
+    // No route in either family is no link, whatever the tables say: an
+    // interface with only a link-local address is not somewhere to send.
+    if !crate::srun::link_up() {
       return LinkKind::None;
-    };
-    let Some(iface) = super::default_route(&table) else {
-      return LinkKind::None;
-    };
-    let sys = std::path::Path::new("/sys/class/net").join(&iface);
+    }
+    // A link that carries only IPv6 has no v4 default route, and reading that as
+    // "no link" is how the row said "no link" on an IPv6-only network whose
+    // interface was plain Wi-Fi.
+    let iface = std::fs::read_to_string("/proc/net/route")
+      .ok()
+      .and_then(|table| super::default_route(&table))
+      .or_else(|| {
+        std::fs::read_to_string("/proc/net/ipv6_route")
+          .ok()
+          .and_then(|table| super::default_route6(&table))
+      });
+    match iface {
+      Some(iface) => kind_of(&iface),
+      None => LinkKind::None,
+    }
+  }
+
+  fn kind_of(iface: &str) -> LinkKind {
+    let sys = std::path::Path::new("/sys/class/net").join(iface);
     if sys.join("wireless").exists() || sys.join("phy80211").exists() {
       return LinkKind::Wlan;
     }
@@ -1241,6 +1410,11 @@ mod link_imp {
   use crate::proto::LinkKind;
 
   pub fn link_kind() -> LinkKind {
+    // The Activity's file names a transport, not a route: with mobile data off
+    // and no Wi-Fi it can still say "wlan". No route, no link.
+    if !crate::srun::link_up() {
+      return LinkKind::None;
+    }
     let path = crate::config::dir().join("link.txt");
     match std::fs::read_to_string(path) {
       Ok(text) => match text.trim() {
@@ -1300,35 +1474,24 @@ fn scan_ac_id(page: &str) -> Option<String> {
   None
 }
 
-fn scrape_ip(page: &str) -> Option<String> {
-  let b = page.as_bytes();
-  let mut i = 0;
-  while i + 2 <= b.len() {
-    if b[i] == b'i' && b[i + 1] == b'p' && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
-      let mut j = i + 2;
-      while j < b.len() && b[j].is_ascii_whitespace() {
-        j += 1;
-      }
-      if j < b.len() && b[j] == b':' {
-        j += 1;
-        while j < b.len() && b[j].is_ascii_whitespace() {
-          j += 1;
-        }
-        if j < b.len() && b[j] == b'"' {
-          j += 1;
-          let start = j;
-          while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') {
-            j += 1;
-          }
-          if j > start {
-            return Some(page[start..j].to_string());
-          }
-        }
-      }
-    }
-    i += 1;
-  }
-  None
+/// The address an answer names for this client.
+///
+/// Which field carries it depends on the deployment and the session: the older
+/// answers carry `client_ip`, the current one reports `online_ip` (and no
+/// `client_ip` at all), and a session opened over IPv6 answers
+/// `client_ip: "0.0.0.0"` with the real address in `online_ip`/`online_ip6`.
+/// So the first field that names an actual address wins, and an all-zero one is
+/// skipped rather than shown as if it were the machine's own.
+fn seen_address(v: &Value) -> Option<String> {
+  ["online_ip", "client_ip", "online_ip6"]
+    .iter()
+    .find_map(|key| {
+      v.get(*key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty() && *ip != "0.0.0.0" && *ip != "::")
+        .map(str::to_owned)
+    })
 }
 
 /// The per-device list the portal nests inside a JSON *string*.
@@ -1431,15 +1594,19 @@ mod tests {
     assert!(!looks_like_portal(&"<html>".repeat(2000)));
   }
 
+  /// The portal speaks several shapes for its own address field; the one that
+  /// names a real address is the one to believe.
   #[test]
-  fn ip_scrape() {
-    // 192.0.2.0/24 is reserved for documentation (RFC 5737).
-    assert_eq!(
-      scrape_ip("        ip     : \"192.0.2.10\",\n").as_deref(),
-      Some("192.0.2.10")
-    );
-    assert_eq!(scrape_ip("ip : \"1.2.3.4\",").as_deref(), Some("1.2.3.4"));
-    assert_eq!(scrape_ip("ipv6 : \"::1\""), None);
+  fn the_address_a_session_names_is_the_first_real_one() {
+    let v: Value =
+      serde_json::from_str(r#"{"client_ip":"0.0.0.0","online_ip":"2001:db8::7"}"#).unwrap();
+    assert_eq!(seen_address(&v).as_deref(), Some("2001:db8::7"));
+    let v: Value = serde_json::from_str(r#"{"client_ip":"192.0.2.10"}"#).unwrap();
+    assert_eq!(seen_address(&v).as_deref(), Some("192.0.2.10"));
+    let v: Value = serde_json::from_str(r#"{"client_ip":"::","online_ip":""}"#).unwrap();
+    assert_eq!(seen_address(&v), None);
+    let v: Value = serde_json::from_str(r#"{"errno":1}"#).unwrap();
+    assert_eq!(seen_address(&v), None);
   }
 
   #[test]
@@ -1671,6 +1838,32 @@ mod tests {
     assert_eq!(default_route(no_default), None);
     assert_eq!(default_route("Iface\tDestination\tGateway\n"), None);
     assert_eq!(default_route(""), None);
+  }
+
+  /// A v6-only host has no line in `/proc/net/route` at all, so the v6 table is
+  /// the only place its interface is named. Field order is documented in the
+  /// kernel's `fib6_clean_node` output: destination, its length, source, its
+  /// length, next hop, metric, ref, use, flags, interface.
+  #[test]
+  fn the_v6_default_route_names_the_uplink_too() {
+    let table = "\
+      00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+      00000000000000000000000000000000 00000400 00000000 00000000 00000001 wlan0\n\
+      00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+      fe800000000000000000000000000001 00000064 00000000 00000000 00000003 eth0\n\
+      20010db8000000000000000000000000 40 00000000000000000000000000000000 00 \
+      00000000000000000000000000000000 00000400 00000000 00000000 00000001 eth0\n";
+    // The lowest metric wins, exactly as the kernel chooses; the ::1 line for
+    // loopback has a prefix length of its own and is not a default route.
+    assert_eq!(default_route6(table).as_deref(), Some("eth0"));
+
+    let wifi_only = "\
+      00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+      00000000000000000000000000000000 00000400 00000000 00000000 00000001 wlan0\n";
+    assert_eq!(default_route6(wifi_only).as_deref(), Some("wlan0"));
+
+    assert_eq!(default_route6(""), None);
+    assert_eq!(default_route6("::1/128 via lo\n"), None);
   }
 
   /// `rad_user_info` nests the per-device list in a JSON string, so the answer

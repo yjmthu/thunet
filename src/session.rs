@@ -152,7 +152,7 @@ impl Session {
 
   /// Query the portal and sync the local state with reality.
   pub fn refresh(&mut self) -> Result<serde_json::Value, NetError> {
-    let v = self.client.status(&self.cfg.ac_id)?;
+    let v = self.client.status()?;
     self.note_session_service(&v);
     let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
     self.state = if online {
@@ -190,7 +190,7 @@ impl Session {
 
   /// Cheap pre-check used before connect/disconnect actions.
   pub fn is_online_now(&self) -> bool {
-    self.client.is_online(&self.cfg.ac_id)
+    self.client.is_online()
   }
 
   /// Is the machine even attached to a network where logging in makes sense?
@@ -222,11 +222,21 @@ impl Session {
   }
 
   /// Build the "portal said no" message: reason + optional hint.
+  ///
+  /// The answer itself is never quoted: it echoes `client_ip`/`online_ip` and
+  /// the account's device list, and this text ends up in the banner and the log.
   fn rejected(&self, v: &serde_json::Value) -> String {
+    let reason = v
+      .get("error_msg")
+      .and_then(|m| m.as_str())
+      .filter(|m| !m.is_empty())
+      .or_else(|| v.get("error").and_then(|e| e.as_str()))
+      .unwrap_or("no reason given");
     format!(
-      "login rejected (ac_id={}): {v}\n\
+      "login rejected (ac_id={}, {}): {reason}\n\
        hint: ac_id can change with the network; pass --ac-id to override",
-      self.cfg.ac_id
+      self.cfg.ac_id,
+      ecode(v)
     )
   }
 
@@ -234,7 +244,7 @@ impl Session {
   pub fn ensure_online(&mut self) -> Result<String, NetError> {
     self.state = State::LoggingIn;
     self.failure = FailureKind::Other;
-    if self.client.is_online(&self.cfg.ac_id) {
+    if self.client.is_online() {
       self.state = State::LoggedIn;
       self.failures = 0;
       return Ok("already online".into());
@@ -307,10 +317,7 @@ impl Session {
           }
         }
       }
-      if self
-        .client
-        .wait_online(&self.cfg.ac_id, Duration::from_secs(20))
-      {
+      if self.client.wait_online(Duration::from_secs(20)) {
         self.state = State::LoggedIn;
         self.failures = 0;
         return Ok(format!(
@@ -325,7 +332,7 @@ impl Session {
       if crate::srun::is_ac_unreachable(&code, &error_msg(&v)) {
         self.failure = FailureKind::AcUnreachable;
         return Err(NetError::msg(format!(
-          "the portal could not reach the access controller for ac_id={}: {v}",
+          "the portal could not reach the access controller for ac_id={} ({code})",
           self.cfg.ac_id
         )));
       }

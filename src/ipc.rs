@@ -1110,23 +1110,30 @@ fn peer_of(stream: &Stream) -> Peer {
   // so rejecting session 0 turned every `thunet status` typed over SSH into a
   // pipe the DACL had just admitted being closed again, with no reason the CLI
   // could show.
+  //
+  // The label names the *role*, not the SID: a SID carries the machine's domain
+  // and the account's RID, which is exactly the kind of identifier a pasted log
+  // must not contain. "service account or not" is the whole of what the reader
+  // needs from it.
   let (authorized, how) = match stream.impersonate_client() {
     Ok(guard) => {
       let sid = crate::ident::current_thread_user_sid();
       let session = crate::ident::current_thread_session();
       drop(guard);
-      let sid_text = sid
-        .as_deref()
-        .and_then(crate::ident::sid_to_string)
-        .unwrap_or_else(|| "unknown".into());
+      let is_service = sid.as_deref().map(crate::ident::is_service_sid);
+      let who = match is_service {
+        Some(true) => "the service account",
+        Some(false) => "a user account",
+        None => "an unreadable account",
+      };
       let how = match session {
-        Some(session) => format!("impersonated sid={sid_text} session={session}"),
-        None => format!("impersonated sid={sid_text}, session unreadable"),
+        Some(session) => format!("impersonated as {who}, session {session}"),
+        None => format!("impersonated as {who}, session unreadable"),
       };
       // A SID that cannot be read cannot be told apart from the service account,
       // so it fails closed; a missing session id only costs a label.
-      match sid {
-        Some(sid) => (!crate::ident::is_service_sid(&sid), how),
+      match is_service {
+        Some(is_service) => (!is_service, how),
         None => (false, how),
       }
     }
@@ -1202,12 +1209,10 @@ fn trusted_stream(stream: Stream, machine: bool) -> Result<Stream, String> {
     crate::ident::pipe_owner_is_current_user(raw)
   };
   if !trusted {
-    let owner = crate::ident::pipe_owner_sid(raw)
-      .as_deref()
-      .and_then(crate::ident::sid_to_string)
-      .unwrap_or_else(|| "unknown".into());
+    // No SID in the message: it names the account that owns the pipe, and this
+    // string reaches a terminal and sometimes the log.
     return Err(format!(
-      "pipe owner {owner} is not {}",
+      "the pipe belongs to another account, not {}",
       if machine { "the service" } else { "this user" }
     ));
   }

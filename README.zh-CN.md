@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-一个跨平台的小程序：登录清华校园网（`auth4.tsinghua.edu.cn`，SRun3K 门户），并让连接一直保持在线。桌面版常驻托盘，安卓版是一个普通 APK。
+一个跨平台的小程序：登录清华校园网（`auth.tsinghua.edu.cn`，SRun3K 门户），并让连接一直保持在线。桌面版常驻托盘，安卓版是一个普通 APK。IPv4 与 IPv6 同等对待，纯 IPv6 的 `Tsinghua-IPv6` 也能用。
 
 桌面版只有一个可执行文件，没有运行时依赖，没有控制台窗口；可在 Windows、Linux、macOS 和 Android 上运行，界面支持中文和英文。
 
@@ -82,10 +82,12 @@
 
 ```
 [2026-10-20 12:56:26] [INFO] connected
-[2026-10-20 12:56:41] [DEBUG] portal: auth4.tsinghua.edu.cn
+[2026-10-20 12:56:41] [DEBUG] portal: auth.tsinghua.edu.cn
 ```
 
 每个级别（`DEBUG`、`INFO`、`WARN`、`ERROR`、`FATAL`）都有自己的颜色。日志正文始终是英文 —— 它是给开发者看的诊断信息，因此不跟随*语言*设置；窗口里的其他内容都会跟随。日志条显示最新的若干行，可以滚动。
+
+日志里不出现地址，也不引用门户的应答原文：日志正是会被粘进 issue 的东西，而本机地址是其中唯一能指认这台机器的信息。地址只在 `thunet status` 里，且只在你主动查询时输出。
 
 *设置 → 日志级别* 会隐藏低于所选级别的行（`DEBUG` 显示全部，然后是 `INFO`、`WARN`、`ERROR`）。隐藏只影响显示：日志并没有被丢弃，把级别调低后还会回来。
 
@@ -307,7 +309,7 @@ online
   "core":   { "version": "0.1.5", "build_epoch": 1792571000, "pid": 1234,
               "uptime_secs": 812,
               "state": "Online", "env": "Campus", "ac_id": "169",
-              "host": "auth4.tsinghua.edu.cn",
+              "host": "auth.tsinghua.edu.cn",
               "credential": { "username": "1234567890", "has_password": true,
                               "remembered": true, "revision": 2, "matches": null },
               "auto_connect": true, "keep_online": true,

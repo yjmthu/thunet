@@ -169,11 +169,33 @@ fn masked_log(text: String, accounts: &[&str], hidden: bool) -> String {
 
 fn info_from(v: &Value) -> Info {
   let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
-  let ip4 = {
-    let ip = norm_ip(s("online_ip"));
-    if ip.is_empty() { norm_ip(s("ip")) } else { ip }
+  // An answer from a v6-only link names the caller with its v6 address (in
+  // `client_ip`/`online_ip`, the fields that always meant "the address the
+  // portal sees"), so each row has to take only addresses of its own family
+  // rather than whichever one happens to be first.
+  let seen = {
+    let first = norm_ip(s("online_ip"));
+    if first.is_empty() {
+      norm_ip(s("ip"))
+    } else {
+      first
+    }
   };
-  let ip6 = norm_ip(s("online_ip6"));
+  let ip4 = if seen.contains(':') {
+    String::new()
+  } else {
+    seen.clone()
+  };
+  let ip6 = {
+    let own = norm_ip(s("online_ip6"));
+    if !own.is_empty() {
+      own
+    } else if seen.contains(':') {
+      seen.clone()
+    } else {
+      String::new()
+    }
+  };
   let devices = devices_from(v.get("online_device_detail"), &ip4, &ip6);
   // The portal reports the total as a *string*, and it can disagree with the
   // detail: count what is actually listed, and only fall back to the portal's
@@ -2263,7 +2285,10 @@ impl App {
               // only on hover.
               ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
-                if !self.info.service.is_empty() {
+                // Only a link can carry a session: with no route at all the tag
+                // is a leftover from the link just left, and the window's own
+                // 2 s read of the interface can be ahead of the core's clear.
+                if !self.info.service.is_empty() && self.uplink != LinkKind::None {
                   let name = service_name(&self.info.service);
                   let tag = egui::RichText::new(name)
                     .monospace()
@@ -3201,6 +3226,13 @@ const DEVICES_GAP: f32 = 8.0;
 const DEVICES_EDGE_PAD: f32 = 6.0;
 /// Widest the system/type column may get before it is elided.
 const DEVICES_KIND_MAX: f32 = 110.0;
+/// Widest the address column may get before it is elided.
+///
+/// A full IPv6 address is 39 characters and would otherwise stretch the dialog
+/// as wide as it can go for one row's sake. The column stops growing here - far
+/// past any IPv4 address - and the row's label elides at that width, with the
+/// widget's own hover text showing the whole value.
+const DEVICES_ADDR_MAX: f32 = 180.0;
 
 impl App {
   /// The account's online-device count beside its name, and the click that
@@ -3353,7 +3385,7 @@ fn devices_list(
   for d in devices {
     let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
     let kind = &d.class;
-    addr_w = addr_w.max(measure(addr, &mono));
+    addr_w = addr_w.max(measure(addr, &mono).min(DEVICES_ADDR_MAX));
     kind_w = kind_w.max(measure(kind, &body).min(DEVICES_KIND_MAX));
   }
   // Each column gets what its widest entry needs, so an address is only elided
@@ -5332,6 +5364,15 @@ mod tests {
     assert_eq!(info_from(&v).service, "PermitALL");
     let v: Value = serde_json::from_str(r#"{"user_name":"1234567890"}"#).unwrap();
     assert_eq!(info_from(&v).service, "");
+
+    // A v6-only link answers with this machine's v6 address in `client_ip`: it
+    // belongs to the IPv6 row, and the IPv4 row keeps quiet rather than showing
+    // an address of the wrong family.
+    let v: Value =
+      serde_json::from_str(r#"{"client_ip":"2001:db8::7","online_ip":"2001:db8::7"}"#).unwrap();
+    let info = info_from(&v);
+    assert_eq!(info.ip4, "");
+    assert_eq!(info.ip6, "2001:db8::7");
   }
 
   /// The portal's `domain` is shown as the service it names: the deployment
@@ -5553,6 +5594,59 @@ mod tests {
       layout.used <= layout.planned + 0.5,
       "the body used more width than it planned: {layout:?}"
     );
+  }
+
+  /// An IPv6 address is 39 characters: the address column stops at
+  /// `DEVICES_ADDR_MAX` rather than stretching the dialog, and the row's label
+  /// elides there (its own hover text carries the whole value).
+  #[test]
+  fn a_v6_address_does_not_stretch_the_device_list() {
+    let t = crate::i18n::Lang::En.texts();
+    // Documentation prefix (RFC 3849), full length, IPv6 only.
+    let devices = vec![Device {
+      id: "1".into(),
+      ip6: "2001:db8:3:801:809:ffff:ec18:d7a7".into(),
+      local: true,
+      ..Default::default()
+    }];
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(DEFAULT_WIDTH, WINDOW_HEIGHT),
+      )),
+      ..Default::default()
+    };
+    let mut layout = None;
+    let mut out = ctx.run_ui(input, |ui| {
+      egui::CentralPanel::default().show(ui, |ui| {
+        let mut open = true;
+        let mut copied = None;
+        layout = Some(devices_list(
+          ui,
+          &devices,
+          devices.len(),
+          t,
+          &mut open,
+          false,
+          &mut copied,
+        ));
+      });
+    });
+    out.textures_delta.clear();
+    let layout = layout.expect("the list is laid out at least once");
+    let capped = DEVICES_EDGE_PAD
+      + DEVICES_DOT
+      + 2.0 * DEVICES_GAP
+      + DEVICES_ICON
+      + DEVICES_ADDR_MAX
+      + DEVICES_GAP
+      + DEVICES_ICON;
+    assert!(
+      layout.planned <= capped + 0.5,
+      "a v6 address stretched the dialog past the address cap: {layout:?}"
+    );
+    assert!(layout.grid <= layout.planned + 0.5, "{layout:?}");
   }
 
   #[test]
@@ -6468,15 +6562,34 @@ impl eframe::App for App {
     // plugged in within a couple of seconds, and the service poll is 30 s.
     if Instant::now() >= self.next_uplink {
       self.next_uplink = Instant::now() + Duration::from_secs(2);
+      let before = self.uplink;
       self.uplink = crate::srun::link_kind();
+      let no_link = self.uplink == LinkKind::None;
+      // No link, no session to describe: the portal rows were read on the link
+      // that just went, and this read of the interface can be a beat ahead of
+      // the core's clear. Blank them here so `No link` never carries a service
+      // tag from the link just left.
+      if no_link && before != LinkKind::None {
+        self.info = Info::default();
+      }
       // The address the machine holds on that link. Two route lookups, no
       // packet sent; cheap enough for the same tick the link kind is read on.
-      self.local_ip4 = crate::srun::link_id()
-        .map(|ip| ip.to_string())
-        .unwrap_or_default();
-      self.local_ip6 = crate::srun::link_id6()
-        .map(|ip| ip.to_string())
-        .unwrap_or_default();
+      // With no link there is nothing to report either: a stale address on a
+      // downed adapter is not the machine's address on any network.
+      self.local_ip4 = if no_link {
+        String::new()
+      } else {
+        crate::srun::link_id()
+          .map(|ip| ip.to_string())
+          .unwrap_or_default()
+      };
+      self.local_ip6 = if no_link {
+        String::new()
+      } else {
+        crate::srun::link_id6()
+          .map(|ip| ip.to_string())
+          .unwrap_or_default()
+      };
       // The Activity rewrites the night mode when the system theme changes;
       // re-reading it on the same slow tick keeps the per-frame theme check
       // free of file access.

@@ -88,7 +88,10 @@ struct EnvProbe {
 /// Probe what the machine is attached to: the path to the internet, whether the
 /// campus portal is behind it, and whether the OS owns the session.
 fn probe_env(session: &Session) -> EnvProbe {
-  let connected = crate::srun::link_up();
+  // A route is not a link: the interface that carries it has to be up as well.
+  // Without that, a driver that keeps an address on an adapter whose media went
+  // away makes the window show a link that is not there.
+  let connected = crate::srun::link_present();
   // The campus verdict is portal evidence, never the Wi-Fi name: a wired link, a
   // router, a VPN and an emulator behind a campus host have no campus SSID, and
   // a phone that shares its own 802.1X session to this machine has a name that
@@ -108,11 +111,11 @@ fn probe_env(session: &Session) -> EnvProbe {
   let portal_note = if ask_portal {
     Some(match &view {
       None => "portal: no answer".to_string(),
-      Some(view) => match &view.address {
-        Some(seen) if view.logged_in => format!("portal: answered, logged in on {seen}"),
-        Some(seen) => format!("portal: answered, nobody logged in (it sees {seen})"),
-        None => "portal: answered, nobody logged in".to_string(),
-      },
+      // The address stays out of the log on purpose: a log gets pasted into an
+      // issue, and the address is the one thing there that identifies the
+      // machine. `thunet status` still prints it for whoever asks.
+      Some(view) if view.logged_in => "portal: answered, logged in".to_string(),
+      Some(_) => "portal: answered, nobody logged in".to_string(),
     })
   } else {
     None
@@ -472,15 +475,23 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   // The path to the internet the last probe ran on. When it changes - a cable
   // pulled, Wi-Fi joined, a new address - the verdict describes a network the
   // machine has already left, so it is re-probed even while the session is up.
-  let mut last_link: Option<std::net::IpAddr> = None;
+  // Both families, because a v6-only link has nothing in the first.
+  let mut last_link: (Option<std::net::IpAddr>, Option<std::net::IpAddr>) = (None, None);
   // The route change being watched: the address and when it first appeared.
   // Only used to hold a move while a session is up.
-  let mut pending_link: Option<(Option<std::net::IpAddr>, Instant)> = None;
+  let mut pending_link: Option<(
+    (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
+    Instant,
+  )> = None;
   // The link the portal facts on screen were read on: the default-route address
-  // and the local address used to reach the portal. Both identify the path the
-  // portal sees, so a change in either makes the account, the service name and
-  // the session addresses describe a link the machine has already left.
-  let mut info_path: (Option<std::net::IpAddr>, Option<std::net::IpAddr>) = (None, None);
+  // in both families, and the local address used to reach the portal. Both
+  // identify the path the portal sees, so a change in either makes the account,
+  // the service name and the session addresses describe a link the machine has
+  // already left.
+  let mut info_path: (
+    (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
+    Option<std::net::IpAddr>,
+  ) = ((None, None), None);
   // Android: the transport is written to `files/link.txt` by the Activity, and
   // that write can land a moment after the route changed. A verdict computed in
   // between would describe the link the machine just left, so the kind itself
@@ -1012,7 +1023,14 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     // used to go unseen because the probe did not run while online.
     if Instant::now() >= next_link_check {
       next_link_check = Instant::now() + Duration::from_secs(1);
-      let id = crate::srun::link_id();
+      // A route is not a link: a driver can keep one on an adapter whose media
+      // went away. Gating the identity on the interface's own state is what
+      // clears the rows when the cable is out while the address is still cached.
+      let id = if crate::srun::link_present() {
+        crate::srun::link_addrs()
+      } else {
+        (None, None)
+      };
       // A route change only counts once it holds: a DHCP renew or a Wi-Fi roam
       // flips the local address for a second, and acting on that took the
       // window offline and started a fresh login for nothing. While a session
@@ -1077,7 +1095,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         failures = 0;
         last_failure.clear();
       }
-      let up = id.is_some();
+      let up = id.0.is_some() || id.1.is_some();
       if up && !link_ready {
         next_attempt = Instant::now();
         failures = 0;
@@ -1122,8 +1140,17 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // no longer has, and the rows refill with the service of the link just
         // left. That is the stale tag this clear exists to prevent.
         session.reset_pool();
+        // Families, not addresses: a log line gets pasted into an issue, and the
+        // address is the one thing there that identifies the machine.
+        let families = match (path.0.0.is_some(), path.0.1.is_some()) {
+          (true, true) => "v4+v6",
+          (true, false) => "v4",
+          (false, true) => "v6",
+          (false, false) => "no address",
+        };
+        let route = if path.1.is_some() { "known" } else { "unknown" };
         tx.send(Ev::Log(Line::debug(format!(
-          "portal rows: cleared, the path to the portal is now {path:?}"
+          "portal rows: cleared, the path to the portal changed ({families}, route {route})"
         ))))
         .ok();
       }
@@ -1415,7 +1442,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     let poll_due = force_status || catchup_due || last_status.elapsed() >= poll_every;
     if poll_due && last_env.polls_portal(session.state) {
       force_status = false;
-      let answer = session.client().status(&session.cfg().ac_id);
+      let answer = session.client().status();
       match &answer {
         Ok(v) => {
           status_failures = 0;

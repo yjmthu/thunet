@@ -1,6 +1,6 @@
 # SRun3K login protocol
 
-How the Tsinghua campus portal (`auth4.tsinghua.edu.cn`, SRun3K) is driven from plain HTTP(S) — no browser, no JavaScript.
+How the Tsinghua campus portal (`auth.tsinghua.edu.cn`, SRun3K) is driven from plain HTTP(S) — no browser, no JavaScript. The name has both an A and an AAAA record and both reach the same portal, so every step below works on an IPv4 link, a dual-stack link and an IPv6-only link alike.
 
 This document describes what the client implements. The code lives in `src/srun.rs` (protocol) and `src/session.rs` (state machine); the crypto primitives are in `src/crypto.rs`.
 
@@ -21,7 +21,7 @@ Installation, usage and troubleshooting are covered in the [README](../README.md
 
 ## 1. Decide whether a login is needed
 
-Three tiny probe requests (2 s timeout) say what is on the path to the internet:
+Three tiny probe requests (2 s timeout) say what is on the path to the internet. The names differ by family — `ipv6.baidu.com`, `www.taobao.com`, `www.tsinghua.edu.cn` on a link with no IPv4 route — because Windows drops A-only names when the machine holds no IPv4 address, so the v4 names cannot even be resolved there:
 
 | Probe result | Meaning |
 | --- | --- |
@@ -32,7 +32,7 @@ Three tiny probe requests (2 s timeout) say what is on the path to the internet:
 
 The client acts on a *verdict* of four separate facts (`LinkEnv` in `src/proto.rs`), not on one flat list of network cases:
 
-- **Is there a link at all.** `link_up()` performs a UDP `connect()` to `223.5.5.5:53`: the kernel does a route lookup and sends nothing. Without one the loop sleeps instead of firing HTTP requests, so a laptop on a train stays quiet.
+- **Is there a link at all.** `link_up()` performs a UDP `connect()` to `223.5.5.5:53` (and, when that has no route, to `[2400:3200::1]:53`): the kernel does a route lookup and sends nothing. Without a route in either family the loop sleeps instead of firing HTTP requests, so a laptop on a train stays quiet. An IPv6-only network is a link, not the absence of one.
 - **Does the internet work.** The probes above reached the internet without being intercepted. This is what tells "the gateway is holding me back" (log in) from "this link simply routes" (nothing to do).
 - **Is the campus portal behind it.** Either the interception named the `ac_id`, or `/cgi-bin/rad_user_info` answered. That is the property every campus path shares — cable, campus Wi-Fi, a router, a VPN, an SSL VPN into the campus — and none of them has to carry a campus SSID, so the Wi-Fi name is never consulted. A portal answer is an answer whether or not it names a session (`error: "ok"` vs `not_online_error`).
 - **Does the OS own the session.** The portal names the service a session was authenticated against in `domain` (`tsinghua-secure_new` for the 802.1X login), and a session from that service belongs to the OS: its row is a mirror of it, so no portal verb applies. This is a *portal* answer rather than a local one on purpose — a phone sharing its own 802.1X session to this machine would otherwise have the computer read the phone's Wi-Fi name.
@@ -114,11 +114,7 @@ A successful answer looks like `{"error":"ok","error_msg":"","suc_msg":"login_ok
 
 ## 8. Verify the session
 
-The RADIUS accounting row appears roughly **20 seconds** after an accepted login, so `srun_portal` returning `ok` is not proof of success. The client
-
-1. reads the assigned address from `/srun_portal_pc?ac_id=<ac_id>` (that page contains the client's public IP),
-2. asks `/cgi-bin/rad_user_info?ip=<ip>`, which returns the live session: `online`, `user_ip`, `online_ip`, `sum_bytes`, `sum_seconds`, `user_name`,
-3. polls step 2 once per second for up to ~30 s (`wait_online`).
+The RADIUS accounting row appears roughly **20 seconds** after an accepted login, so `srun_portal` returning `ok` is not proof of success. The client asks `/cgi-bin/rad_user_info` with no `ip`, which returns the live session for the address the request came from: `online`, `user_ip`, `online_ip`, `sum_bytes`, `sum_seconds`, `user_name`. That address may be a v6 one, and the client takes it as it comes — the old `srun_portal_pc` page scrape could only ever read an IPv4, which made a v6-only link unreadable. It polls the same call once per second for up to ~30 s (`wait_online`).
 
 `rad_user_info` also feeds the traffic counters and the periodic status refresh (every 15 s while online). The per-device list in `online_device_detail` arrives as a JSON *string* (an object encoded as text); the client parses it into an object before handing the answer on, and keeps the original text if it is not one.
 
