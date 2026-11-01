@@ -49,8 +49,6 @@ import android.window.OnBackInvokedDispatcher;
 public class ThunetActivity extends android.app.NativeActivity {
   /** Request code for the notification permission. */
   private static final int NOTIFY_REQUEST = 1001;
-  /** Request code for the location permission (Wi-Fi name detection). */
-  private static final int LOCATION_REQUEST = 1002;
 
   /** Autofill manager, or null on a device without the framework. */
   private AutofillManager afm;
@@ -107,9 +105,6 @@ public class ThunetActivity extends android.app.NativeActivity {
             OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::handleBack);
     super.onCreate(savedInstanceState);
     installAutofillHost();
-    // Refresh the Wi-Fi name the Rust side reads; a permission revoked in
-    // Settings leaves the detection off.
-    Ssid.update(this);
     // The level is the only source of truth: the service never starts itself.
     String mode = Wake.mode(this);
     if (Wake.MODE_SERVICE.equals(mode)) {
@@ -138,12 +133,6 @@ public class ThunetActivity extends android.app.NativeActivity {
     if (Wake.MODE_SERVICE.equals(Wake.mode(this)) && !notificationsAllowed()) {
       Wake.apply(this, Wake.MODE_WAKE);
       Wake.setDenied(this, true);
-    }
-    // Same for the Wi-Fi name: without the permission there is nothing to read.
-    if (Ssid.enabled(this) && !Ssid.permitted(this)) {
-      Ssid.setEnabled(this, false);
-    } else {
-      Ssid.update(this);
     }
     if (openOemAfterPower) {
       // The dialog has been answered; the OEM toggles are the other half, and
@@ -230,32 +219,8 @@ public class ThunetActivity extends android.app.NativeActivity {
     requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, NOTIFY_REQUEST);
   }
 
-  /**
-   * Called from Rust ({@code src/secure_wifi.rs}) when the SSID-detection row
-   * moves.
-   *
-   * Enabling asks for the location permission first; the answer, not this call,
-   * is what the window reads back.
-   */
-  public void setSecureDetection(boolean on) {
-    Log.i(Wake.TAG, "ssid: " + on);
-    if (!on) {
-      Ssid.setEnabled(this, false);
-      return;
-    }
-    if (Ssid.permitted(this)) {
-      Ssid.setEnabled(this, true);
-      return;
-    }
-    requestPermissions(new String[] {Manifest.permission.ACCESS_FINE_LOCATION}, LOCATION_REQUEST);
-  }
-
   @Override
   public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
-    if (request == LOCATION_REQUEST) {
-      Ssid.setEnabled(this, results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED);
-      return;
-    }
     if (request != NOTIFY_REQUEST) {
       super.onRequestPermissionsResult(request, permissions, results);
       return;

@@ -11,8 +11,9 @@ use crate::session::State;
 pub fn color_for(state: State) -> [u8; 3] {
   match state {
     State::LoggedIn => [46, 160, 67],
-    State::Authenticating => [210, 153, 34],
-    State::LoggedOut => [140, 140, 140],
+    State::LoggingIn => [210, 153, 34],
+    // No link, or no answer about the session.
+    State::LoggedOut | State::Unknown => [140, 140, 140],
   }
 }
 
@@ -123,7 +124,7 @@ pub fn app_fill(state: State) -> [u8; 3] {
   }
   match state {
     State::LoggedIn => PORTABLE_FILL,
-    State::Authenticating => [108, 158, 216],
-    State::LoggedOut => [72, 88, 116],
+    State::LoggingIn => [108, 158, 216],
+    State::LoggedOut | State::Unknown => [72, 88, 116],
   }
 }

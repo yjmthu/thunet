@@ -10,19 +10,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::CoreConfig;
 use crate::logline::Line;
-use crate::srun::{Client, NetEnv, NetError};
+use crate::srun::{Client, NetError, Probe};
 
+/// What the campus portal currently reports about this machine's address.
+///
+/// This is the third layer of the model and nothing else: whether a session
+/// exists. It says nothing about the link - a campus link with no session is
+/// `LoggedOut`, not "offline" - and nothing about what a login would do here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
-  /// The portal has no session for this address. Not "no internet": a campus
-  /// link can carry traffic while the portal still reports nobody signed in.
-  #[serde(rename = "Offline")]
+  /// No answer about this address yet: the core just started, the link just
+  /// changed, or the request never reached the portal. The honest default,
+  /// because "the portal says nobody is signed in" is a fact only the portal
+  /// can supply.
+  Unknown,
+  /// The portal answered and reports no session for this address.
   LoggedOut,
-  Authenticating,
+  /// A login is in flight (challenge + portal round trip).
+  LoggingIn,
   /// The portal reports a session for this address, or this core just opened
-  /// one. The wire keeps the old names, so a window and a service from
-  /// different builds still understand each other.
-  #[serde(rename = "Online")]
+  /// one.
   LoggedIn,
 }
 
@@ -44,6 +51,11 @@ pub struct Session {
   cfg: CoreConfig,
   /// True when `ac_id` was auto-detected (so it must be refreshed per connect).
   auto_ac: bool,
+  /// The service the portal named for the session on this address, when that
+  /// service is the OS's own (802.1X). Kept here because it arrives with an
+  /// *answer*, on the poll's schedule, while the link verdict is derived when
+  /// something changes.
+  os_session: Option<String>,
   /// Diagnostics produced off the UI thread; drained into the window log.
   warnings: Vec<Line>,
   pub state: State,
@@ -98,8 +110,9 @@ impl Session {
       client,
       cfg,
       auto_ac,
+      os_session: None,
       warnings,
-      state: State::LoggedOut,
+      state: State::Unknown,
       failures: 0,
       failure: FailureKind::Other,
     }
@@ -140,6 +153,7 @@ impl Session {
   /// Query the portal and sync the local state with reality.
   pub fn refresh(&mut self) -> Result<serde_json::Value, NetError> {
     let v = self.client.status(&self.cfg.ac_id)?;
+    self.note_session_service(&v);
     let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
     self.state = if online {
       State::LoggedIn
@@ -152,13 +166,35 @@ impl Session {
     Ok(v)
   }
 
+  /// The service the portal named for this address's session, when it is the
+  /// OS's own (802.1X).
+  pub fn os_session(&self) -> Option<&str> {
+    self.os_session.as_deref()
+  }
+
+  /// Read the session's owner out of one portal answer. Returns whether it
+  /// changed, so the caller can re-derive the link verdict that quotes it.
+  pub fn note_session_service(&mut self, answer: &serde_json::Value) -> bool {
+    let next = answer
+      .get("domain")
+      .and_then(|d| d.as_str())
+      .map(str::trim)
+      .filter(|d| crate::srun::is_os_service(d))
+      .map(str::to_owned);
+    if next == self.os_session {
+      return false;
+    }
+    self.os_session = next;
+    true
+  }
+
   /// Cheap pre-check used before connect/disconnect actions.
   pub fn is_online_now(&self) -> bool {
     self.client.is_online(&self.cfg.ac_id)
   }
 
   /// Is the machine even attached to a network where logging in makes sense?
-  pub fn net_env(&self) -> NetEnv {
+  pub fn net_env(&self) -> Probe {
     self.client.net_env()
   }
 
@@ -170,6 +206,12 @@ impl Session {
   /// it with the local default-route address can never match.
   pub fn portal_view(&self) -> Option<crate::srun::PortalView> {
     self.client.portal_view()
+  }
+
+  /// Forget the portal connections kept alive for reuse: they belong to the
+  /// link they were opened on (see [`crate::srun::Client::reset_pool`]).
+  pub fn reset_pool(&mut self) {
+    self.client.reset_pool();
   }
 
   /// Adopt an ac_id found by the caller's probe (only when auto-detecting).
@@ -190,7 +232,7 @@ impl Session {
 
   /// One full "make sure I am online" step.
   pub fn ensure_online(&mut self) -> Result<String, NetError> {
-    self.state = State::Authenticating;
+    self.state = State::LoggingIn;
     self.failure = FailureKind::Other;
     if self.client.is_online(&self.cfg.ac_id) {
       self.state = State::LoggedIn;
@@ -220,11 +262,13 @@ impl Session {
       ) {
         Ok(v) => v,
         Err(e) => {
-          // The request never reached the portal, so the state is unknown, not
-          // "authenticating". Leaving it there kept the window and the tray
-          // amber until a later status poll happened to succeed — which on a
-          // dead network never happens.
-          self.state = State::LoggedOut;
+          // The request never reached the portal, so there is no answer about
+          // this address. Leaving it at `LoggingIn` kept the window and the tray
+          // amber until a later status poll happened to succeed - which on a
+          // dead network never happens - and claiming `LoggedOut` there would
+          // state something the portal never said. `Unknown` is both honest and
+          // still "not logged in" for every decision below.
+          self.state = State::Unknown;
           // Keep the cause: the window words a dead network differently from a
           // portal that answered with something unusable.
           return Err(e.context(format!("request to {} failed", self.cfg.host)));

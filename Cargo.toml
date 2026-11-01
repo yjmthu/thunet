@@ -15,6 +15,9 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 ureq = "3"
+# Response bodies are decoded by the charset their `Content-Type` names (see
+# `srun::decode_body`), which matters for the portal's GBK pages.
+encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md-5 = "0.10"

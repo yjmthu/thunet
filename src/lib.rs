@@ -21,8 +21,6 @@ mod logline;
 mod prompt;
 mod proto;
 mod secret;
-#[cfg(target_os = "android")]
-mod secure_wifi;
 mod session;
 mod shortcut;
 mod single;
@@ -30,7 +28,6 @@ mod srun;
 mod theme;
 mod tray;
 mod ui;
-mod wifi;
 #[cfg(windows)]
 mod winsvc;
 

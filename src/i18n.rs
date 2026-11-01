@@ -105,12 +105,6 @@ pub struct Texts {
   /// Hover on a disabled *Apply*: the form is incomplete, or nothing changed.
   pub password_required: &'static str,
   pub nothing_to_apply: &'static str,
-  /// Android: read the Wi-Fi name to tell `Tsinghua-Secure` from a portal
-  /// network. Off by default because it needs the location permission.
-  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-  pub secure_detection: &'static str,
-  #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-  pub secure_detection_hint: &'static str,
   /// Android: how much of the app stays behind, mirroring the desktop's
   /// autostart triad, plus the hint for the level currently chosen.
   #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -178,6 +172,13 @@ pub struct Texts {
   /// Label for copying a range of log lines; the menu appends the count.
   pub copy_selection: &'static str,
   pub network_unavailable: &'static str,
+  /// Neither the plain probes nor the portal answered: a network that is up but
+  /// carries nothing, or a gateway that drops traffic from unauthenticated
+  /// clients before it reaches either of them.
+  pub network_unreachable: &'static str,
+  /// The portal reports no session for this address *and* the link routes
+  /// anyway: a VPN's egress, or a router that is already signed in. A login
+  /// here would vouch for that address, so this link needs none.
   pub no_login_needed: &'static str,
   pub not_campus_network: &'static str,
   /// Why a portal request failed, one line per [`crate::srun::NetCause`]. The
@@ -190,11 +191,11 @@ pub struct Texts {
   /// The other side closed the connection mid-answer.
   pub net_lost: &'static str,
   pub net_other: &'static str,
-  /// Shown while a login could still happen: the 802.1X network is the reason it
-  /// cannot.
+  /// Shown while a login could still happen: the session is the OS's own
+  /// (802.1X), which the portal named in its `domain`.
   pub secure_wifi: &'static str,
-  /// Shown while the session is already up on that network, so there is nothing
-  /// left for the user to do.
+  /// Shown while that session is already up, so there is nothing left for the
+  /// user to do.
   pub secure_wifi_online: &'static str,
   /// A portal verb was asked for on a network whose session belongs to the OS.
   pub disconnect_unavailable: &'static str,
@@ -209,12 +210,37 @@ pub struct Texts {
   pub lang_zh: &'static str,
   pub lang_en: &'static str,
   // status
+  /// Label for the status line: the machine can reach the internet. The line
+  /// says only *that*, because that is what a glance needs; what is signed in
+  /// where is the tooltip's job (see the `detail_*` strings below).
   pub online: &'static str,
-  pub authenticating: &'static str,
+  /// Label for the status line: no internet here (yet).
   pub offline: &'static str,
+  /// Label while a login is in flight.
+  pub signing_in: &'static str,
+  /// Tooltip line: the portal reports a session for this address, so the campus
+  /// network is entered and signed in. The label above it only says *online*,
+  /// so this line has to carry the whole fact on its own.
+  pub signed_in: &'static str,
+  /// Tooltip line: the campus portal answers, and no session exists for this
+  /// address: a login is what opens one.
+  pub not_signed_in: &'static str,
+  /// Tooltip line: the session exists but the OS opened it (802.1X), so the
+  /// portal verbs are not ours.
+  pub signed_in_system: &'static str,
+  /// Tooltip line: no link at all.
+  pub no_connection: &'static str,
+  /// Tooltip line: a link exists but nothing on it answers.
+  pub no_internet: &'static str,
+  /// Tooltip line: another operator's captive portal is in the way.
+  pub foreign_portal: &'static str,
   /// While no core answers: the window cannot tell what the link is doing, and
   /// the last verdict came from a core that is no longer there.
   pub unknown: &'static str,
+  /// Tooltip line: no core answers, so the words above are a leftover.
+  pub core_silent: &'static str,
+  /// Tooltip line: a portal login is in flight.
+  pub signing_in_note: &'static str,
   pub account: &'static str,
   /// Label of the row that names the link the session rides on (cable, Wi-Fi).
   pub link: &'static str,
@@ -282,9 +308,13 @@ pub struct Texts {
   /// The portal could not reach an access controller for the `ac_id` in use.
   pub ac_unreachable: &'static str,
   /// State label: the link reaches the internet without a portal session.
-  pub online_without_portal: &'static str,
-  /// State label: the link is not the campus network at all.
-  pub online_other_network: &'static str,
+  ///
+  /// State labels share one row with the heartbeat track, so they stay short:
+  /// the band below the header is where the full sentence goes.
+  pub online_no_login_needed: &'static str,
+  /// State label: the link is not the campus network at all. Short for the same
+  /// reason.
+  pub online_not_campus: &'static str,
   /// Status banner: that other network needs no login, and that is good news.
   pub online_no_portal: &'static str,
   pub refresh_failed: &'static str,
@@ -383,8 +413,6 @@ static ZH: Texts = Texts {
   auto_connect_without_credentials_online: "当前会话可继续，但没有保存密码——掉线后不会自动重连",
   password_required: "保存密码或更换账号都需要重新输入密码",
   nothing_to_apply: "没有需要应用的修改",
-  secure_detection: "Secure 检测",
-  secure_detection_hint: "读取 Wi-Fi 名称需要定位权限（并开启定位服务）；未授权时不作判断，只靠网络探测。",
   background_mode: "后台运行",
   background_off: "关闭",
   background_wake: "网络变化",
@@ -414,7 +442,8 @@ static ZH: Texts = Texts {
   copy_all: "复制全部",
   copy_selection: "复制选中的行",
   network_unavailable: "当前没有网络连接（网线未插或 Wi-Fi 未连接），暂不尝试登录",
-  no_login_needed: "当前网络不经过校园门户（未检测到拦截），本机不会尝试登录",
+  network_unreachable: "探测和门户都没有响应（网络不通，或网关不放行未登录的流量）",
+  no_login_needed: "门户已确认本地址没有会话，而链路已经能上网；本链路无需登录",
   not_campus_network: "当前网络不是清华校园网登录环境，跳过登录",
   net_resolve: "无法解析服务器地址（DNS）",
   net_refused: "服务器拒绝了连接",
@@ -422,8 +451,8 @@ static ZH: Texts = Texts {
   net_unreachable: "当前没有可用的网络（网线未插或网卡已禁用）",
   net_lost: "连接被对端中断（服务器或网关提前关闭了连接）",
   net_other: "网络请求失败",
-  secure_wifi: "已连接 {}（系统级 802.1X 认证），无需门户登录",
-  secure_wifi_online: "已通过 {} 登录（系统级 802.1X 认证），无需操作",
+  secure_wifi: "当前会话由系统级 802.1X 认证（门户只负责记账），无需在本页登录",
+  secure_wifi_online: "已通过系统级 802.1X 登录，无需操作",
   disconnect_unavailable: "当前网络由系统级 802.1X 认证，没有本程序建立的门户会话可断开",
   credentials_unavailable: "当前网络由系统级 802.1X 认证，门户账号在这里不会被使用",
   language: "语言",
@@ -436,12 +465,20 @@ static ZH: Texts = Texts {
   lang_zh: "中文",
   lang_en: "English",
   online: "在线",
-  online_without_portal: "已联网（未登录）",
-  online_other_network: "在线（其他网络）",
-  online_no_portal: "当前网络不是校园网，可直接上网，无需门户登录",
-  authenticating: "认证中",
   offline: "离线",
+  signing_in: "登录中",
+  signed_in: "校园网络已登录：门户确认本机地址上有一个会话",
+  not_signed_in: "校园网络未登录：门户有应答，但本机地址上没有会话",
+  signed_in_system: "校园网络已登录，走的是系统级 802.1X：会话由操作系统建立，这里不提供登录 / 登出",
+  no_connection: "没有网络连接：网线未插、Wi-Fi 未接入，或系统没有默认路由",
+  no_internet: "已连上网络，但它没有把流量送出去：可能还没拿到地址，或被网关截住",
+  foreign_portal: "这是其他网络的门户认证页，不是清华校园网：在这里登录解决不了校园网",
+  online_no_login_needed: "已联网：门户确认本地址上没有会话，本链路不需要登录",
+  online_not_campus: "已联网：清华门户没有应答，当前连的不是校园网络",
+  online_no_portal: "当前网络不是校园网，可直接上网，无需门户登录",
   unknown: "未知",
+  core_silent: "后台核心没有应答：这里显示的是它停下之前的状态，不代表现在的情况",
+  signing_in_note: "正在向校园门户提交登录，等门户确认会话",
   account: "账号",
   link: "网络",
   link_ethernet: "以太网",
@@ -450,7 +487,7 @@ static ZH: Texts = Texts {
   link_usb: "USB 共享",
   link_none: "未连接",
   link_other: "其他",
-  heartbeat_hint: "在线每 15 秒、离线每 10 秒查询一次门户状态",
+  heartbeat_hint: "在线每 15 秒、离线每 10 秒查询一次门户状态（门户不在本链路时不查）",
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "本次流量",
@@ -536,8 +573,6 @@ static EN: Texts = Texts {
   auto_connect_without_credentials_online: "This session keeps running, but no password is saved — it will not reconnect on its own",
   password_required: "Saving a password or changing the account needs the password typed in",
   nothing_to_apply: "Nothing to apply",
-  secure_detection: "Secure detection",
-  secure_detection_hint: "Reading the Wi-Fi name needs the location permission (and location services); without it the app falls back to the network probes.",
   background_mode: "Background",
   background_off: "Off",
   background_wake: "Wi-Fi change",
@@ -567,7 +602,8 @@ static EN: Texts = Texts {
   copy_all: "Copy all",
   copy_selection: "Copy selected lines",
   network_unavailable: "No network connection (cable unplugged / Wi-Fi down), not logging in",
-  no_login_needed: "This link does not go through the campus portal (nothing intercepts HTTP); no login is attempted",
+  network_unreachable: "Neither the probes nor the portal answered (the network is down, or the gateway drops traffic from unauthenticated clients)",
+  no_login_needed: "The portal confirms no session for this address and the link already routes; this link needs no login",
   not_campus_network: "This does not look like the Tsinghua campus login network; skipping",
   net_resolve: "Cannot resolve the server address (DNS)",
   net_refused: "The server refused the connection",
@@ -575,8 +611,8 @@ static EN: Texts = Texts {
   net_unreachable: "No network route to the server (cable unplugged or adapter disabled)",
   net_lost: "The connection was closed by the other side (server or gateway hung up)",
   net_other: "The network request failed",
-  secure_wifi: "Connected to {} (OS-level 802.1X); no portal login needed",
-  secure_wifi_online: "Signed in through {} (OS-level 802.1X); nothing to do",
+  secure_wifi: "This session was opened by OS-level 802.1X (the portal only mirrors it); no portal login is needed here",
+  secure_wifi_online: "Signed in through OS-level 802.1X; nothing to do",
   disconnect_unavailable: "This network authenticates at the OS level; this app has no portal session here to end",
   credentials_unavailable: "This network authenticates at the OS level; the portal account is not used here",
   language: "Language",
@@ -589,12 +625,20 @@ static EN: Texts = Texts {
   lang_zh: "中文",
   lang_en: "English",
   online: "Online",
-  online_without_portal: "Online (unauthenticated)",
-  online_other_network: "Online (other network)",
-  online_no_portal: "This is not the campus network; the internet works directly, so no portal login is needed",
-  authenticating: "Authenticating",
   offline: "Offline",
+  signing_in: "Signing in",
+  signed_in: "Signed in on the campus network: the portal reports a session for this address",
+  not_signed_in: "Not signed in on the campus network: the portal answers, but no session exists for this address",
+  signed_in_system: "Signed in on the campus network through OS-level 802.1X: the OS opened this session, so there is no login or logout to do here",
+  no_connection: "No network connection: no cable, no Wi-Fi, or no default route",
+  no_internet: "Connected, but nothing gets through: no address yet, or the gateway is holding traffic back",
+  foreign_portal: "This is another network's portal page, not the Tsinghua campus network: signing in here would not reach it",
+  online_no_login_needed: "Online: the portal confirms no session for this address, so this link needs no login",
+  online_not_campus: "Online: the Tsinghua portal did not answer, so this is not the campus network",
+  online_no_portal: "This is not the campus network; the internet works directly, so no portal login is needed",
   unknown: "Unknown",
+  core_silent: "No core is answering: what you see is the last state before it stopped, not what the network is doing now",
+  signing_in_note: "Signing in at the campus portal; waiting for it to confirm the session",
   account: "Account",
   link: "Link",
   link_ethernet: "Ethernet",
@@ -603,7 +647,7 @@ static EN: Texts = Texts {
   link_usb: "USB tethering",
   link_none: "No link",
   link_other: "Other",
-  heartbeat_hint: "Portal status is polled every 15 s online and 10 s offline",
+  heartbeat_hint: "Portal status is polled every 15 s online and 10 s offline (not at all where the portal is not on this link)",
   ipv4: "IPv4",
   ipv6: "IPv6",
   session_traffic: "Session traffic",

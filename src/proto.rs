@@ -23,13 +23,16 @@ use crate::session::State;
 /// Bumped whenever a [`Cmd`] or [`Ev`] variant changes shape or meaning.
 ///
 /// While the app is pre-release the window and the service are always installed
-/// from the same build, so this stays at 1 and the shapes may change freely.
+/// from the same build, so this stays low and the shapes may change freely.
 /// Raise it the first time an old core can meet a new frontend: a released
 /// build, or an upgrade that cannot restart both halves together.
 ///
 /// 2: [`Ev::Beat`] was added, and the window no longer takes a status answer as
 /// the heartbeat.
-pub const VERSION: u8 = 2;
+/// 3: [`Ev::Env`] carries [`LinkEnv`] instead of the old flat verdict, and the
+/// state variants travel under the names they have in code (`LoggedOut` where
+/// the wire used to say `Offline`).
+pub const VERSION: u8 = 3;
 
 /// What the frontend asks the core to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,27 +100,107 @@ pub enum ToastKind {
   Info,
 }
 
-/// Where the machine sits, as far as logging in is concerned. The core probes
-/// this and the UI greys *Connect* out when an attempt could not possibly work.
+/// Whether the campus portal is behind this link, and who owns the session.
+///
+/// The probe answers three questions separately, and the model keeps them
+/// separate because every rule downstream decomposes into them:
+///
+/// * [`LinkEnv::internet`] - the plain probes reached the internet without being
+///   intercepted. This is what tells "the gateway is holding me back" (log in)
+///   from "this link simply routes" (nothing to do).
+/// * [`LinkEnv::portal`] - the campus portal is here, someone else's portal is,
+///   or ours stayed silent.
+/// * [`LinkEnv::os_session`] - the portal says the OS opened the session on this
+///   address (802.1X), so it is not the portal's and its verbs do not apply.
+///   The evidence is the answer's `domain` field, not the Wi-Fi name: a phone
+///   sharing its own 802.1X session to this machine carries that session on an
+///   address whose local Wi-Fi name says nothing about it.
+///
+/// [`State`] is deliberately *not* in here: whether a session exists is the
+/// portal's answer, and it changes on a different schedule than the link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoginEnv {
-  /// The campus portal answered: this is the campus network, and the portal
-  /// verbs (Connect/Disconnect) apply.
-  Campus,
-  /// The OS authenticates this Wi-Fi at layer 2 (802.1X); no portal involved.
-  EnterpriseWifi(String),
-  /// Nothing answered: no cable, no Wi-Fi, no route, DNS broken.
-  NoNetwork,
+pub struct LinkEnv {
+  /// The machine has a route at all: a cable, a Wi-Fi association, a phone's
+  /// link. False means there is nothing to ask and nothing to log in on.
+  pub connected: bool,
+  /// The plain-HTTP probes reached the internet directly: nothing intercepted
+  /// them. False on a gateway that drops pre-login traffic, and on one that
+  /// answers with another operator's login page.
+  pub internet: bool,
+  pub portal: Portal,
+  /// The service the portal names for the session on this address, when that
+  /// service is the OS's own (802.1X). A login or a logout here would act on
+  /// something this app never opened.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub os_session: Option<String>,
+}
+
+/// What is behind the path to the internet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Portal {
+  /// The campus portal answered about this link: its gateway intercepted a
+  /// probe (`ac_id` names the access controller), or `/cgi-bin/rad_user_info`
+  /// answered. `ac_id` is `None` when nothing intercepted, which is also when a
+  /// login has no access controller to be addressed to.
+  Ours { ac_id: Option<String> },
   /// A captive portal that is not the campus one (hotel, airport, ...).
-  OtherPortal,
-  /// The internet works directly, and the campus portal answered without
-  /// naming a signed-in identity for this address: the campus link, with no
-  /// session on it. Nothing to send until a login is wanted.
-  NoPortal,
-  /// The internet works directly and the portal is not behind this link at all:
-  /// home Wi-Fi, mobile data, a hotspot. Nothing on this link is the campus
-  /// network, so no login will ever be attempted.
-  OtherNetwork,
+  Foreign,
+  /// The campus portal did not answer on this link. `internet` says whether
+  /// anything else did.
+  Silent,
+}
+
+impl LinkEnv {
+  /// A link where a failed request to the campus portal is worth a red band.
+  ///
+  /// Only where the portal is ours: on any other link the band would repeat, in
+  /// another tone, what the verdict band already says.
+  pub fn portal_answers(&self) -> bool {
+    matches!(self.portal, Portal::Ours { .. })
+  }
+
+  /// The OS owns the session here (802.1X), so the portal verbs are not ours to
+  /// use - and neither is the account: a login would prove nothing.
+  pub fn os_owns_session(&self) -> bool {
+    self.os_session.is_some()
+  }
+
+  /// Is a login both meaningful and addressable here?
+  ///
+  /// Meaningful because the gateway is holding traffic back (`!internet`): on a
+  /// link that already routes, a login would only authenticate an address the
+  /// portal can see for reasons of its own - behind a NAT, a VPN gateway's
+  /// egress - for everybody behind it. Addressable because the portal is ours
+  /// and is not the OS's business.
+  pub fn login_possible(&self) -> bool {
+    self.portal_answers() && !self.os_owns_session() && !self.internet
+  }
+
+  /// May a logout be sent? The session must be one the portal owns, and one
+  /// must exist (or be in flight, which is what *Disconnect* cancels).
+  pub fn logout_possible(&self, state: State) -> bool {
+    self.portal_answers()
+      && !self.os_owns_session()
+      && matches!(state, State::LoggedIn | State::LoggingIn)
+  }
+
+  /// Is a status poll of the portal worth making?
+  ///
+  /// Only where the portal can answer - a poll elsewhere is a guaranteed
+  /// timeout whose answer is already known - with one exception: while a session
+  /// is up the poll is the only thing watching the link, because the timer that
+  /// re-probes the network stays off then.
+  pub fn polls_portal(&self, state: State) -> bool {
+    self.portal_answers() || state == State::LoggedIn
+  }
+
+  /// Does the core's account form apply on this link? It does wherever a login
+  /// is possible, and also where one is merely pointless (a home network still
+  /// keeps a saved credential for the next campus link). It does not where the
+  /// session is the OS's.
+  pub fn account_form_applies(&self) -> bool {
+    !self.os_owns_session()
+  }
 }
 
 /// Which physical link carries the machine's default route.
@@ -164,7 +247,7 @@ pub struct CoreInfo {
   pub pid: u32,
   pub uptime_secs: u64,
   pub state: State,
-  pub env: LoginEnv,
+  pub env: LinkEnv,
   pub ac_id: String,
   pub host: String,
   /// The link the core's requests would leave on. Absent when the core is old
@@ -269,7 +352,7 @@ pub enum Ev {
     kind: ToastKind,
   },
   /// What the core's network probe last saw; drives *Connect* availability.
-  Env(LoginEnv),
+  Env(LinkEnv),
   /// Answer to [`Cmd::Status`]: one object with the core's own state under
   /// `core` and the portal's session/traffic dump under `portal`.
   Status(Value),
@@ -375,8 +458,20 @@ mod tests {
   fn events_roundtrip_including_the_network_verdict() {
     for ev in [
       Ev::State(State::LoggedIn),
-      Ev::Env(LoginEnv::EnterpriseWifi("Tsinghua-Secure".into())),
-      Ev::Env(LoginEnv::NoPortal),
+      Ev::Env(LinkEnv {
+        connected: true,
+        internet: true,
+        portal: Portal::Silent,
+        os_session: None,
+      }),
+      Ev::Env(LinkEnv {
+        connected: true,
+        internet: false,
+        portal: Portal::Ours {
+          ac_id: Some("169".into()),
+        },
+        os_session: Some("Tsinghua-Secure".into()),
+      }),
       Ev::Error(None),
       Ev::Error(Some(Failure::Credentials)),
       Ev::Error(Some(Failure::Network(crate::srun::NetCause::Resolve))),
@@ -422,7 +517,12 @@ mod tests {
       pid: 42,
       uptime_secs: 7,
       state: State::LoggedIn,
-      env: LoginEnv::Campus,
+      env: LinkEnv {
+        connected: true,
+        internet: true,
+        portal: Portal::Ours { ac_id: None },
+        os_session: None,
+      },
       ac_id: "169".into(),
       host: "auth4.tsinghua.edu.cn".into(),
       link: LinkKind::Wlan,
@@ -455,29 +555,107 @@ mod tests {
   #[test]
   fn a_core_that_does_not_report_the_link_still_parses() {
     // An updated window has to keep working against a service built before
-    // this field existed; the row then reads as "no link" rather than the
+    // these fields existed; the row then reads as "no link" rather than the
     // whole answer failing to parse.
-    let old = r#"{"version":"0.1.3","pid":1,"uptime_secs":2,"state":"Offline",
-      "env":"Campus","ac_id":"1","host":"auth4.tsinghua.edu.cn",
+    let old = r#"{"version":"0.1.3","pid":1,"uptime_secs":2,"state":"LoggedOut",
+      "env":{"connected":true,"internet":false,"portal":{"Ours":{"ac_id":"1"}}},
+      "ac_id":"1","host":"auth4.tsinghua.edu.cn",
       "credential":{"username":"alice","has_password":false,"remembered":false},
       "auto_connect":false,"wanted_online":false,"failures":0,"frontends":0,
       "endpoint":"x"}"#;
     let info: CoreInfo = serde_json::from_str(old).unwrap();
     assert_eq!(info.link, LinkKind::None);
-    assert_eq!(info.state, State::LoggedOut, "the old wire name parses");
+    assert_eq!(info.state, State::LoggedOut);
+    assert!(info.env.portal_answers());
+    assert_eq!(
+      info.env.os_session, None,
+      "an old core never reported 802.1X"
+    );
     assert!(!info.keep_online, "an old core never reported it");
     assert!(!info.autostart, "an old core never reported it");
     assert_eq!(info.version, "0.1.3");
   }
 
-  /// The variants were renamed in code, not on the wire: a window and a
-  /// service from different builds still have to read each other's state.
+  /// The verdict model in one table. Every rule downstream - the verbs, the
+  /// poll, the band - reads these answers instead of re-deriving them, which is
+  /// what kept four slightly different ``what does this link allow`` matches in
+  /// the tree.
   #[test]
-  fn the_state_variants_keep_their_wire_names() {
+  fn the_link_env_answers_what_this_link_allows() {
+    let ours = |internet: bool| LinkEnv {
+      connected: true,
+      internet,
+      portal: Portal::Ours { ac_id: None },
+      os_session: None,
+    };
+    let silent = |internet: bool| LinkEnv {
+      connected: true,
+      internet,
+      portal: Portal::Silent,
+      os_session: None,
+    };
+    let foreign = LinkEnv {
+      connected: true,
+      internet: false,
+      portal: Portal::Foreign,
+      os_session: None,
+    };
+    let secure = LinkEnv {
+      connected: true,
+      internet: true,
+      portal: Portal::Ours { ac_id: None },
+      os_session: Some("Tsinghua-Secure".into()),
+    };
+
+    // A gateway holding traffic back: a login is exactly what fixes it, and a
+    // session there is one the portal owns.
+    let blocked = ours(false);
+    assert!(blocked.login_possible());
+    assert!(blocked.logout_possible(State::LoggedIn));
+    assert!(blocked.polls_portal(State::LoggedOut));
+    assert!(blocked.portal_answers());
+    assert!(blocked.account_form_applies());
+
+    // The portal answers but the link routes anyway (a VPN's egress, a router
+    // that is already signed in): a login would authenticate that shared
+    // address for everybody behind it.
+    let routed = ours(true);
+    assert!(!routed.login_possible());
+    assert!(routed.polls_portal(State::LoggedOut));
+    assert!(routed.portal_answers());
+
+    // Nothing of ours answered: no verbs, no poll, and a failed request is not
+    // news - the verdict band already says it.
+    for env in [silent(true), silent(false), foreign] {
+      assert!(!env.login_possible(), "{env:?}");
+      assert!(!env.logout_possible(State::LoggedIn), "{env:?}");
+      assert!(!env.polls_portal(State::LoggedOut), "{env:?}");
+      assert!(!env.portal_answers(), "{env:?}");
+    }
+
+    // A session that is up keeps its poll even where the portal is not ours:
+    // while online the network probe timer is off, so the poll is the only
+    // thing that would notice the machine moved.
+    assert!(silent(true).polls_portal(State::LoggedIn));
+
+    // 802.1X: the OS owns the session, so none of the portal verbs are ours,
+    // and neither is the account form. The poll still runs - the portal row is
+    // the only place the account and the traffic numbers come from.
+    assert!(!secure.login_possible());
+    assert!(!secure.logout_possible(State::LoggedIn));
+    assert!(!secure.account_form_applies());
+    assert!(secure.polls_portal(State::LoggedOut));
+  }
+
+  /// The state now travels under its own name: `Offline` was a word the core
+  /// never meant (it says "the portal reports no session", not "no internet").
+  #[test]
+  fn the_state_variants_round_trip_by_their_own_names() {
     for (state, wire) in [
-      (State::LoggedOut, "Offline"),
-      (State::Authenticating, "Authenticating"),
-      (State::LoggedIn, "Online"),
+      (State::Unknown, "Unknown"),
+      (State::LoggedOut, "LoggedOut"),
+      (State::LoggingIn, "LoggingIn"),
+      (State::LoggedIn, "LoggedIn"),
     ] {
       let text = Wire::ev(Ev::State(state)).line().unwrap();
       assert!(text.contains(&format!("\"State\":\"{wire}\"")), "{text}");

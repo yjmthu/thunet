@@ -4,9 +4,6 @@
   <uses-permission android:name="android.permission.INTERNET" />
   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
   <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-  <!-- Only used by the optional "Secure detection" setting: reading the Wi-Fi
-       name (SSID) is what tells Tsinghua-Secure from a portal network. -->
-  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
   <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
   <!-- The keep-alive toggle: a foreground service must be able to show its
        notification, and Android 13+ gates that on this runtime permission. -->

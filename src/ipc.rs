@@ -206,7 +206,7 @@ struct Shared {
   /// Replayed to late connections: log lines and toasts, newest last.
   history: VecDeque<Ev>,
   state: Option<crate::session::State>,
-  env: Option<crate::proto::LoginEnv>,
+  env: Option<crate::proto::LinkEnv>,
   info: Option<serde_json::Value>,
   error: Option<Failure>,
 }
@@ -309,7 +309,11 @@ impl Hub {
       Ok(g) => g,
       Err(poisoned) => poisoned.into_inner(),
     };
-    shared.clients.iter().filter(|client| client.is_live()).count()
+    shared
+      .clients
+      .iter()
+      .filter(|client| client.is_live())
+      .count()
   }
 
   /// A `Sender<Ev>`-shaped handle for the worker loop.
@@ -1518,7 +1522,7 @@ mod tests {
 
   use super::*;
   use crate::logline::Line;
-  use crate::proto::{LoginEnv, ToastKind};
+  use crate::proto::{LinkEnv, Portal, ToastKind};
   use crate::session::State;
 
   #[test]
@@ -1641,14 +1645,19 @@ mod tests {
   fn a_late_frontend_gets_the_current_state_and_the_log_tail() {
     let hub = Hub::new();
     hub.publish(Ev::State(State::LoggedIn));
-    hub.publish(Ev::Env(LoginEnv::Campus));
+    hub.publish(Ev::Env(LinkEnv {
+      connected: true,
+      internet: true,
+      portal: Portal::Ours { ac_id: None },
+      os_session: None,
+    }));
     hub.publish(Ev::Log(Line::info("first")));
     hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
     let (_rx, backlog, _live) = hub.attach();
     // Snapshot first, then the replayed log lines.
     assert!(matches!(backlog[0], Ev::State(State::LoggedIn)));
-    assert!(matches!(backlog[1], Ev::Env(LoginEnv::Campus)));
+    assert!(matches!(&backlog[1], Ev::Env(env) if env.portal_answers()));
     assert!(matches!(&backlog[2], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
     assert!(matches!(backlog.last(), Some(Ev::Log(_))));
   }

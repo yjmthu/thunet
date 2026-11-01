@@ -161,9 +161,6 @@ public class ThunetApp extends Application {
     if (manager == null) {
       return;
     }
-    // The Wi-Fi name changes with the link, and the optional SSID detection
-    // must follow it; the call is a no-op without the permission.
-    Ssid.update(this);
     // A binding the system no longer knows is not a link: drop it here too, so
     // a lost `onLost` cannot leave the row and the core describing a network
     // that is gone.

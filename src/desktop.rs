@@ -585,7 +585,7 @@ fn run(cli: Cli) -> Result<(), String> {
       // directory, which an ordinary caller cannot write.
       let link = with_core()?;
       let before = core_snapshot(&link)?;
-      if remember_password.is_some() && matches!(before.env, proto::LoginEnv::EnterpriseWifi(_)) {
+      if remember_password.is_some() && before.env.os_session.is_some() {
         // The OS owns that session; there is no portal pair to seal, and the
         // core would answer with the state it already has, which reads like a
         // success.
@@ -1228,9 +1228,11 @@ fn already_online_with(state: session::State, account: &str, held: &str) -> bool
 /// core holds when it has one.
 fn session_line(state: session::State, held: &str) -> String {
   let verb = match state {
-    session::State::LoggedIn => "online",
-    session::State::Authenticating => "authenticating",
-    session::State::LoggedOut => "offline",
+    session::State::LoggedIn => "signed in",
+    session::State::LoggingIn => "signing in",
+    session::State::LoggedOut => "not signed in",
+    // The portal has not answered about this address, so neither claim is true.
+    session::State::Unknown => "unknown (no answer from the portal yet)",
   };
   match (held.is_empty(), state) {
     (false, session::State::LoggedOut) => format!("session: {verb} (credential: {held})"),
@@ -1725,7 +1727,12 @@ mod tests {
       "alice"
     ));
     assert!(!already_online_with(
-      session::State::Authenticating,
+      session::State::LoggingIn,
+      "alice",
+      "alice"
+    ));
+    assert!(!already_online_with(
+      session::State::Unknown,
       "alice",
       "alice"
     ));
@@ -1735,19 +1742,25 @@ mod tests {
   fn the_session_line_names_the_account_the_core_holds() {
     assert_eq!(
       session_line(session::State::LoggedIn, "bob"),
-      "session: online as bob"
+      "session: signed in as bob"
     );
     assert_eq!(
       session_line(session::State::LoggedOut, "alice"),
-      "session: offline (credential: alice)"
+      "session: not signed in (credential: alice)"
     );
     assert_eq!(
       session_line(session::State::LoggedOut, ""),
-      "session: offline"
+      "session: not signed in"
     );
     assert_eq!(
-      session_line(session::State::Authenticating, "alice"),
-      "session: authenticating as alice"
+      session_line(session::State::LoggingIn, "alice"),
+      "session: signing in as alice"
+    );
+    // The portal never answered, so the line must not claim a session either
+    // way - that is what the old "offline" default used to do.
+    assert_eq!(
+      session_line(session::State::Unknown, ""),
+      "session: unknown (no answer from the portal yet)"
     );
   }
 }

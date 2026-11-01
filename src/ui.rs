@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
-use crate::core::{POLL_OFFLINE, POLL_ONLINE, polls_portal};
+use crate::core::{POLL_OFFLINE, POLL_ONLINE};
 use crate::i18n::{Lang, Texts};
 use crate::icons::{
   DeviceKind, app_fill, app_icon, back_arrow_image, close_button, color_for, device_kind,
@@ -25,27 +25,11 @@ use crate::icons::{
 };
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
-use crate::proto::{Cmd, CoreInfo, CredentialState, Ev, Failure, LinkKind, LoginEnv, ToastKind};
+use crate::proto::{
+  Cmd, CoreInfo, CredentialState, Ev, Failure, LinkEnv, LinkKind, Portal, ToastKind,
+};
 use crate::session::State;
 use crate::tray::{Action, Tray};
-
-impl LoginEnv {
-  /// Is a login attempt possible here at all?
-  fn allows_login(&self) -> bool {
-    matches!(self, LoginEnv::Campus)
-  }
-
-  /// Why *Connect* is unavailable, or `None` on a campus network.
-  fn blocked_reason(&self, t: &Texts) -> Option<String> {
-    match self {
-      LoginEnv::Campus => None,
-      LoginEnv::EnterpriseWifi(ssid) => Some(t.secure_wifi.replacen("{}", ssid, 1)),
-      LoginEnv::NoNetwork => Some(t.network_unavailable.to_string()),
-      LoginEnv::OtherPortal => Some(t.not_campus_network.to_string()),
-      LoginEnv::NoPortal | LoginEnv::OtherNetwork => Some(t.no_login_needed.to_string()),
-    }
-  }
-}
 
 #[derive(Default, Clone)]
 struct Info {
@@ -54,6 +38,12 @@ struct Info {
   bytes_in: u64,
   bytes_out: u64,
   name: String,
+  /// The service the portal says this session belongs to (its `domain`):
+  /// `PermitALL` on a wired port, `tsinghua-ipv4_new` on that SSID, and
+  /// `tsinghua-secure_new` on the OS-level 802.1X login. Shown next to the link
+  /// because it names *which* service the session rides on, which the local
+  /// link kind cannot say.
+  service: String,
   /// The account's online devices, this machine first. Empty when the portal
   /// reports no detail (offline, or an answer without the field).
   devices: Vec<Device>,
@@ -205,8 +195,35 @@ fn info_from(v: &Value) -> Info {
     bytes_in: v.get("bytes_in").and_then(Value::as_u64).unwrap_or(0),
     bytes_out: v.get("bytes_out").and_then(Value::as_u64).unwrap_or(0),
     name: s("user_name").to_string(),
+    service: s("domain").to_string(),
     devices,
     devices_total,
+  }
+}
+
+/// The service behind a session, as the row shows it.
+///
+/// The portal's `domain` is the name of the campus service a session belongs to,
+/// and deployments append a suffix of their own (`tsinghua-secure_new`, and a
+/// `tsinghua-ipv4_new` that was `tsinghua-ipv4` before it). The suffix is not
+/// what the user is reading for, and a rename should not look like a new
+/// service: the campus names are matched in full, and anything else
+/// (`PermitALL`, a policy name this app has not seen) is shown as it arrived.
+/// A bare `ipv4` is not enough to match: another deployment's name could carry
+/// that word without being one of these services.
+fn service_name(domain: &str) -> &str {
+  let lower = domain.to_ascii_lowercase();
+  if lower.contains("tsinghua-secure") {
+    "Tsinghua-Secure"
+  } else if lower.contains("tsinghua-ipv4") {
+    "Tsinghua-IPv4"
+  } else if lower.contains("tsinghua-ipv6") {
+    "Tsinghua-IPv6"
+  } else if lower.contains("tsinghua") {
+    // The bare service name, also seen with a `_new` suffix of its own.
+    "Tsinghua"
+  } else {
+    domain
   }
 }
 
@@ -274,40 +291,148 @@ fn state_color(state: State) -> egui::Color32 {
   egui::Color32::from_rgb(c[0], c[1], c[2])
 }
 
-/// What the state line says, and which palette entry colours it.
+/// Everything the window says about the link, in one table.
 ///
+/// The status line, its tooltip, the tray icon colour, the band above the page
+/// and the reason *Connect* is greyed out all describe the same two facts
+/// ([`LinkEnv`] and [`State`]). They used to be four separate matches over a flat
+/// list of cases, which is how a green dot ended up above a red "connection
+/// timed out" band.
+///
+/// The line itself says one thing - is this machine on the internet - because
+/// that is what a glance is for. The `detail` carries what that *means* for the
+/// portal session, and it is shown on hover and in the tray tooltip.
+///
+/// | link | session | line | detail |
+/// | --- | --- | --- | --- |
+/// | 802.1X, OS owns it | any | online / offline | signed in (system) |
+/// | no connection | any | offline | no link |
+/// | another portal | any | offline | their page is in the way |
+/// | portal silent, routing | any | online | online, not the campus network |
+/// | portal silent, nothing answers | any | offline | the network does not answer |
+/// | ours, gateway blocking | out / in flight | offline / signing in | not signed in |
+/// | ours, gateway blocking | signed in | online | signed in |
+/// | ours, routing anyway | out | online | no login needed |
+/// | ours, routing anyway | signed in | online | signed in |
+struct LinkWords {
+  /// The status line, and the tray tooltip with it.
+  label: &'static str,
+  /// What the label means for the session; empty when nothing is known.
+  detail: &'static str,
+  /// The palette entry the dot and the tray icon take.
+  palette: State,
+  /// A band about the link itself; `None` where the link has nothing to add.
+  band: Option<(BannerTone, String)>,
+  /// Why *Connect* cannot work here; `None` where a login is the thing to do.
+  refusal: Option<String>,
+}
+
 /// No core answering wins over every network verdict: that verdict came from a
 /// core that is no longer there, so reading it as "online" left a stopped core
-/// looking connected (the link was still "no portal, direct internet" from a
-/// minute ago). The palette falls back to the offline grey for the same reason
-/// - there is no session to colour.
-fn state_words(
-  state: State,
-  env: &LoginEnv,
-  core_answered: bool,
-  t: &Texts,
-) -> (&'static str, State) {
+/// looking connected (the link was still "portal silent, routing" from a minute
+/// ago). The palette falls back to the grey for the same reason - there is no
+/// session to colour.
+fn link_words(env: &LinkEnv, state: State, core_answered: bool, t: &Texts) -> LinkWords {
   if !core_answered {
-    return (t.unknown, State::LoggedOut);
+    return LinkWords {
+      label: t.unknown,
+      detail: t.core_silent,
+      palette: State::Unknown,
+      band: None,
+      refusal: None,
+    };
   }
-  match state {
-    State::LoggedIn => (t.online, State::LoggedIn),
-    State::Authenticating => (t.authenticating, State::Authenticating),
-    // The OS owns an 802.1X session: the portal row is not the authority there,
-    // and it can lag the join by a poll. `probe_env` only names an enterprise
-    // SSID on the interface that carries the default route, so the link is up -
-    // calling it "Offline" next to a banner that already named the network read
-    // as "there is no internet" until the next poll corrected it.
-    State::LoggedOut if matches!(env, LoginEnv::EnterpriseWifi(_)) => (t.online, State::LoggedIn),
-    // The portal has no session for this address, but the link does not go
-    // through it at all: "Offline" would read as "there is no internet",
-    // which is the opposite of what the probe just measured.
-    State::LoggedOut if *env == LoginEnv::NoPortal => (t.online_without_portal, State::LoggedIn),
-    // Same reading, different cause: the link is not the campus network at all
-    // (home Wi-Fi, mobile data). It is named separately so the label does not
-    // claim a campus session that never existed.
-    State::LoggedOut if *env == LoginEnv::OtherNetwork => (t.online_other_network, State::LoggedIn),
-    State::LoggedOut => (t.offline, State::LoggedOut),
+  // The portal says the OS opened this session (802.1X): the row is a mirror of
+  // the OS's own session, and no portal verb is ours to offer. The evidence is
+  // the answer's `domain`, not the Wi-Fi name - see `srun::is_os_service`.
+  if env.os_session.is_some() {
+    let online = env.connected && env.internet;
+    return LinkWords {
+      label: if online { t.online } else { t.offline },
+      detail: if online {
+        t.signed_in_system
+      } else {
+        t.no_connection
+      },
+      palette: if online {
+        State::LoggedIn
+      } else {
+        State::Unknown
+      },
+      band: online.then(|| (BannerTone::Ok, t.secure_wifi_online.to_string())),
+      refusal: Some(t.secure_wifi.to_string()),
+    };
+  }
+  if !env.connected {
+    return LinkWords {
+      label: t.offline,
+      detail: t.no_connection,
+      palette: State::Unknown,
+      band: Some((BannerTone::Warn, t.network_unavailable.to_string())),
+      refusal: Some(t.network_unavailable.to_string()),
+    };
+  }
+  match (&env.portal, env.internet) {
+    (Portal::Foreign, _) => LinkWords {
+      label: t.offline,
+      detail: t.foreign_portal,
+      palette: State::Unknown,
+      band: Some((BannerTone::Warn, t.not_campus_network.to_string())),
+      refusal: Some(t.not_campus_network.to_string()),
+    },
+    // Home Wi-Fi, a hotspot, mobile data: the internet works and there is no
+    // portal of ours in the way. Good news, so it is green.
+    (Portal::Silent, true) => LinkWords {
+      label: t.online,
+      detail: t.online_not_campus,
+      palette: State::LoggedIn,
+      band: Some((BannerTone::Ok, t.online_no_portal.to_string())),
+      refusal: Some(t.online_no_portal.to_string()),
+    },
+    // A link that is up but carries nothing: nothing answered, so there is
+    // nothing to log in on either.
+    (Portal::Silent, false) => LinkWords {
+      label: t.offline,
+      detail: t.no_internet,
+      palette: State::Unknown,
+      band: Some((BannerTone::Warn, t.network_unreachable.to_string())),
+      refusal: Some(t.network_unreachable.to_string()),
+    },
+    // Our portal. A login is the thing to do while the gateway holds traffic
+    // back, so the band stays out of the way and the button carries it.
+    (Portal::Ours { .. }, false) => LinkWords {
+      label: match state {
+        State::LoggedIn => t.online,
+        State::LoggingIn => t.signing_in,
+        _ => t.offline,
+      },
+      detail: match state {
+        State::LoggedIn => t.signed_in,
+        State::LoggingIn => t.signing_in_note,
+        _ => t.not_signed_in,
+      },
+      palette: state,
+      band: None,
+      refusal: None,
+    },
+    // Our portal, and the link routes anyway: the portal sees an address it is
+    // not gating (a VPN's egress, a router already signed in), so a login would
+    // vouch for that address rather than for this machine.
+    (Portal::Ours { .. }, true) => {
+      let signed_in = state == State::LoggedIn;
+      LinkWords {
+        label: t.online,
+        detail: if signed_in {
+          t.signed_in
+        } else {
+          t.online_no_login_needed
+        },
+        // The link itself works, and that is what the dot stands for.
+        palette: State::LoggedIn,
+        band: (!signed_in).then_some((BannerTone::Warn, t.no_login_needed.to_string())),
+        refusal: Some(t.no_login_needed.to_string()),
+      }
+    }
   }
 }
 
@@ -618,10 +743,6 @@ pub struct App {
   /// The ROM's own power policy, read from the vendor settings when possible.
   #[cfg(target_os = "android")]
   background_oem_power: crate::background::OemPower,
-  /// The Android SSID-detection setting; without the location permission it
-  /// stays off and the network probes decide.
-  #[cfg(target_os = "android")]
-  secure_detection: bool,
   /// Which credential field the autofill service last heard about.
   #[cfg(target_os = "android")]
   autofill_focus: Option<AutofillKind>,
@@ -692,7 +813,7 @@ pub struct App {
   pass_edit: String,
   remember: bool,
   /// Last network verdict from the worker; decides whether *Connect* is usable.
-  env: LoginEnv,
+  env: LinkEnv,
   page: Page,
   toast: Option<Toast>,
   /// Inert on Android. `available()` is false when the platform refused to
@@ -809,7 +930,7 @@ impl App {
     // The autostart modes live in the settings page; the tray menu deliberately
     // has no entry for them, because registering the service can raise a UAC
     // prompt that should not be one stray click away.
-    let tray = Tray::new(app_title, t, app_fill(State::LoggedOut));
+    let tray = Tray::new(app_title, t, app_fill(State::Unknown));
     // Without a tray icon there is no way back into a hidden window, so an
     // invisible start has to be cancelled and the window left on screen.
     let start_hidden = minimized && tray.available();
@@ -891,7 +1012,7 @@ impl App {
       next_uplink: Instant::now(),
       local_ip4: String::new(),
       local_ip6: String::new(),
-      state: State::LoggedOut,
+      state: State::Unknown,
       info: Info::default(),
       last_heartbeat: None,
       turtle: None,
@@ -907,8 +1028,6 @@ impl App {
       background_power: crate::background::power_ok(),
       #[cfg(target_os = "android")]
       background_oem_power: crate::background::oem_power(),
-      #[cfg(target_os = "android")]
-      secure_detection: crate::secure_wifi::enabled(),
       #[cfg(target_os = "android")]
       autofill_focus: None,
       #[cfg(target_os = "android")]
@@ -929,7 +1048,12 @@ impl App {
       remember: false,
       // Until the worker's first probe lands, assume a login is possible: a
       // wrongly disabled button is worse than a click that reports why not.
-      env: LoginEnv::Campus,
+      env: LinkEnv {
+        connected: false,
+        internet: false,
+        portal: Portal::Silent,
+        os_session: None,
+      },
       page: Page::Status,
       toast: None,
       cfg,
@@ -944,7 +1068,7 @@ impl App {
       portable,
       portable_autostart,
       tray,
-      tray_rgb: Some(color_for(State::LoggedOut)),
+      tray_rgb: Some(color_for(State::Unknown)),
       tray_warned: false,
       // `Tray::new` has just written the first bitmap, so a state change in the
       // first half second of the run waits like any other.
@@ -1011,7 +1135,9 @@ impl App {
     self.core = None;
     self.core_answered = false;
     self.last_error = None;
-    self.state = State::LoggedOut;
+    // Nothing is known about the link any more: the verdict belonged to a core
+    // that is gone, so the page must not keep claiming a session.
+    self.state = State::Unknown;
     self.info = Info::default();
     self.last_heartbeat = None;
     if let Some(v) = stale
@@ -1681,6 +1807,10 @@ impl App {
       self.cloaked = false;
     }
     self.shown = true;
+    // The window is what the user reads the verdict from, and the verdict is
+    // only re-derived when something changes: bringing the window up is the
+    // one moment it has to be current.
+    self.refresh(true);
     // A session that changed scale while the window was hidden (an unmapped
     // window may keep the size it was last given) gets its fixed size back on
     // the first pass after this.
@@ -1771,32 +1901,13 @@ impl App {
     self.quit_at = Some(Instant::now());
   }
 
-  /// False where the portal verbs (Connect, Disconnect and the account form)
-  /// have nothing to act on. On an 802.1X network the OS owns the session and
-  /// the portal entry is only a mirror of it, so a logout there would tear down
-  /// something this app never opened - and the account is not used at all.
-  fn portal_verbs(&self) -> bool {
-    !matches!(self.env, LoginEnv::EnterpriseWifi(_))
-  }
-
-  /// Can *Disconnect* act on anything?
-  ///
-  /// The verb belongs to the portal. On a link that is not the campus portal
-  /// (mobile data, another network) or behind someone else's captive portal
-  /// there is no session of ours to end, so the button is greyed out exactly as
-  /// it is on an 802.1X network. The account form stays enabled: editing the
-  /// saved credential does not touch the portal.
-  fn can_disconnect(&self) -> bool {
-    self.portal_verbs() && !matches!(self.env, LoginEnv::OtherNetwork | LoginEnv::OtherPortal)
-  }
-
   /// Words and colour for the state line, and for the tray icon with them.
   ///
   /// One helper because the two drifted apart: the window showed "online" for
   /// a link that carries no portal session while the tray icon kept its grey.
   fn state_display(&self, t: &Texts) -> (&'static str, [u8; 3]) {
-    let (text, palette) = state_words(self.state, &self.env, self.core_answered, t);
-    (text, app_fill(palette))
+    let words = link_words(&self.env, self.state, self.core_answered, t);
+    (words.label, app_fill(words.palette))
   }
 
   /// Replace this process with a fresh launch of the executable on disk.
@@ -2007,7 +2118,7 @@ impl App {
           self.state,
           answered,
           self.core_stale,
-          self.env.clone(),
+          &self.env,
           self.last_error.as_ref(),
           auto_connect,
           credentials_ready,
@@ -2029,17 +2140,25 @@ impl App {
 
         ui.horizontal(|ui| {
           if self.page == Page::Status {
-            ui.label(
+            // The line says only whether this machine is on the internet; what
+            // that means for the portal session is the tooltip's job, so a
+            // glance stays a glance.
+            let dot = ui.label(
               egui::RichText::new("●")
                 .color(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
                 .size(18.0),
             );
-            ui.label(egui::RichText::new(label).size(18.0).strong());
+            let text = ui.label(egui::RichText::new(label).size(18.0).strong());
+            let detail = link_words(&self.env, self.state, self.core_answered, t).detail;
+            if !detail.is_empty() {
+              dot.on_hover_text(detail);
+              text.on_hover_text(detail);
+            }
             ui.add_space(6.0);
             // The core skips the poll where the portal cannot answer, so there
             // is no beat to draw: the track stays quiet instead of turning
             // amber for a beat that is not late but cancelled.
-            let beat = if polls_portal(self.state, &self.env) {
+            let beat = if self.env.polls_portal(self.state) {
               self.last_heartbeat
             } else {
               None
@@ -2134,7 +2253,27 @@ impl App {
               });
               ui.end_row();
               ui.label(t.link);
-              ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
+              // The link kind is a local fact. The portal's `domain` is a second
+              // one, about the session rather than the interface: it rides beside
+              // the link kind as a quiet tag - a weaker shade than the link kind,
+              // not the accent colour, because it is context and not something to
+              // look at. No separator, and no row of its own. The raw value
+              // carries a deployment suffix (`tsinghua-secure_new`) that changes
+              // with a rename, so the tag shows the service and the raw value
+              // only on hover.
+              ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(self.uplink.text(t)).monospace());
+                if !self.info.service.is_empty() {
+                  let name = service_name(&self.info.service);
+                  let tag = egui::RichText::new(name)
+                    .monospace()
+                    .color(ui.visuals().weak_text_color());
+                  let shown = ui.label(tag);
+                  if name != self.info.service {
+                    shown.on_hover_text(&self.info.service);
+                  }
+                }
+              });
               ui.end_row();
               // The portal's address while it has an answer, otherwise the one
               // this machine holds on the current link: mobile data and other
@@ -2245,14 +2384,16 @@ impl App {
           ui.add_space(10.0);
           ui.horizontal(|ui| {
             let online = self.state == State::LoggedIn;
-            // Off-campus (or with no link at all) a login attempt can only be
-            // rejected, so the button is greyed out and says why on hover.
-            let blocked = self.env.blocked_reason(t);
-            let can_connect = !online && blocked.is_none();
+            // The page's own words about the link: the login side of them says
+            // whether *Connect* means anything, the rest is the band and the
+            // status line, so all three can never disagree.
+            let words = link_words(&self.env, self.state, true, t);
+            let refusal = words.refusal;
+            let can_connect = !online && self.env.login_possible();
             let mut connect = ui.add_enabled(can_connect, egui::Button::new(t.connect));
             // Only explain the greyed-out state when the network is the reason;
             // while online the button is off for an obvious reason already.
-            if let (false, Some(why)) = (online, &blocked) {
+            if let (false, Some(why)) = (online, &refusal) {
               connect = connect.on_disabled_hover_text(why);
             }
             if connect.clicked() {
@@ -2261,20 +2402,14 @@ impl App {
               // drawn from it: ask before the 30 s round is due.
               self.next_core_query = Instant::now();
             }
-            // A core that still wants to be online is trying or waiting: while a
-            // login attempt is in flight the state is *Authenticating* and this
-            // button calls it off. Between attempts the page says *Offline*, and
-            // there is no session to end - leaving the button lit there read as
-            // "both verbs are available with nothing connected".
-            let can_stop = can_stop(self.state, self.can_disconnect());
+            // A session the portal owns and that exists (or is in flight, which
+            // is where cancelling a login belongs) is the only thing *Disconnect*
+            // can end. Between attempts there is none, and leaving the button lit
+            // there read as "both verbs are available with nothing connected".
+            let can_stop = self.env.logout_possible(self.state);
             if ui
               .add_enabled(can_stop, egui::Button::new(t.disconnect))
-              .on_disabled_hover_text(
-                self
-                  .env
-                  .blocked_reason(t)
-                  .unwrap_or_else(|| t.disconnect.into()),
-              )
+              .on_disabled_hover_text(refusal.clone().unwrap_or_else(|| t.disconnect.into()))
               .clicked()
             {
               self.send(Cmd::Disconnect);
@@ -2615,36 +2750,7 @@ impl App {
                 }
               }
             }
-            // Reading the Wi-Fi name needs the location permission, which only
-            // the user can grant; the Activity asks when this is ticked.
-            #[cfg(target_os = "android")]
-            {
-              let mut secure = self.secure_detection;
-              if ui
-                .checkbox(&mut secure, t.secure_detection)
-                .on_hover_text(t.secure_detection_hint)
-                .changed()
-              {
-                if let Err(e) = crate::secure_wifi::set(secure) {
-                  self.toast_err(e);
-                }
-                // The permission dialog answers asynchronously, so the file is
-                // the answer, not this call.
-                self.secure_detection = crate::secure_wifi::enabled();
-              }
-            }
           });
-          // Touch has no hover, and the permission requirement is the one thing
-          // the checkbox cannot say by itself.
-          #[cfg(target_os = "android")]
-          ui.add(
-            egui::Label::new(
-              egui::RichText::new(t.secure_detection_hint)
-                .small()
-                .color(ui.visuals().weak_text_color()),
-            )
-            .wrap(),
-          );
 
           ui.add_space(2.0);
           // The rule under the shortcut button is unconditional: it is the line
@@ -2655,8 +2761,9 @@ impl App {
           // On an 802.1X network the portal account is never used, so the form is
           // inert: an edit could not be put to work, and a pair that cannot be
           // tried would be stored unverified.
-          let credentials_live = self.portal_verbs();
-          if !credentials_live && let Some(why) = self.env.blocked_reason(t) {
+          let credentials_live = self.env.account_form_applies();
+          if !credentials_live && let Some(why) = link_words(&self.env, self.state, true, t).refusal
+          {
             ui.label(
               egui::RichText::new(why)
                 .small()
@@ -3217,17 +3324,6 @@ fn devices_scroll_max(screen_h: f32, phone: bool) -> f32 {
   }
 }
 
-/// May the *Disconnect* button act right now?
-///
-/// Only a state above *Offline* has a session to end. The core's intent flag is
-/// deliberately not part of this: while an automatic attempt is between retries
-/// the page says *Offline*, and a lit-up *Disconnect* there looked like "both
-/// verbs are available with nothing connected". A login that is actually in
-/// flight shows *Authenticating*, which is where cancelling belongs.
-fn can_stop(state: State, verbs: bool) -> bool {
-  state != State::LoggedOut && verbs
-}
-
 /// Draw the dialog body: the title row with its close button, then the rows.
 ///
 /// The width is measured before anything is laid out. The title row, the rule
@@ -3489,7 +3585,7 @@ fn core_version_uptime(ui: &mut egui::Ui, version: &str, uptime_secs: u64) {
   ui.label(if version == env!("CARGO_PKG_VERSION") {
     text.weak()
   } else {
-    text.color(state_color(State::Authenticating))
+    text.color(state_color(State::LoggingIn))
   });
   let color = ui.visuals().text_color();
   ui.label(
@@ -3534,7 +3630,7 @@ fn core_status(
       ui.label(egui::RichText::new(running_word).color(state_color(State::LoggedIn)));
     }
     None => {
-      ui.label(egui::RichText::new(gone_word).color(state_color(State::LoggedOut)));
+      ui.label(egui::RichText::new(gone_word).color(state_color(State::Unknown)));
     }
   }
 }
@@ -4805,30 +4901,132 @@ mod tests {
     assert!(shaped(&offset[1..], ':', &[2]), "{label}");
   }
 
-  /// Off-campus networks must leave *Connect* disabled with an explanation;
-  /// only a campus portal makes a login attempt possible.
+  /// What the page says about a link, from one table. The three facts that used
+  /// to be three separate matches (the verdict, the button, the band) now have
+  /// to agree, so the cases are pinned here.
   #[test]
-  fn only_a_campus_network_allows_connect() {
+  fn the_page_reads_one_table_for_the_link() {
     let t = crate::i18n::Lang::En.texts();
-    assert!(LoginEnv::Campus.allows_login());
-    assert_eq!(LoginEnv::Campus.blocked_reason(t), None);
-    let blocked = [
-      LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
-      LoginEnv::NoNetwork,
-      LoginEnv::OtherPortal,
-      LoginEnv::NoPortal,
-      LoginEnv::OtherNetwork,
-    ];
-    for env in &blocked {
-      assert!(!env.allows_login(), "{env:?}");
-      let why = env.blocked_reason(t).expect("a reason has to be shown");
-      assert!(!why.trim().is_empty(), "{env:?}");
-    }
+    let link = |connected: bool, internet: bool, portal: Portal| LinkEnv {
+      connected,
+      internet,
+      portal,
+      os_session: None,
+    };
+    let ours = |internet: bool| {
+      link(
+        true,
+        internet,
+        Portal::Ours {
+          ac_id: Some("169".into()),
+        },
+      )
+    };
 
-    // The SSID is named in the hint instead of leaving its placeholder behind.
-    let hint = blocked[0].blocked_reason(t).unwrap_or_default();
-    assert!(hint.contains("Tsinghua-Secure"), "{hint}");
-    assert!(!hint.contains("{}"), "{hint}");
+    // A campus link the gateway is holding back: the login is the thing to do.
+    let words = link_words(&ours(false), State::LoggedOut, true, t);
+    assert_eq!(words.label, t.offline, "no internet yet");
+    assert_eq!(words.detail, t.not_signed_in);
+    assert!(words.refusal.is_none(), "Connect has to be usable here");
+    assert!(words.band.is_none(), "the button already says it");
+
+    // Same link, a login in flight.
+    let words = link_words(&ours(false), State::LoggingIn, true, t);
+    assert_eq!(words.label, t.signing_in);
+    assert_eq!(words.detail, t.signing_in_note);
+
+    // Same link, signed in: the line says online, the detail says why.
+    let words = link_words(&ours(false), State::LoggedIn, true, t);
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.signed_in);
+    assert!(words.band.is_none());
+    assert_eq!(words.palette, State::LoggedIn);
+
+    // Our portal, but the link routes anyway (a VPN's egress, a router that is
+    // already signed in): online, and nothing to sign in.
+    let words = link_words(&ours(true), State::LoggedOut, true, t);
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.online_no_login_needed);
+    assert_eq!(words.refusal.as_deref(), Some(t.no_login_needed));
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Warn, t.no_login_needed.into()))
+    );
+
+    // A home network: the internet works and needs no login, which is good news.
+    let words = link_words(&link(true, true, Portal::Silent), State::LoggedOut, true, t);
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.online_not_campus);
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Ok, t.online_no_portal.into()))
+    );
+    assert!(words.refusal.is_some());
+
+    // A link that is up but carries nothing.
+    let words = link_words(
+      &link(true, false, Portal::Silent),
+      State::LoggedOut,
+      true,
+      t,
+    );
+    assert_eq!(words.label, t.offline);
+    assert_eq!(words.detail, t.no_internet);
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Warn, t.network_unreachable.into()))
+    );
+
+    // Another operator's portal: pass their page first.
+    let words = link_words(
+      &link(true, false, Portal::Foreign),
+      State::LoggedOut,
+      true,
+      t,
+    );
+    assert_eq!(words.label, t.offline);
+    assert_eq!(words.detail, t.foreign_portal);
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Warn, t.not_campus_network.into()))
+    );
+
+    // No link at all.
+    let words = link_words(&link(false, false, Portal::Silent), State::Unknown, true, t);
+    assert_eq!(words.label, t.offline);
+    assert_eq!(words.detail, t.no_connection);
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Warn, t.network_unavailable.into()))
+    );
+
+    // 802.1X: the portal says the OS opened the session, so no portal verb is
+    // offered, and the band is the good news rather than a reason. The wording
+    // does not name the service: that string is the portal's, and it has been
+    // renamed once already.
+    let secure = LinkEnv {
+      connected: true,
+      internet: true,
+      portal: Portal::Ours { ac_id: None },
+      os_session: Some("tsinghua-secure_new".into()),
+    };
+    let words = link_words(&secure, State::Unknown, true, t);
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.signed_in_system);
+    assert_eq!(words.palette, State::LoggedIn);
+    assert_eq!(
+      words.band,
+      Some((BannerTone::Ok, t.secure_wifi_online.to_string()))
+    );
+    let refusal = words.refusal.expect("Connect has a reason to be off");
+    assert_eq!(refusal, t.secure_wifi);
+    assert!(!refusal.contains("tsinghua-secure"), "{refusal}");
+
+    // With no core answering the stored verdict is not trustworthy either.
+    let words = link_words(&ours(false), State::LoggedIn, false, t);
+    assert_eq!(words.label, t.unknown);
+    assert_eq!(words.detail, t.core_silent);
+    assert!(words.band.is_none());
   }
 
   /// A network where logging in cannot work is a warning band, not a red one;
@@ -4836,7 +5034,13 @@ mod tests {
   #[test]
   fn a_non_campus_network_shows_a_warning_band() {
     let t = crate::i18n::Lang::En.texts();
-    let tones = |env: LoginEnv, state: State, err: Option<Failure>| {
+    let link = |connected: bool, internet: bool, portal: Portal| LinkEnv {
+      connected,
+      internet,
+      portal,
+      os_session: None,
+    };
+    let tones = |env: &LinkEnv, state: State, err: Option<Failure>| {
       page_banners(
         Page::Status,
         state,
@@ -4853,53 +5057,26 @@ mod tests {
       .map(|(tone, _)| tone)
       .collect::<Vec<_>>()
     };
-
-    assert_eq!(tones(LoginEnv::Campus, State::LoggedOut, None), vec![]);
-    assert_eq!(
-      tones(LoginEnv::OtherPortal, State::LoggedOut, None),
-      vec![BannerTone::Warn]
+    let ours = link(
+      true,
+      false,
+      Portal::Ours {
+        ac_id: Some("169".into()),
+      },
     );
-    // Online, the verdict is only worth a band where it says "nothing to do":
-    // another operator's portal is not shown while a session is up.
-    assert_eq!(tones(LoginEnv::OtherPortal, State::LoggedIn, None), vec![]);
-    // Direct internet behind the campus portal (the portal answers, but names
-    // no session) stays a warning: it is still the campus link, and a session
-    // is exactly what is missing.
+    let silent_online = link(true, true, Portal::Silent);
+    let foreign = link(true, false, Portal::Foreign);
+
+    assert_eq!(tones(&ours, State::LoggedOut, None), vec![]);
     assert_eq!(
-      tones(LoginEnv::NoPortal, State::LoggedOut, None),
+      tones(&foreign, State::LoggedOut, None),
       vec![BannerTone::Warn]
     );
     // A link that is not the campus network at all is not a warning: the
     // machine is online, just not through the portal. Green, like 802.1X.
     assert_eq!(
-      tones(LoginEnv::OtherNetwork, State::LoggedOut, None),
+      tones(&silent_online, State::LoggedOut, None),
       vec![BannerTone::Ok]
-    );
-    assert_eq!(tones(LoginEnv::OtherNetwork, State::LoggedIn, None), vec![]);
-    // An 802.1X network is amber until its session is up and green afterwards.
-    let secure = || LoginEnv::EnterpriseWifi("Tsinghua-Secure".into());
-    assert_eq!(
-      tones(secure(), State::LoggedOut, None),
-      vec![BannerTone::Warn]
-    );
-    let online = page_banners(
-      Page::Status,
-      State::LoggedIn,
-      true,
-      None,
-      secure(),
-      None,
-      false,
-      true,
-      false,
-      t,
-    );
-    assert_eq!(
-      online,
-      vec![(
-        BannerTone::Ok,
-        t.secure_wifi_online.replacen("{}", "Tsinghua-Secure", 1)
-      )]
     );
     // With no core answering the stored verdict is not trustworthy either.
     assert_eq!(
@@ -4908,7 +5085,7 @@ mod tests {
         State::LoggedOut,
         false,
         None,
-        LoginEnv::NoNetwork,
+        &link(false, false, Portal::Silent),
         None,
         false,
         true,
@@ -4925,7 +5102,7 @@ mod tests {
         State::LoggedOut,
         false,
         None,
-        LoginEnv::Campus,
+        &ours,
         None,
         false,
         true,
@@ -4943,7 +5120,7 @@ mod tests {
         State::LoggedOut,
         false,
         Some(1),
-        LoginEnv::Campus,
+        &ours,
         None,
         false,
         true,
@@ -4954,11 +5131,11 @@ mod tests {
     );
     // A rejection is red and comes before the warning.
     assert_eq!(
-      tones(
-        LoginEnv::NoNetwork,
-        State::LoggedOut,
-        Some(Failure::Credentials)
-      ),
+      tones(&ours, State::LoggedOut, Some(Failure::Credentials)),
+      vec![BannerTone::Error]
+    );
+    assert_eq!(
+      tones(&foreign, State::LoggedOut, Some(Failure::Credentials)),
       vec![BannerTone::Error, BannerTone::Warn]
     );
     // A network failure is worded from the active texts, so the band follows
@@ -4971,7 +5148,7 @@ mod tests {
           State::LoggedOut,
           true,
           None,
-          LoginEnv::Campus,
+          &ours,
           Some(&Failure::Network(crate::srun::NetCause::Resolve)),
           false,
           true,
@@ -4988,7 +5165,7 @@ mod tests {
         State::LoggedOut,
         true,
         None,
-        LoginEnv::NoNetwork,
+        &ours,
         Some(&Failure::Credentials),
         false,
         true,
@@ -5005,7 +5182,7 @@ mod tests {
         state,
         true,
         None,
-        LoginEnv::Campus,
+        &ours,
         None,
         true,
         ready,
@@ -5148,6 +5325,30 @@ mod tests {
     // Falls back to `ip` when no session address is reported.
     let v: Value = serde_json::from_str(r#"{"ip":"198.51.100.7"}"#).unwrap();
     assert_eq!(info_from(&v).ip4, "198.51.100.7");
+
+    // The portal's `domain` is the service the session rides on; it is shown
+    // beside the link kind, and absent when the answer does not name one.
+    let v: Value = serde_json::from_str(r#"{"domain":"PermitALL"}"#).unwrap();
+    assert_eq!(info_from(&v).service, "PermitALL");
+    let v: Value = serde_json::from_str(r#"{"user_name":"1234567890"}"#).unwrap();
+    assert_eq!(info_from(&v).service, "");
+  }
+
+  /// The portal's `domain` is shown as the service it names: the deployment
+  /// suffix is dropped, and anything this app does not know stays as it arrived.
+  #[test]
+  fn the_campus_service_is_named_without_its_deployment_suffix() {
+    assert_eq!(service_name("tsinghua-secure_new"), "Tsinghua-Secure");
+    assert_eq!(service_name("Tsinghua-Secure"), "Tsinghua-Secure");
+    assert_eq!(service_name("tsinghua-ipv4_new"), "Tsinghua-IPv4");
+    assert_eq!(service_name("Tsinghua-IPv4"), "Tsinghua-IPv4");
+    assert_eq!(service_name("tsinghua-ipv6_new"), "Tsinghua-IPv6");
+    assert_eq!(service_name("tsinghua"), "Tsinghua");
+    assert_eq!(service_name("tsinghua_new"), "Tsinghua");
+    assert_eq!(service_name("PermitALL"), "PermitALL");
+    assert_eq!(service_name("default"), "default");
+    // A bare `ipv4` is another deployment's name, not one of these services.
+    assert_eq!(service_name("ipv4-only"), "ipv4-only");
   }
 
   /// The walk is a full period long and never wraps.
@@ -5356,16 +5557,34 @@ mod tests {
 
   #[test]
   fn disconnect_is_off_while_the_page_says_offline() {
-    // Nothing to end while offline, even if the core still wants to be online:
-    // an automatic attempt between retries keeps the state Offline, and both
-    // verbs lit up there is what the phone showed.
-    assert!(!can_stop(State::LoggedOut, true));
+    let ours = LinkEnv {
+      connected: true,
+      internet: false,
+      portal: Portal::Ours { ac_id: None },
+      os_session: None,
+    };
+    // Nothing to end while nothing is signed in, even if the core still wants to
+    // be online: an automatic attempt between retries leaves no session, and
+    // both verbs lit up there is what the phone showed.
+    assert!(!ours.logout_possible(State::LoggedOut));
+    assert!(!ours.logout_possible(State::Unknown));
     // A login in flight can be called off.
-    assert!(can_stop(State::Authenticating, true));
-    assert!(can_stop(State::LoggedIn, true));
+    assert!(ours.logout_possible(State::LoggingIn));
+    assert!(ours.logout_possible(State::LoggedIn));
     // A link this app does not manage never offers the verb, whatever the state.
-    assert!(!can_stop(State::LoggedIn, false));
-    assert!(!can_stop(State::Authenticating, false));
+    let secure = LinkEnv {
+      os_session: Some("Tsinghua-Secure".into()),
+      ..ours.clone()
+    };
+    assert!(!secure.logout_possible(State::LoggedIn));
+    // Nor does a link where the portal is not ours: there is no session of the
+    // portal's to end there.
+    let silent = LinkEnv {
+      internet: true,
+      portal: Portal::Silent,
+      ..ours.clone()
+    };
+    assert!(!silent.logout_possible(State::LoggedIn));
   }
 
   #[test]
@@ -5621,43 +5840,81 @@ mod tests {
   #[test]
   fn a_silent_core_reads_as_unknown() {
     let t = crate::i18n::Lang::En.texts();
+    let ours = LinkEnv {
+      connected: true,
+      internet: false,
+      portal: Portal::Ours { ac_id: None },
+      os_session: None,
+    };
+    // No core answering: the verdict came from a core that is no longer there.
     assert_eq!(
-      state_words(State::LoggedOut, &LoginEnv::NoPortal, false, t),
-      (t.unknown, State::LoggedOut)
+      link_words(&ours, State::LoggedOut, false, t).label,
+      t.unknown
     );
-    // With a core answering, the verdict still explains the missing session,
-    // and the palette stays green because the machine is online.
-    assert_eq!(
-      state_words(State::LoggedOut, &LoginEnv::NoPortal, true, t),
-      (t.online_without_portal, State::LoggedIn)
+    // The label is the link's own word; who is signed in belongs to the detail.
+    let words = link_words(&ours, State::LoggedOut, true, t);
+    assert_eq!(words.label, t.offline);
+    assert_eq!(words.detail, t.not_signed_in);
+    // The portal answered and the link routes anyway: nothing to sign in.
+    let words = link_words(
+      &LinkEnv {
+        internet: true,
+        ..ours.clone()
+      },
+      State::LoggedOut,
+      true,
+      t,
     );
-    assert_eq!(
-      state_words(State::LoggedOut, &LoginEnv::OtherNetwork, true, t),
-      (t.online_other_network, State::LoggedIn)
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.online_no_login_needed);
+    // Not the campus network at all: the link is online, so the dot is green.
+    let words = link_words(
+      &LinkEnv {
+        internet: true,
+        portal: Portal::Silent,
+        ..ours.clone()
+      },
+      State::LoggedOut,
+      true,
+      t,
     );
-    assert_eq!(
-      state_words(State::LoggedOut, &LoginEnv::Campus, true, t),
-      (t.offline, State::LoggedOut)
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.online_not_campus);
+    assert_eq!(words.palette, State::LoggedIn);
+    // A link with no carrier says so, and so does its detail.
+    let words = link_words(
+      &LinkEnv {
+        connected: false,
+        ..ours.clone()
+      },
+      State::LoggedOut,
+      true,
+      t,
     );
-    // An 802.1X link is online the moment the OS joined it: the portal row can
-    // arrive a poll later, and waiting for it used to print "Offline" beside a
-    // banner that already named the authenticated network.
-    assert_eq!(
-      state_words(
-        State::LoggedOut,
-        &LoginEnv::EnterpriseWifi("Tsinghua-Secure".into()),
-        true,
-        t
-      ),
-      (t.online, State::LoggedIn)
+    assert_eq!(words.label, t.offline);
+    assert_eq!(words.detail, t.no_connection);
+    // An 802.1X link is signed in the moment the OS joined it: the portal row
+    // can arrive a poll later, and waiting for it used to print "Offline"
+    // beside a banner that already named the authenticated network.
+    let words = link_words(
+      &LinkEnv {
+        connected: true,
+        internet: true,
+        portal: Portal::Ours { ac_id: None },
+        os_session: Some("tsinghua-secure".into()),
+      },
+      State::Unknown,
+      true,
+      t,
     );
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.signed_in_system);
+    let words = link_words(&ours, State::LoggedIn, true, t);
+    assert_eq!(words.label, t.online);
+    assert_eq!(words.detail, t.signed_in);
     assert_eq!(
-      state_words(State::LoggedIn, &LoginEnv::Campus, true, t),
-      (t.online, State::LoggedIn)
-    );
-    assert_eq!(
-      state_words(State::Authenticating, &LoginEnv::Campus, true, t),
-      (t.authenticating, State::Authenticating)
+      link_words(&ours, State::LoggingIn, true, t).label,
+      t.signing_in
     );
   }
 
@@ -5721,7 +5978,7 @@ fn page_banners(
   state: State,
   core_answered: bool,
   stale: Option<u8>,
-  env: LoginEnv,
+  env: &LinkEnv,
   last_error: Option<&Failure>,
   auto_connect: bool,
   credentials_ready: bool,
@@ -5758,29 +6015,13 @@ fn page_banners(
     };
     banners.push((tone, text));
   }
-  // The verdict explains the state of *Connect*: amber while a login is
-  // impossible here (no network, another operator's portal, or an 802.1X
-  // network that has not signed in yet), green on that same network once the
-  // session is up. The core re-probes as soon as the path to the internet
-  // changes, so this is not a leftover from the network the machine left.
+  // The link's own band: the same words the status line and the *Connect* hover
+  // use, so the page can never say two things about one link. It is worded from
+  // the last probe, not from an attempt that failed, so it does not depend on
+  // anyone having pressed a button.
   if page == Page::Status && core_answered {
-    match env {
-      LoginEnv::EnterpriseWifi(ref ssid) if state == State::LoggedIn => {
-        banners.push((BannerTone::Ok, t.secure_wifi_online.replacen("{}", ssid, 1)))
-      }
-      // The internet works without a portal in the way, and the link is not the
-      // campus network at all: home Wi-Fi, mobile data. Nothing to log in to is
-      // good news, so it gets the same green band as an 802.1X network instead
-      // of the amber "nothing to log in to" warning.
-      LoginEnv::OtherNetwork if state != State::LoggedIn => {
-        banners.push((BannerTone::Ok, t.online_no_portal.to_string()))
-      }
-      _ if state != State::LoggedIn => {
-        if let Some(why) = env.blocked_reason(t) {
-          banners.push((BannerTone::Warn, why));
-        }
-      }
-      _ => {}
+    if let Some(band) = link_words(env, state, true, t).band {
+      banners.push(band);
     }
   }
   // Auto connect with nothing to connect with. Offline the machine sits there
@@ -5921,6 +6162,9 @@ impl eframe::App for App {
     let focused = ctx.input(|i| i.focused);
     if focused && !self.was_focused {
       self.push_log(Line::debug("app: window focused"));
+      // Coming to the front is a trigger like any other: the network verdict is
+      // only re-derived on one, so this is where "what did I miss" is answered.
+      self.refresh(true);
     }
     self.was_focused = focused;
     // The autofill service answers from Java; wake the loop when it does and
@@ -6247,7 +6491,6 @@ impl eframe::App for App {
         self.background_allowed = crate::background::allowed();
         self.background_power = crate::background::power_ok();
         self.background_oem_power = crate::background::oem_power();
-        self.secure_detection = crate::secure_wifi::enabled();
       }
     }
 
@@ -6340,19 +6583,25 @@ impl eframe::App for App {
     // without state of its own. It rides the same tick as the turtle.
     #[cfg(windows)]
     {
-      let tip = match self.state {
-        State::LoggedIn => format!(
-          "{} · {label} · {}",
-          app_name(),
-          dash(private_value(&self.info.ip4, self.cfg.privacy))
-        ),
-        _ => format!("{} · {label}", app_name()),
-      };
+      // The same two words as the status line, plus the detail it keeps for the
+      // tooltip, plus the address while a session is up.
+      let detail = link_words(&self.env, self.state, self.core_answered, t).detail;
+      let mut tip = format!("{} · {label}", app_name());
+      if !detail.is_empty() {
+        tip.push_str(" · ");
+        tip.push_str(detail);
+      }
+      if self.state == State::LoggedIn && !self.info.ip4.is_empty() {
+        tip.push_str(" · ");
+        tip.push_str(&dash(private_value(&self.info.ip4, self.cfg.privacy)));
+      }
       self.tray.set_tooltip(&tip);
     }
+    // The tray menu speaks the same rules as the two buttons: a login where one
+    // is the thing to do, a logout where a session of the portal's exists.
     self.tray.set_enabled(
-      self.state != State::LoggedIn && self.env.allows_login(),
-      self.state == State::LoggedIn && self.can_disconnect(),
+      self.state != State::LoggedIn && self.env.login_possible(),
+      self.env.logout_possible(self.state),
     );
 
     // When hidden, wake up often enough to pick up a second launch quickly.

@@ -17,18 +17,21 @@ pub const CALLBACK: &str = "C_a_l_l_b_a_c_k";
 
 const UA: &str = "SRun3K Client_1.0.13462.80424";
 
-/// What the machine is currently attached to, decided from external probes
-/// only (campus pages answer even when there is nothing to log in to).
+/// What the three plain-HTTP probes found on the way to the internet.
+///
+/// This is only about the *path*: what answered, not what a portal said about
+/// this machine. The campus portal's own answer is [`PortalView`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetEnv {
-  /// Nothing answered: no cable, no Wi-Fi, no route, DNS broken.
-  Unreachable,
-  /// The internet answered directly, so there is nothing to authenticate.
-  DirectInternet,
-  /// A captive portal intercepted us and it is the campus one.
-  Campus { ac_id: String },
+pub enum Probe {
+  /// No probe was answered at all. Not "no route": that is `link_id()`. A
+  /// gateway that drops pre-login traffic looks exactly like this.
+  NothingAnswered,
+  /// A probe was answered directly: nothing is intercepting HTTP here.
+  Direct,
+  /// The campus gateway intercepted a probe and named the access controller.
+  Intercepted { ac_id: String },
   /// An interception page that does not look like the campus portal.
-  OtherPortal,
+  ForeignPortal,
 }
 
 /// What kept a request from reaching the portal, coarse enough for the window
@@ -156,6 +159,8 @@ fn looks_unresolved(text: &str) -> bool {
 pub struct Client {
   host: String,
   https: bool,
+  /// What the agents were built with, so they can be rebuilt on a new link.
+  timeout: Duration,
   agent: ureq::Agent,
   /// The login round-trip is relayed by the portal to the access controller,
   /// and right after a session was ended somewhere else (the web portal,
@@ -188,20 +193,68 @@ pub struct PortalView {
   pub address: Option<String>,
 }
 
+/// The `charset=` parameter of a `Content-Type` header, unquoted and lowered.
+///
+/// The portal answers `application/json; charset=utf-8` for `rad_user_info`, but
+/// the login form is GBK on some deployments, so the body is decoded by what the
+/// header says rather than by assuming UTF-8.
+pub fn charset_of(content_type: &str) -> Option<String> {
+  content_type.split(';').skip(1).find_map(|param| {
+    let (name, value) = param.split_once('=')?;
+    name
+      .trim()
+      .eq_ignore_ascii_case("charset")
+      .then(|| value.trim().trim_matches('"').to_ascii_lowercase())
+  })
+}
+
+/// Decode a response body using its declared charset, falling back to UTF-8.
+/// Unknown labels decode as UTF-8 too, lossily, which is what an unlabelled
+/// answer would get.
+pub fn decode_body(bytes: &[u8], charset: Option<&str>) -> String {
+  let encoding = charset
+    .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+    .unwrap_or(encoding_rs::UTF_8);
+  if encoding == encoding_rs::UTF_8 {
+    return String::from_utf8_lossy(bytes).into_owned();
+  }
+  encoding.decode(bytes).0.into_owned()
+}
+
 impl Client {
   pub fn new(host: impl Into<String>, https: bool, timeout: Duration) -> Self {
+    let (agent, login_agent) = Self::agents(timeout);
+    Self {
+      host: host.into(),
+      https,
+      timeout,
+      agent,
+      login_agent,
+    }
+  }
+
+  fn agents(timeout: Duration) -> (ureq::Agent, ureq::Agent) {
     let agent = |t: Duration| -> ureq::Agent {
       ureq::Agent::config_builder()
         .timeout_global(Some(t))
         .build()
         .into()
     };
-    Self {
-      host: host.into(),
-      https,
-      agent: agent(timeout),
-      login_agent: agent(timeout.max(LOGIN_TIMEOUT)),
-    }
+    (agent(timeout), agent(timeout.max(LOGIN_TIMEOUT)))
+  }
+
+  /// Drop the connections kept alive for reuse.
+  ///
+  /// A kept-alive socket is bound to the local address it was opened from, so
+  /// once the machine moves to another link - or a tunnel takes over the route
+  /// to the portal - reusing that socket still asks about the address it no
+  /// longer has. The portal then keeps naming the service of the link just
+  /// left, and the window shows it until the pool happens to expire the socket.
+  /// Rebuilding the agents sends the next request out on the new path.
+  pub fn reset_pool(&mut self) {
+    let (agent, login_agent) = Self::agents(self.timeout);
+    self.agent = agent;
+    self.login_agent = login_agent;
   }
 
   fn scheme(&self) -> &'static str {
@@ -219,21 +272,25 @@ impl Client {
   }
 
   fn get_with(&self, agent: &ureq::Agent, url: &str) -> Result<String, NetError> {
-    agent
+    let mut resp = agent
       .get(url)
       .header("User-Agent", UA)
       .call()
-      .map_err(NetError::transport)?
-      .body_mut()
-      .read_to_string()
-      .map_err(NetError::transport)
+      .map_err(NetError::transport)?;
+    let charset = resp
+      .headers()
+      .get("content-type")
+      .and_then(|v| v.to_str().ok())
+      .and_then(charset_of);
+    let bytes = resp.body_mut().read_to_vec().map_err(NetError::transport)?;
+    Ok(decode_body(&bytes, charset.as_deref()))
   }
 
   /// Cheap reachability probe with a short timeout so the worker thread is not
   /// blocked for long when the machine has no network at all. It runs on a timer
   /// even when nobody asked to log in (it decides whether *Connect* is usable),
   /// so the timeout is deliberately shorter than a normal request.
-  pub fn net_env(&self) -> NetEnv {
+  pub fn net_env(&self) -> Probe {
     const PROBES: [&str; 3] = [
       "http://connect.rom.miui.com/generate_204",
       "http://www.msftconnecttest.com/connecttest.txt",
@@ -248,20 +305,20 @@ impl Client {
         Ok(mut resp) => {
           let body = resp.body_mut().read_to_string().unwrap_or_default();
           if let Some(ac_id) = scan_ac_id(&body) {
-            return NetEnv::Campus { ac_id };
+            return Probe::Intercepted { ac_id };
           }
           return if looks_like_portal(&body) {
-            NetEnv::OtherPortal
+            Probe::ForeignPortal
           } else {
-            NetEnv::DirectInternet
+            Probe::Direct
           };
         }
         // A status-code error still means a server answered: the network works.
-        Err(ureq::Error::StatusCode(_)) => return NetEnv::DirectInternet,
+        Err(ureq::Error::StatusCode(_)) => return Probe::Direct,
         Err(_) => continue,
       }
     }
-    NetEnv::Unreachable
+    Probe::NothingAnswered
   }
 
   fn url(&self, path: &str, params: &[(&str, &str)]) -> String {
@@ -492,6 +549,22 @@ impl Client {
       .to_string();
     Some((user.to_string(), addr))
   }
+}
+
+/// Does the portal's `domain` name the service the OS authenticates (802.1X)?
+///
+/// A session created by the WPA-Enterprise login is reported with a `domain`
+/// such as `tsinghua-secure_new`: the RADIUS realm is the Wi-Fi name, with a
+/// suffix the portal has already changed once. So this is a contains-check on
+/// `tsinghua-secure` rather than an equality - a rename of the suffix must not
+/// change what the app offers, and the raw value goes to the log (and the Link
+/// row) so a rename of the *stem* is visible before it is guessed at.
+///
+/// This is deliberately *not* read from the Wi-Fi name: the name describes the
+/// local radio, and a phone sharing its own 802.1X session to this machine has a
+/// radio whose name says nothing about that session.
+pub fn is_os_service(domain: &str) -> bool {
+  domain.to_ascii_lowercase().contains("tsinghua-secure")
 }
 
 /// Portal codes meaning "this account/password pair is wrong".
@@ -898,6 +971,39 @@ pub fn link_id6() -> Option<std::net::Ipv6Addr> {
   }
 }
 
+/// The local address the OS would use to reach `target`, without sending a
+/// packet: the same route lookup as [`link_id`], aimed somewhere else.
+///
+/// This is how a tunnel that appears *without* touching the default route is
+/// noticed. An SSL VPN that carries campus traffic installs a route to the
+/// portal's prefix, so the source address toward the portal changes while the
+/// one toward the public internet - and therefore [`link_id`] - does not.
+pub fn route_source(target: std::net::SocketAddr) -> Option<std::net::IpAddr> {
+  let bind = if target.is_ipv4() {
+    "0.0.0.0:0"
+  } else {
+    "[::]:0"
+  };
+  let socket = std::net::UdpSocket::bind(bind).ok()?;
+  socket.connect(target).ok()?;
+  socket.local_addr().ok().map(|a| a.ip())
+}
+
+/// The first address `host` resolves to, IPv4 preferred.
+///
+/// Used to aim [`route_source`] at the portal. A name that does not resolve is
+/// not an error here: the caller keeps the address it had, and the watch simply
+/// has nothing to compare until the next probe can resolve it.
+pub fn resolve_host(host: &str) -> Option<std::net::IpAddr> {
+  use std::net::ToSocketAddrs as _;
+  let addrs: Vec<_> = (host, 443).to_socket_addrs().ok()?.collect();
+  addrs
+    .iter()
+    .map(|a| a.ip())
+    .find(std::net::IpAddr::is_ipv4)
+    .or_else(|| addrs.first().map(|a| a.ip()))
+}
+
 /// Which kind of link carries that route: a cable, Wi-Fi, or neither.
 ///
 /// The window shows it next to the account, because a laptop can have both a
@@ -1242,6 +1348,40 @@ fn expanded_device_detail(value: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The portal labels most answers UTF-8, but its login form is GBK on some
+  /// deployments; the header decides, not an assumption.
+  #[test]
+  fn the_body_is_decoded_by_the_charset_its_header_names() {
+    let text = "计费";
+    let utf8 = text.as_bytes();
+    assert_eq!(decode_body(utf8, Some("utf-8")), text);
+    assert_eq!(decode_body(utf8, None), text);
+    let gbk = [0xBC, 0xC6, 0xB7, 0xD1];
+    assert_eq!(decode_body(&gbk, Some("gbk")), text);
+    assert_eq!(decode_body(&gbk, Some("gb2312")), text);
+    // An unknown label must not blank the answer out.
+    assert_eq!(decode_body(utf8, Some("no-such-charset")), text);
+  }
+
+  #[test]
+  fn the_charset_is_read_out_of_a_content_type() {
+    assert_eq!(
+      charset_of("application/json; charset=utf-8").as_deref(),
+      Some("utf-8")
+    );
+    assert_eq!(charset_of("text/html; charset=GBK").as_deref(), Some("gbk"));
+    assert_eq!(
+      charset_of("text/html; charset=\"gb2312\"").as_deref(),
+      Some("gb2312")
+    );
+    assert_eq!(
+      charset_of("text/plain; boundary=x; charset=utf-8").as_deref(),
+      Some("utf-8")
+    );
+    assert_eq!(charset_of("text/plain"), None);
+    assert_eq!(charset_of("text/plain; boundary=x"), None);
+  }
 
   #[test]
   fn a_lookup_failure_without_an_errno_is_a_resolve_failure() {

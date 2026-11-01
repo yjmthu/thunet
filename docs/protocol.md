@@ -21,26 +21,27 @@ Installation, usage and troubleshooting are covered in the [README](../README.md
 
 ## 1. Decide whether a login is needed
 
-Three tiny probe requests (3 s timeout) classify the current network:
+Three tiny probe requests (2 s timeout) say what is on the path to the internet:
 
-| Probe result | Meaning | Reaction |
-| --- | --- | --- |
-| nothing answers | no link, or a gateway that drops pre-login traffic | wait / log in, see below |
-| answer contains `index_<ac_id>.html` | the campus gateway is intercepting HTTP | remember `ac_id`, log in |
-| a small HTML/JS stub without `ac_id` | some other captive portal | wait 60 s, retry |
-| the real page (or any HTTP status) | nothing is intercepting: the session is up, or this link routes without the portal | no login: there is nothing to address it to |
+| Probe result | Meaning |
+| --- | --- |
+| nothing answers | no link, broken DNS, or a gateway that drops pre-login traffic |
+| answer contains `index_<ac_id>.html` | the campus gateway is intercepting HTTP: remember `ac_id`, log in |
+| a small HTML/JS stub without `ac_id` | another operator's captive portal |
+| the real page (or any HTTP status) | nothing is intercepting |
 
-Two shortcuts are applied first:
+The client acts on a *verdict* of four separate facts (`LinkEnv` in `src/proto.rs`), not on one flat list of network cases:
 
-- **Link check.** `link_up()` performs a UDP `connect()` to `223.5.5.5:53`: the kernel does a route lookup and sends nothing. Without a route the loop sleeps instead of firing HTTP requests, so a laptop on a train stays quiet.
-- **Enterprise Wi-Fi.** SSIDs such as `Tsinghua-Secure` authenticate with 802.1X and never show a captive portal, so the portal login is skipped (`src/wifi.rs`). Reading the SSID requires `netsh` on Windows, which needs Location permission; the check is best-effort, and the "internet works" probe above is the fallback.
+- **Is there a link at all.** `link_up()` performs a UDP `connect()` to `223.5.5.5:53`: the kernel does a route lookup and sends nothing. Without one the loop sleeps instead of firing HTTP requests, so a laptop on a train stays quiet.
+- **Does the internet work.** The probes above reached the internet without being intercepted. This is what tells "the gateway is holding me back" (log in) from "this link simply routes" (nothing to do).
+- **Is the campus portal behind it.** Either the interception named the `ac_id`, or `/cgi-bin/rad_user_info` answered. That is the property every campus path shares — cable, campus Wi-Fi, a router, a VPN, an SSL VPN into the campus — and none of them has to carry a campus SSID, so the Wi-Fi name is never consulted. A portal answer is an answer whether or not it names a session (`error: "ok"` vs `not_online_error`).
+- **Does the OS own the session.** The portal names the service a session was authenticated against in `domain` (`tsinghua-secure_new` for the 802.1X login), and a session from that service belongs to the OS: its row is a mirror of it, so no portal verb applies. This is a *portal* answer rather than a local one on purpose — a phone sharing its own 802.1X session to this machine would otherwise have the computer read the phone's Wi-Fi name.
 
-Two local facts only ever *upgrade* the "nothing answers" case, where the login is the only way forward:
+A login is attempted only where it can work: the portal is ours, the gateway is holding traffic back, and the OS does not own the session. Where the portal answers but the link routes anyway — an SSL VPN's egress, a router that is already signed in — the client reads the session and signs nothing in: that address belongs to the gateway, and a login would vouch for everybody behind it.
 
-- **Campus SSID.** Every other `Tsinghua…` SSID (`Tsinghua`, `Tsinghua-IPv4`) keeps the portal, so the name makes a login meaningful there. The name is read from `netsh`, or from the connected network profiles when `netsh` is refused.
-- **The portal knows this address.** `/cgi-bin/rad_user_info` reports the caller's own address — as `client_ip` on the older answers and as `online_ip` on the current portal, which has no `client_ip` field at all. On the campus network it equals the address this machine holds on its default route, because nothing is NATed in between; from any other network the two differ. That separates "the campus gateway just is not intercepting" from "this is not our network at all", so a hotel Wi-Fi never gets a login attempt.
+The verdict is **not polled**. It is re-derived when something changes: the link watch sees a new default-route address or a new interface, the route *toward the portal* changes (that is how an SSL VPN which leaves the default route alone is noticed — the same `UdpSocket::connect` route lookup, aimed at the portal's address), the user presses *Connect* or *Refresh*, or the window comes to the front. A verdict nobody changed cannot change by itself, and on a phone the difference is every request the client no longer sends.
 
-A link that already reaches the internet is **not** upgraded, even when the name says campus: there is nothing to log in to, and `ac_id` is per access network — an id borrowed from the link this machine came from makes the portal answer `E2808` or `INFO failed, BAS respond timeout`. Those two answers are classified as "this `ac_id` cannot be used here", which stops the retry loop instead of hammering the portal (see §10).
+An `ac_id` is per access network. An id borrowed from the link this machine came from makes the portal answer `E2808` or `INFO failed, BAS respond timeout`; those two are classified as "this `ac_id` cannot be used here", which stops the retry loop instead of hammering the portal (see §10).
 
 ## 2. Find the `ac_id`
 
@@ -121,9 +122,13 @@ The RADIUS accounting row appears roughly **20 seconds** after an accepted login
 
 `rad_user_info` also feeds the traffic counters and the periodic status refresh (every 15 s while online). The per-device list in `online_device_detail` arrives as a JSON *string* (an object encoded as text); the client parses it into an object before handing the answer on, and keeps the original text if it is not one.
 
+Every response is decoded by the charset its `Content-Type` names (`srun::decode_body`), and as UTF-8 when the header names none: `rad_user_info` answers `application/json; charset=utf-8`, while some deployments serve the login form as GBK, and reading those bytes as UTF-8 would turn every Chinese field into a replacement character.
+
+All of this describes one link. When the link changes — a cable pulled, Wi-Fi joined, a tunnel that reroutes the portal — the core blanks the portal rows (`Ev::Info({})`) before the next poll rather than leaving the previous link's account, service and addresses on screen under the new interface, then polls again within a second and keeps a few catch-up polls until the portal's own accounting row shows up.
+
 ## 9. Staying online
 
-- **Heartbeat:** the core polls `/srun_portal_pc` and `/cgi-bin/rad_user_info` every 10 s while offline and every 15 s while online. That poll is also the keepalive: `keepalive_time` in the answer always equals the time of the request, so the portal renews the session on it and the client sends no separate keep-alive traffic.
+- **Heartbeat:** the core polls `/srun_portal_pc` and `/cgi-bin/rad_user_info` every 10 s while offline and every 15 s while online, on links where the campus portal is actually behind the path. On any other link the poll is skipped — there it is a guaranteed timeout whose answer the probe already has — except while a session is up, where the poll is the only thing watching the link. That poll is also the keepalive: `keepalive_time` in the answer always equals the time of the request, so the portal renews the session on it and the client sends no separate keep-alive traffic.
 - **Intent:** an automatic login needs the user's runtime intent (seeded by *Connect on startup*, set by a manual connect) and either *Stay connected* or an open startup window. A logout on the portal website is indistinguishable from a kick or a timeout, so *Stay connected* is what decides whether the core signs back in.
 - **Watchdog:** when the link drops the UDP route lookup fails and the loop waits instead of sending requests; when the link returns the backoff is reset and a login is attempted within ~1 s.
 - **Backoff:** consecutive failures wait `reconnect_delay_secs × 2^(n-1)`, capped at 120 s. A rejected password is not retried automatically (the same pair can only be refused again), and neither is an `ac_id` the portal cannot route: both drop the intent, so every automatic path stops until a manual connect.
