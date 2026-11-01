@@ -1275,40 +1275,43 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       // The link facts themselves are published by the thread above; here only
       // their consequences for this loop. The path block below covers a changed
       // address; this covers a changed transport.
-      if last_link_kind != Some(kind) {
+      let kind_changed = last_link_kind != Some(kind);
+      if kind_changed {
         last_link_kind = Some(kind);
         session.reset_pool();
         force_env = true;
       }
       // The portal rows were read on one path to the portal: the default-route
       // address, plus the local address this machine reaches the portal from
-      // (a tunnel changes the second without touching the first). A different
-      // path means they describe a link the machine has already left, so they
-      // are blanked now rather than after LINK_SETTLE - the window reads the
-      // interface on its own tick, and waiting would print the new interface
-      // beside the old service (`WLAN PermitALL`).
+      // (a tunnel changes the second without touching the first). They are
+      // blanked when the transport changes or when the route itself moves,
+      // which is the case that would otherwise keep showing another link's
+      // service. A new address on the same transport is a DHCP step - v4 first
+      // and v6 a second later, a renew, a privacy address - and blanking there
+      // cleared the rows once per step, so one Wi-Fi switch looked like three
+      // or four refreshes. The pool is still reset: its sockets are bound to
+      // the address that is gone.
       let path = (id, portal_route);
       if path != info_path {
+        let route_moved = info_path.1 != portal_route;
         info_path = path;
-        tx.send(Ev::Info(serde_json::json!({}))).ok();
-        // The kept-alive portal sockets belong to the old path as well: reused
-        // as they are, the portal keeps answering for the address this machine
-        // no longer has, and the rows refill with the service of the link just
-        // left. That is the stale tag this clear exists to prevent.
         session.reset_pool();
-        // Families, not addresses: a log line gets pasted into an issue, and the
-        // address is the one thing there that identifies the machine.
-        let families = match (path.0.0.is_some(), path.0.1.is_some()) {
-          (true, true) => "v4+v6",
-          (true, false) => "v4",
-          (false, true) => "v6",
-          (false, false) => "no address",
-        };
-        let route = if path.1.is_some() { "known" } else { "unknown" };
-        tx.send(Ev::Log(Line::debug(format!(
-          "portal rows: cleared, the path to the portal changed ({families}, route {route})"
-        ))))
-        .ok();
+        if kind_changed || route_moved {
+          tx.send(Ev::Info(serde_json::json!({}))).ok();
+          // Families, not addresses: a log line gets pasted into an issue, and the
+          // address is the one thing there that identifies the machine.
+          let families = match (path.0.0.is_some(), path.0.1.is_some()) {
+            (true, true) => "v4+v6",
+            (true, false) => "v4",
+            (false, true) => "v6",
+            (false, false) => "no address",
+          };
+          let route = if path.1.is_some() { "known" } else { "unknown" };
+          tx.send(Ev::Log(Line::debug(format!(
+            "portal rows: cleared, the path to the portal changed ({families}, route {route})"
+          ))))
+          .ok();
+        }
       }
     }
 
