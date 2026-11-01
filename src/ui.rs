@@ -752,9 +752,15 @@ pub struct App {
   /// walk itself is free-running, so a poll or a link change cannot send the
   /// turtle back to the start.
   last_heartbeat: Option<Instant>,
-  /// How far along its track the turtle is, 0.0 .. 1.0. Advanced by the frame
-  /// clock at the current poll period and reset by an explicit Refresh only.
+  /// How far along its track the turtle is, 0.0 .. 1.0. Advanced by real time
+  /// at the current poll period and reset by an explicit Refresh only.
   walk: f32,
+  /// When the walk was last advanced. The clock is read here rather than from
+  /// egui's `stable_dt`: in reactive mode with `request_repaint_after` egui
+  /// reports a *predicted* 1/60 s per frame instead of the time that passed, so
+  /// a walk integrated from it moved as fast as the window happened to repaint
+  /// - fast while the pointer was moving, slow while it was idle.
+  walk_at: Instant,
   /// The turtle sprite, uploaded on first use and kept alive by the handle.
   turtle: Option<egui::TextureHandle>,
   /// The device badge was clicked and its list is showing.
@@ -1053,6 +1059,7 @@ impl App {
       info: Info::default(),
       last_heartbeat: None,
       walk: 0.0,
+      walk_at: Instant::now(),
       turtle: None,
       devices_open: false,
       logs,
@@ -1150,6 +1157,7 @@ impl App {
   /// "succeeded but did nothing" looked like.
   fn refresh(&mut self, quiet: bool) {
     self.walk = 0.0;
+    self.walk_at = Instant::now();
     self.last_heartbeat = Some(Instant::now());
     self.send(Cmd::Refresh { quiet });
   }
@@ -1177,6 +1185,7 @@ impl App {
     // Nothing is beating any more, so the turtle stops where it is rather than
     // walking on and pretending the core is alive.
     self.walk = 0.0;
+    self.walk_at = Instant::now();
     // The link report came from that core too. Without it the Link row and the
     // addresses would keep naming the network the stopped core last saw, and a
     // stale verdict would keep *Connect* lit for a service that is not there.
@@ -6325,16 +6334,20 @@ impl eframe::App for App {
     // per catch-up poll, which is what looked like several refreshes in a row.
     // A hidden window still runs this (eframe calls `logic`), so the walk is
     // where it should be when the window comes back.
+    let now = Instant::now();
+    // A process resumed after a suspend, or a frame that stalled, must not jump
+    // the walk across the track; half a second is the largest step it takes.
+    let dt = now
+      .saturating_duration_since(self.walk_at)
+      .min(Duration::from_millis(500));
+    self.walk_at = now;
     if self.last_heartbeat.is_some() {
       let period = if self.state == State::LoggedIn {
         POLL_ONLINE
       } else {
         POLL_OFFLINE
       };
-      // A resumed process can hand us a multi-second frame; letting that jump
-      // the walk would look like the jump the beats used to cause.
-      let dt = ctx.input(|i| i.stable_dt).min(0.5);
-      self.walk = advance_walk(self.walk, Duration::from_secs_f32(dt), period);
+      self.walk = advance_walk(self.walk, dt, period);
     }
     // A phone parks the event loop while the app is in the background and
     // resumes it on return. The focus edge is the one local trace of that, and
