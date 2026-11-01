@@ -1193,6 +1193,9 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       } else {
         (None, None)
       };
+      // Read before the settle below decides what to blank: whether this is a
+      // new transport is what makes the rows describe a link that is gone.
+      let kind_changed = last_link_kind != Some(kind);
       // A route change only counts once it holds: a DHCP renew or a Wi-Fi roam
       // flips the local address for a second, and acting on that took the
       // window offline and started a fresh login for nothing. While a session
@@ -1233,7 +1236,14 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // The portal's answer belonged to the link just left: its address is
         // gone, so neither the session nor its absence is known any more.
         // Whatever the next poll finds is an answer about the new link.
-        if session.state == State::LoggedIn {
+        //
+        // Only a new transport makes that true. A new address on the same one
+        // is a DHCP step (v4, then v6, then another lease), and blanking on
+        // each of those made one Wi-Fi switch flash the account between the
+        // real name and `-` several times. The poll below still runs at once,
+        // so a genuinely different network's answer replaces the rows within
+        // a second or two.
+        if kind_changed && session.state == State::LoggedIn {
           session.state = State::Unknown;
           tx.send(Ev::Log(Line::warn("link changed, no answer yet")))
             .ok();
@@ -1241,7 +1251,9 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // A poll in flight when the link moved would answer about the old one;
         // now that the move is certain, blank the rows once more so that answer
         // cannot land as if it described this link.
-        tx.send(Ev::Info(serde_json::json!({}))).ok();
+        if kind_changed {
+          tx.send(Ev::Info(serde_json::json!({}))).ok();
+        }
         // The answer the window is showing belongs to the link that just went:
         // ask again now, so the session found on the new one is not held back by
         // the offline poll period.
@@ -1281,7 +1293,6 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       // The link facts themselves are published by the thread above; here only
       // their consequences for this loop. The path block below covers a changed
       // address; this covers a changed transport.
-      let kind_changed = last_link_kind != Some(kind);
       if kind_changed {
         last_link_kind = Some(kind);
         session.reset_pool();
@@ -1290,19 +1301,22 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       // The portal rows were read on one path to the portal: the default-route
       // address, plus the local address this machine reaches the portal from
       // (a tunnel changes the second without touching the first). They are
-      // blanked when the transport changes or when the route itself moves,
-      // which is the case that would otherwise keep showing another link's
-      // service. A new address on the same transport is a DHCP step - v4 first
-      // and v6 a second later, a renew, a privacy address - and blanking there
-      // cleared the rows once per step, so one Wi-Fi switch looked like three
-      // or four refreshes. The pool is still reset: its sockets are bound to
-      // the address that is gone.
+      // blanked when the transport changes, or when the route toward the portal
+      // moves *without* the default address moving - that is the tunnel case
+      // which would otherwise keep showing another link's service. A new
+      // default address on the same transport is a DHCP step - v4 first and v6
+      // a second later, a renew, a privacy address - and blanking there cleared
+      // the rows once per step, so one Wi-Fi switch looked like several
+      // refreshes. The pool is still reset: its sockets are bound to the
+      // address that is gone.
       let path = (id, portal_route);
       if path != info_path {
+        let id_moved = info_path.0 != id;
         let route_moved = info_path.1 != portal_route;
         info_path = path;
         session.reset_pool();
-        if kind_changed || route_moved {
+        let tunneled = route_moved && !id_moved;
+        if kind_changed || tunneled {
           tx.send(Ev::Info(serde_json::json!({}))).ok();
           // Families, not addresses: a log line gets pasted into an issue, and the
           // address is the one thing there that identifies the machine.
