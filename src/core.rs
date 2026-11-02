@@ -1561,6 +1561,12 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           _ => State::Unknown,
         };
         if online != State::LoggedIn {
+          // This verdict can only expire from the other side: the gateway stops
+          // letting an unauthenticated address through once its grace window
+          // ends, and nothing on this machine moves when it does. Without a
+          // fresh probe the loop would read the old "already routes" for ever
+          // and never sign in again, however much `keep_online` wants it.
+          force_env = true;
           skip = Some((
             t.no_login_needed.to_string(),
             "skipped: the portal reports no session and the link already routes".to_string(),
@@ -1806,6 +1812,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             } else if !online && session.state == State::LoggedIn {
               // Session ended outside our control (timeout / kicked / unplugged).
               session.state = State::LoggedOut;
+              // The verdict was taken while the gateway was open *because of*
+              // that session, so it is stale from here on; re-probe instead of
+              // trusting it.
+              force_env = true;
               tx.send(Ev::Log(Line::warn("session ended, logged out")))
                 .ok();
             } else if online
