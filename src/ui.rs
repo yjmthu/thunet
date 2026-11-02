@@ -290,10 +290,9 @@ fn link_words(env: &LinkEnv, state: State, core_answered: bool, t: &Texts) -> Li
 /// Advance the turtle's free-running walk by one frame, wrapping at the end
 /// of the track.
 ///
-/// The walk is not anchored to the beats: the core beats on the loop's
-/// cadence, and a link that just came up owes several catch-up polls two
-/// seconds apart. Restarting the walk on each of those made one Wi-Fi switch
-/// look like five refreshes in a row, so the turtle keeps walking and only an
+/// The walk is not anchored to the beats: a beat is one pass of the core's
+/// loop, which comes round several times a second, so restarting the walk on
+/// each one would pin the turtle at the start. It keeps walking, and only an
 /// explicit Refresh starts it over.
 fn advance_walk(walk: f32, dt: Duration, period: Duration) -> f32 {
   if period.is_zero() {
@@ -305,8 +304,9 @@ fn advance_walk(walk: f32, dt: Duration, period: Duration) -> f32 {
 /// The turtle that walks the status track.
 ///
 /// It stands on a fixed-length line and walks it at the poll period, looping
-/// at the right end; the line itself never changes length. It turns amber once
-/// the core has missed a whole cycle.
+/// at the right end; the line itself never changes length. It turns amber when
+/// the core's loop has not come round for longer than a cycle, which is a stuck
+/// core and not a request that is merely slow.
 fn status_track(
   ui: &mut egui::Ui,
   state: State,
@@ -572,9 +572,9 @@ pub struct App {
   next_local: Instant,
   state: State,
   info: PortalRows,
-  /// When the last beat arrived. Only the track's amber colour reads it: the
-  /// walk itself is free-running, so a poll or a link change cannot send the
-  /// turtle back to the start.
+  /// When the last beat arrived: one per pass of the core's loop. Only the
+  /// track's amber colour reads it: the walk itself is free-running, so a poll
+  /// or a link change cannot send the turtle back to the start.
   last_heartbeat: Option<Instant>,
   /// How far along its track the turtle is, 0.0 .. 1.0. Advanced by real time
   /// at the current poll period and reset by an explicit Refresh only.

@@ -105,6 +105,16 @@ public class ThunetApp extends Application {
               refreshLink();
             }
 
+            // An address arrived or left on this Wi-Fi. Android announces a
+            // join through `onAvailable`, but the IPv6 address is assigned
+            // later - SLAAC and DHCPv6 finish seconds after association - and
+            // only this callback fires then. Without it the rows kept the IPv4
+            // address alone until some unrelated event made `refreshLink` run.
+            @Override
+            public void onLinkPropertiesChanged(Network network, LinkProperties props) {
+              refreshLink();
+            }
+
             @Override
             public void onLost(Network network) {
               Log.i(Wake.TAG, "link: wifi lost " + network);
@@ -151,6 +161,14 @@ public class ThunetApp extends Application {
           new ConnectivityManager.NetworkCallback() {
             @Override
             public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+              refreshLink();
+            }
+
+            // The same address event on the default network: a Wi-Fi that took
+            // over as default reports its IPv6 here, and mobile data reports
+            // the addresses it hands out after the APN comes up.
+            @Override
+            public void onLinkPropertiesChanged(Network network, LinkProperties props) {
               refreshLink();
             }
 

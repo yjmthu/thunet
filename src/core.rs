@@ -21,8 +21,10 @@ use crate::proto::{Cmd, Ev, Failure, LinkEnv, LinkKind, LinkState, Portal, Porta
 use crate::session::{Session, State};
 use crate::srun::{NetCause, NetError, Probe};
 
-/// The status poll the window draws as a heartbeat: every 15 s while the
-/// session is up, every 10 s while it is not.
+/// The interval of the status poll: every 15 s while the session is up, every
+/// 10 s while it is not. It is how long one walk of the turtle takes and what
+/// the amber track measures a stalled core against; the beat itself is the loop
+/// (see [`Ev::Beat`]).
 ///
 /// This is the only timer left in the core, and it is not a guess: on a campus
 /// link that poll *is* the keepalive (see `docs/protocol.md` §9), and it is what
@@ -1702,8 +1704,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     // pass already restarts the gap. A poll is only made where the portal can
     // answer (see [`LinkEnv::polls_portal`]): elsewhere it was a three-second
     // timeout whose failure the verdict already explains, and nothing it found
-    // could change the page. The beat is sent either way - it is the core's own
-    // liveness, and a link with no portal still has to show that the loop runs.
+    // could change the page.
     let catchup_due = catchup_polls > 0 && last_status.elapsed() >= LINK_CATCHUP_STEP;
     let poll_every = if session.state == State::LoggedIn {
       POLL_ONLINE
@@ -1822,10 +1823,6 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         force_status = false;
         catchup_polls = 0;
       }
-      // The beat is the loop, not the poll's answer: the window draws it as a
-      // heartbeat, and neither a silent portal nor a link without one may look
-      // like a core that stopped.
-      tx.send(Ev::Beat).ok();
       last_status = Instant::now();
     }
 
@@ -1846,6 +1843,15 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     for w in session.take_warnings() {
       tx.send(Ev::Log(w)).ok();
     }
+
+    // The beat is this pass ending, and nothing else. It used to ride on the
+    // poll, which made one thing stand for two: a handover where the portal
+    // query was still outstanding - a DNS lookup on a fresh Wi-Fi, a login
+    // waiting out the portal's own relay - read as a core that had stopped, and
+    // the track went amber for the whole of it. One beat per pass means the
+    // window's amber is only ever "the loop has not come round", which is what
+    // it is drawn for.
+    tx.send(Ev::Beat).ok();
 
     // Wait for the next tick, or until the OS says the link moved.
     //

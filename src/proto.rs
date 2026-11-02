@@ -443,9 +443,10 @@ pub enum Ev {
   /// IP rows are drawn from [`Ev::Info`] instead, so the two are published
   /// together and cannot contradict each other.
   Link(LinkState),
-  /// One status poll finished, whether or not the portal answered. The window
-  /// walks the turtle from this beat; [`Ev::Info`] carries what the answer
-  /// said.
+  /// One pass of the core's loop finished. The window draws its track from this
+  /// beat, and turns it amber when none arrives for longer than a poll period,
+  /// so the colour means the loop stopped and never a request that is merely
+  /// slow; [`Ev::Info`] carries what the last answer said.
   Beat,
   Log(Line),
   /// `Some` = a failure to surface; `None` = clear the banner.
