@@ -578,6 +578,12 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   // compares it (see `await_request`) and is abandoned when the link moves.
   let link_gen = Arc::new(AtomicU64::new(0));
   let mut force_env = true;
+  // A session of ours ended and no login has been made since. While this holds,
+  // the portal saying "no session" on a link that still routes is the gateway's
+  // grace window - it stops intercepting only once the portal has closed the
+  // session - and not a link that needs no login. Cleared by a login either way,
+  // by a new link, and by a session the portal reports on its own.
+  let mut session_lost = false;
   // The last thing the log said about the portal evidence: one line per change,
   // not per probe.
   let mut last_portal_note: Option<String> = None;
@@ -1298,6 +1304,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         next_attempt = Instant::now();
         failures = 0;
         last_failure.clear();
+        session_lost = false;
       }
       let up = id.0.is_some() || id.1.is_some();
       if up && !link_ready {
@@ -1547,11 +1554,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           ),
         };
         skip = Some((text, log, Duration::from_secs(60), ToastKind::Info));
-      } else if last_env.internet {
+      } else if last_env.internet && !session_lost {
         // Our portal, and the link routes anyway: a grace period, or an address
         // the portal is not gating (a VPN's egress, a router already signed in).
         // A login here would authenticate that shared address for everybody
-        // behind it, so one answer is all this gets.
+        // behind it, so one answer is all this gets. A session of ours that just
+        // ended is the exception: the address is this machine's own, and what
+        // routes is the gateway still letting it through.
         let client = session.client().clone();
         let online = match await_request(&link_gen, move || client.status()) {
           Ok(Ok(v)) => {
@@ -1617,6 +1626,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           // Connected: the connect window has done its job. Whether the core
           // keeps it that way is `keep_online`'s decision from here on.
           connect_budget = Duration::ZERO;
+          session_lost = false;
           set_banner(&tx, &mut banner, None);
           // The gateway stops intercepting once the session is up, so the
           // verdict this link earns has changed too - and it is never polled.
@@ -1638,6 +1648,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         }
         Err(e) => {
           failures = failures.saturating_add(1);
+          // One attempt is all "this link needs no login" waits for: after it the
+          // old reading returns, so a shared address that will never accept a
+          // login of ours falls back to the quiet verdict instead of retrying.
+          session_lost = false;
           let bad_credentials = session.failure == crate::session::FailureKind::Credentials;
           let ac_unreachable = session.failure == crate::session::FailureKind::AcUnreachable;
           // What the next pass may do differs per kind of failure.
@@ -1802,6 +1816,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             let online = v.get("online").and_then(|b| b.as_bool()).unwrap_or(false);
             if online && session.state != State::LoggedIn {
               session.state = State::LoggedIn;
+              session_lost = false;
               failures = 0;
               // Being online is what the connect window was for: it is done. A
               // session found here may have been opened elsewhere, which is still
@@ -1811,10 +1826,17 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
               tx.send(Ev::Log(Line::info("already online"))).ok();
             } else if !online && session.state == State::LoggedIn {
               // Session ended outside our control (timeout / kicked / unplugged).
-              session.state = State::LoggedOut;
               // The verdict was taken while the gateway was open *because of*
               // that session, so it is stale from here on; re-probe instead of
               // trusting it.
+              session_lost = true;
+              // Say what is about to happen, not what the still-open gateway
+              // would have the page read: a sign-in that starts right away is one.
+              session.state = if auto_attempts && link_ready && Instant::now() >= next_attempt {
+                State::LoggingIn
+              } else {
+                State::LoggedOut
+              };
               force_env = true;
               tx.send(Ev::Log(Line::warn("session ended, logged out")))
                 .ok();

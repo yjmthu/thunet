@@ -268,7 +268,17 @@ fn link_words(env: &LinkEnv, state: State, core_answered: bool, t: &Texts) -> Li
     },
     // Our portal, and the link routes anyway: the portal sees an address it is
     // not gating (a VPN's egress, a router already signed in), so a login would
-    // vouch for that address rather than for this machine.
+    // vouch for that address rather than for this machine. A login already in
+    // flight is the exception: a link can still route in the gateway's grace
+    // window right after a session ended, and calling that "needs no login"
+    // flashed the band between every re-login. The row says what is happening.
+    (Portal::Ours { .. }, true) if state == State::LoggingIn => LinkWords {
+      label: t.signing_in,
+      detail: t.signing_in_note,
+      palette: State::LoggingIn,
+      band: None,
+      refusal: Some(t.signing_in.to_string()),
+    },
     (Portal::Ours { .. }, true) => {
       let signed_in = state == State::LoggedIn;
       LinkWords {
@@ -4853,6 +4863,15 @@ mod tests {
     assert_eq!(words.detail, t.signed_in);
     assert!(words.band.is_none());
     assert_eq!(words.palette, State::LoggedIn);
+
+    // The same link while a re-login runs: the routing it sees may be the
+    // gateway's grace window after a session ended, so the row reports the
+    // sign-in instead of concluding that none is needed - and draws no band.
+    let words = link_words(&ours(true), State::LoggingIn, true, t);
+    assert_eq!(words.label, t.signing_in);
+    assert_eq!(words.detail, t.signing_in_note);
+    assert_eq!(words.palette, State::LoggingIn);
+    assert!(words.band.is_none());
 
     // Our portal, but the link routes anyway (a VPN's egress, a router that is
     // already signed in): online, and nothing to sign in.
