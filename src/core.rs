@@ -1168,7 +1168,10 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       let log = "skipped: no account or password to log in with";
       if last_failure != log {
         last_failure = log.to_string();
-        tx.send(Ev::Log(Line::warn(log))).ok();
+        // A note, not a warning: nothing is broken, the account is simply not
+        // filled in yet, and the settings page is where that is fixed. The
+        // toast beside it carries the same tone.
+        tx.send(Ev::Log(Line::info(log))).ok();
         if user_connect {
           tx.send(Ev::Notify {
             msg: t.no_credentials.into(),
@@ -1573,7 +1576,18 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // Log (and toast) only when the reason changes, not on every retry.
         if last_failure != log {
           last_failure = log.clone();
-          tx.send(Ev::Log(Line::warn(&log))).ok();
+          // A skip is the app declining to act, not a fault: the OS owning the
+          // session (802.1X), a link with no campus portal behind it and a link
+          // that already routes are the design working, and the amber WARN tag
+          // made a machine in its normal state look broken. Only a skip the
+          // user has to fix (`Err`) stays a warning; the toast's own tone is
+          // what already says which is which.
+          let line = if kind == ToastKind::Err {
+            Line::warn(&log)
+          } else {
+            Line::info(&log)
+          };
+          tx.send(Ev::Log(line)).ok();
           if user_connect {
             tx.send(Ev::Notify { msg, kind }).ok();
             user_connect = false;

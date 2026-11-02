@@ -248,6 +248,9 @@ pub struct Texts {
   pub link_wlan: &'static str,
   pub link_mobile: &'static str,
   pub link_usb: &'static str,
+  /// The link row's value when there is no default route. The same `-` the rest
+  /// of the column shows for a value that does not exist: a word here read as
+  /// one more kind of link rather than as "nothing to report".
   pub link_none: &'static str,
   pub link_other: &'static str,
   /// Tooltip of the heartbeat ring beside the state label.
@@ -485,7 +488,7 @@ static ZH: Texts = Texts {
   link_wlan: "WLAN",
   link_mobile: "移动数据",
   link_usb: "USB 共享",
-  link_none: "未连接",
+  link_none: "-",
   link_other: "其他",
   heartbeat_hint: "进度条每在线 15 秒、离线 10 秒走完一圈；变黄说明核心循环停住了。门户只在本链路上查询",
   ipv4: "IPv4",
@@ -645,7 +648,7 @@ static EN: Texts = Texts {
   link_wlan: "WLAN",
   link_mobile: "Mobile data",
   link_usb: "USB tethering",
-  link_none: "No link",
+  link_none: "-",
   link_other: "Other",
   heartbeat_hint: "One lap takes 15 s online and 10 s offline; amber means the core's loop has stopped. The portal itself is only queried where it is on this link",
   ipv4: "IPv4",

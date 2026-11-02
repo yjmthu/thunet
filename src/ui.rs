@@ -53,7 +53,7 @@ fn mask_for(value: &str) -> &'static str {
 /// The account and the addresses are private; the row label, the session
 /// traffic and the device types are not.
 fn private_value(value: &str, hidden: bool) -> &str {
-  if hidden && !value.is_empty() && value != "—" {
+  if hidden && !value.is_empty() && value != NO_VALUE {
     mask_for(value)
   } else {
     value
@@ -2116,7 +2116,7 @@ impl App {
           // would claim a session the portal never confirmed - that name has
           // its place on the settings page, where it is edited.
           let account = if self.info.name.is_empty() {
-            "—".to_string()
+            NO_VALUE.to_string()
           } else {
             self.info.name.clone()
           };
@@ -2177,10 +2177,22 @@ impl App {
               }
               ui.end_row();
               ui.label(t.session_traffic);
+              // The counters describe a session, and the portal names one only
+              // by naming an account for this address - the same fact the row
+              // above reads. Without it there is no number to show, but the
+              // arrows, colours and unit stay, so the row keeps its shape and
+              // the column does not jump between the two states. Under it the
+              // number is the portal's, printed as it is: zero and any other
+              // byte count are the same case, a reading rather than a gap.
+              let (down, up) = if self.info.name.is_empty() {
+                (None, None)
+              } else {
+                (Some(self.info.bytes_in), Some(self.info.bytes_out))
+              };
               let height = ui.text_style_height(&egui::TextStyle::Body);
               let gap = 12.0;
-              let down = traffic_job(ui, "↓", self.info.bytes_in, ui.visuals().hyperlink_color);
-              let up = traffic_job(ui, "↑", self.info.bytes_out, ui.visuals().warn_fg_color);
+              let down = traffic_job(ui, "↓", down, ui.visuals().hyperlink_color);
+              let up = traffic_job(ui, "↑", up, ui.visuals().warn_fg_color);
               let down = ui.ctx().fonts_mut(|f| f.layout_job(down));
               let up = ui.ctx().fonts_mut(|f| f.layout_job(up));
               let width = down.size().x + gap + up.size().x;
@@ -3053,9 +3065,14 @@ impl App {
   }
 }
 
+/// What a status-row cell shows when it has no value: no link, no address, no
+/// account, no session traffic. One glyph for all of them, so the column reads
+/// as one empty state rather than four different ones.
+const NO_VALUE: &str = "-";
+
 fn dash(s: &str) -> String {
   if s.is_empty() {
-    "-".to_string()
+    NO_VALUE.to_string()
   } else {
     s.to_string()
   }
@@ -5223,7 +5240,7 @@ mod tests {
   }
 
   /// Privacy mode replaces the account and the addresses with dots; addresses
-  /// keep their family's length, and an empty value or the "no session" dash
+  /// keep their family's length, and an empty value or the "no value" dash
   /// stay as they are.
   #[test]
   fn private_values_are_masked() {
@@ -5232,7 +5249,7 @@ mod tests {
     assert_eq!(private_value("1234567890", true), MASK);
     assert_eq!(private_value("1234567890", false), "1234567890");
     assert_eq!(private_value("", true), "");
-    assert_eq!(private_value("—", true), "—");
+    assert_eq!(private_value(NO_VALUE, true), NO_VALUE);
     assert_eq!(MASK_IP4.chars().count(), 9);
     assert!(MASK_IP6.chars().count() > MASK_IP4.chars().count());
   }
@@ -6596,7 +6613,7 @@ fn build_time_label(t: &Texts) -> String {
 fn traffic_job(
   ui: &egui::Ui,
   arrow: &str,
-  bytes: u64,
+  bytes: Option<u64>,
   arrow_color: egui::Color32,
 ) -> egui::text::LayoutJob {
   let font = egui::TextStyle::Body.resolve(ui.style());
@@ -6613,11 +6630,12 @@ fn traffic_job(
     );
   };
   add(&mut job, arrow, arrow_color);
-  add(
-    &mut job,
-    &format!(" {}", human(bytes)),
-    ui.visuals().text_color(),
-  );
+  // `None` is a session the portal does not report. The unit stays so the
+  // count still reads as a byte count, one the portal has not filled in - the
+  // row never collapses to a bare dash and never shows a zero it cannot stand
+  // behind.
+  let amount = bytes.map_or_else(|| format!("{NO_VALUE} B"), human);
+  add(&mut job, &format!(" {amount}"), ui.visuals().text_color());
   job
 }
 
