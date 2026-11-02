@@ -800,6 +800,10 @@ fn connect(path: &str) -> Result<Stream, String> {
 /// not data: a Windows pipe loses both the buffered line and the client's
 /// identity if the client goes away before the server accepts it, so the peer
 /// stays connected until it sees this.
+// The pipe behind this endpoint is the machine-quit doorbell and the service
+// protocol; Android is one process with no service, so nothing binds or
+// connects it there.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub(crate) mod endpoint {
   #[cfg(unix)]
   use interprocess::local_socket::prelude::*;
@@ -1181,6 +1185,7 @@ pub struct Link {
   /// frontend says why in one warning and then closes the pipe. The event still
   /// travels to the caller - the CLI drops everything it reads while it waits
   /// for the replay to end - so the reason is remembered here or nowhere.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   last_warn: Arc<Mutex<Option<String>>>,
   machine: bool,
 }
@@ -1372,6 +1377,7 @@ impl Link {
   }
 
   /// The last warning the core sent, when it died without answering.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   pub fn last_warn(&self) -> Option<String> {
     let slot = self
       .last_warn

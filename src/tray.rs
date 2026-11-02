@@ -5,7 +5,11 @@
 //! needs a `cfg` for the tray itself.
 
 /// What a tray menu item or an icon click asks the window to do.
+///
+/// Android has no tray, so its inert [`Tray`] never builds a menu item and no
+/// variant is constructed there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub enum Action {
   Connect,
   Disconnect,

@@ -14,6 +14,11 @@
 //! rights on both platforms; the tray entry is always per user and never needs
 //! elevation.
 
+// Android has no service manager and no tray: its window reaches only the two
+// `*_registered` queries, so the service half of this module - and the stubs
+// that stand in for it - is compiled there but never called.
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 /// How much of the app starts with the system.

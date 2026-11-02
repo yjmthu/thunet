@@ -234,6 +234,9 @@ pub fn migrate() {
   split_legacy(&dir(), true);
 }
 
+// Android has no machine-wide service: its core is a thread of the window, so
+// the machine directory is never split or read there.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn migrate_machine() {
   split_legacy(&machine_dir(), false);
 }
@@ -323,6 +326,7 @@ impl CoreConfig {
   }
 
   /// Load the machine-wide settings: the service account's directory.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   pub fn load_machine() -> Self {
     migrate_machine();
     Self::read(&machine_dir())

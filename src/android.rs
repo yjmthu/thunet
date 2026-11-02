@@ -45,6 +45,10 @@ static BACK_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// by the window on its next pass and handed to egui as `Event::Ime`.
 static IME_EVENTS: Mutex<Vec<eframe::egui::ImeEvent>> = Mutex::new(Vec::new());
 
+// `AndroidApp` is the handle `android-activity`'s JNI glue passes in, and this
+// is the signature winit documents for the entry point; the lint cannot see
+// past the opaque type.
+#[allow(improper_ctypes_definitions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn android_main(app: AndroidApp) {
   let dir = app

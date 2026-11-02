@@ -674,6 +674,7 @@ pub struct App {
   /// Whether that window entry is registered. The machine modes answer with
   /// `autostart_mode` instead; a portable run has no service, so this is its
   /// whole autostart state.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   portable_autostart: bool,
   user_edit: String,
   pass_edit: String,
@@ -1546,6 +1547,7 @@ impl App {
   /// Register or remove the login entry that starts this portable window.
   ///
   /// Only the window half: a portable run has no service to register.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   fn apply_portable_autostart(&mut self, on: bool) {
     let Some(autostart) = self.autostart.clone() else {
       self.toast_err(self.t().autostart_failed.to_string());
@@ -1571,6 +1573,7 @@ impl App {
   ///
   /// The work happens on a helper thread: on Windows the core half may show a
   /// UAC prompt, so the answer can take as long as the user needs to click.
+  #[cfg_attr(target_os = "android", allow(dead_code))]
   fn apply_autostart_mode(&mut self, mode: Mode) {
     // The row is not drawn in portable mode; this keeps a stray call from
     // registering the machine service anyway.

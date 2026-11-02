@@ -683,6 +683,7 @@ pub fn portal_device_class() -> Option<&'static str> {
 /// `battery` is evidence, not a default: a machine with a battery is portable
 /// even when the firmware stays silent. Without that evidence the answer is
 /// `None` - a desktop is never assumed from a missing answer.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn class_from_chassis(chassis: Option<u32>, battery: bool) -> Option<&'static str> {
   match chassis {
     Some(3) => Some("Desktop"),
@@ -1025,6 +1026,7 @@ pub fn link_present() -> bool {
 /// waiting for a poll interval. Either family is enough: a v6-only network has
 /// no IPv4 route at all, and calling that "no link" is how the app used to sit
 /// still on `Tsinghua-IPv6`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn link_up() -> bool {
   link_id().is_some() || link_id6().is_some()
 }
@@ -1113,6 +1115,7 @@ fn android_link() -> Option<(
 /// The same route-lookup trick, aimed at a public v6 host: the address the
 /// kernel would send from is the one this machine holds on the link. `None`
 /// when there is no v6 route at all (an IPv4-only network).
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn link_id6() -> Option<std::net::Ipv6Addr> {
   let socket = std::net::UdpSocket::bind("[::]:0").ok()?;
   socket.connect("[2400:3200::1]:53").ok()?;

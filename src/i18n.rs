@@ -41,6 +41,9 @@ impl Lang {
   }
 }
 
+// The Android settings page offers none of the autostart rows: a phone has no
+// service manager and no tray to turn on.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub struct Texts {
   // window chrome
   pub connect: &'static str,

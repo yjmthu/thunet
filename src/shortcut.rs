@@ -17,6 +17,7 @@ pub use linux::create_desktop_shortcut;
 pub use windows::create_desktop_shortcut;
 
 #[cfg(not(any(windows, target_os = "linux")))]
+#[cfg_attr(target_os = "android", allow(dead_code))] // no desktop to put a launcher on
 pub fn create_desktop_shortcut() -> Result<(), String> {
   Err("desktop shortcuts are only implemented for Windows and Linux".into())
 }

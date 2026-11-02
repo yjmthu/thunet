@@ -6,6 +6,10 @@
 //! operation and exits, so the privilege is held for the length of that call
 //! and not by anything that keeps running.
 
+// Android has neither UAC nor polkit: nothing in its window can ask for
+// administrator rights, so these helpers have no caller there.
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 /// Error string returned when the user dismisses the Windows UAC prompt.
 ///
 /// Callers that show a message can translate it instead of reporting a

@@ -3,6 +3,11 @@
 //! A second launch of the GUI must not start another tray icon and a second
 //! network worker: it should bring the existing window back instead.
 
+// The Android activity is the only instance by construction and there is no
+// installer on the platform, so the machine-wide quit doorbell and the upgrade
+// records it writes back have no caller there.
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 /// Held for the lifetime of the process; dropping it releases the guard.
 pub struct Guard {
   #[cfg(unix)]

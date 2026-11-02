@@ -9,6 +9,10 @@
 //!
 //! The pipe path uses none of this: `piped_line` reads plain lines from stdin.
 
+// Only the desktop CLI (`thunet login -i`) asks questions on a terminal; the
+// Android window never runs that command.
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 use std::io::{IsTerminal as _, Write};
 
 /// Whether there is a terminal to ask a question on.
