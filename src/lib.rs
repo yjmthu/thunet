@@ -17,6 +17,7 @@ mod i18n;
 mod icons;
 mod ident;
 mod ipc;
+mod linkwatch;
 mod logline;
 mod prompt;
 mod proto;

@@ -40,4 +40,14 @@ final class Native {
 
   /** Delete this many characters before and after the cursor. */
   static native void imeDelete(int before, int after);
+
+  /**
+   * The link this process is using: the transport on the first line, the
+   * addresses it holds on the next two.
+   *
+   * Pushed from {@code ThunetApp} whenever the network changes, and once at
+   * start: the core keeps it in memory and is woken by the push, so it asks
+   * neither the route table nor the file system while nothing moves.
+   */
+  static native void setLink(String text);
 }

@@ -12,7 +12,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use serde_json::Value;
 
 use crate::autostart::{Autostart, Mode};
 use crate::config::Config;
@@ -26,56 +25,11 @@ use crate::icons::{
 use crate::ipc::Link;
 use crate::logline::{Level, Line};
 use crate::proto::{
-  Cmd, CoreInfo, CredentialState, Ev, Failure, LinkEnv, LinkKind, Portal, ToastKind,
+  Cmd, CoreInfo, CredentialState, Ev, Failure, LinkEnv, LinkKind, Portal, PortalDevice, PortalRows,
+  ToastKind,
 };
 use crate::session::State;
 use crate::tray::{Action, Tray};
-
-#[derive(Default, Clone)]
-struct Info {
-  ip4: String,
-  ip6: String,
-  bytes_in: u64,
-  bytes_out: u64,
-  name: String,
-  /// The service the portal says this session belongs to (its `domain`):
-  /// `PermitALL` on a wired port, `tsinghua-ipv4_new` on that SSID, and
-  /// `tsinghua-secure_new` on the OS-level 802.1X login. Shown next to the link
-  /// because it names *which* service the session rides on, which the local
-  /// link kind cannot say.
-  service: String,
-  /// The account's online devices, this machine first. Empty when the portal
-  /// reports no detail (offline, or an answer without the field).
-  devices: Vec<Device>,
-  /// How many devices the account has online, from the detail when there is
-  /// one and from the portal's own total otherwise.
-  devices_total: usize,
-}
-
-/// One device the account has online, as `/cgi-bin/rad_user_info` lists it.
-#[derive(Default, Clone)]
-struct Device {
-  /// Portal session id. Only keeps the order stable inside a group.
-  id: String,
-  ip4: String,
-  ip6: String,
-  os: String,
-  class: String,
-  /// This is the machine the window runs on, judged by the session's own
-  /// addresses.
-  local: bool,
-}
-
-/// The portal reports `::` (or an all-zero address) when nothing is assigned;
-/// treat those as "no address" so the copy button stays disabled.
-fn norm_ip(s: &str) -> String {
-  let t = s.trim();
-  if t.is_empty() || t == "::" || t == "0:0:0:0:0:0:0:0" || t == "0.0.0.0" {
-    String::new()
-  } else {
-    t.to_string()
-  }
-}
 
 /// What a private value looks like when privacy is on.
 ///
@@ -165,131 +119,6 @@ fn masked_log(text: String, accounts: &[&str], hidden: bool) -> String {
     .map(|name| name.trim())
     .filter(|name| !name.is_empty())
     .fold(text, |acc, name| mask_token(&acc, name))
-}
-
-fn info_from(v: &Value) -> Info {
-  let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
-  // An answer from a v6-only link names the caller with its v6 address (in
-  // `client_ip`/`online_ip`, the fields that always meant "the address the
-  // portal sees"), so each row has to take only addresses of its own family
-  // rather than whichever one happens to be first.
-  let seen = {
-    let first = norm_ip(s("online_ip"));
-    if first.is_empty() {
-      norm_ip(s("ip"))
-    } else {
-      first
-    }
-  };
-  let ip4 = if seen.contains(':') {
-    String::new()
-  } else {
-    seen.clone()
-  };
-  let ip6 = {
-    let own = norm_ip(s("online_ip6"));
-    if !own.is_empty() {
-      own
-    } else if seen.contains(':') {
-      seen.clone()
-    } else {
-      String::new()
-    }
-  };
-  let devices = devices_from(v.get("online_device_detail"), &ip4, &ip6);
-  // The portal reports the total as a *string*, and it can disagree with the
-  // detail: count what is actually listed, and only fall back to the portal's
-  // number when the detail is missing altogether (an older core, or offline).
-  let devices_total = if devices.is_empty() {
-    v.get("online_device_total")
-      .and_then(|n| {
-        n.as_str()
-          .and_then(|text| text.trim().parse().ok())
-          .or_else(|| n.as_u64().map(|n| n as usize))
-      })
-      .unwrap_or(0)
-  } else {
-    devices.len()
-  };
-  Info {
-    ip4,
-    ip6,
-    bytes_in: v.get("bytes_in").and_then(Value::as_u64).unwrap_or(0),
-    bytes_out: v.get("bytes_out").and_then(Value::as_u64).unwrap_or(0),
-    name: s("user_name").to_string(),
-    service: s("domain").to_string(),
-    devices,
-    devices_total,
-  }
-}
-
-/// The service behind a session, as the row shows it.
-///
-/// The portal's `domain` is the name of the campus service a session belongs to,
-/// and deployments append a suffix of their own (`tsinghua-secure_new`, and a
-/// `tsinghua-ipv4_new` that was `tsinghua-ipv4` before it). The suffix is not
-/// what the user is reading for, and a rename should not look like a new
-/// service: the campus names are matched in full, and anything else
-/// (`PermitALL`, a policy name this app has not seen) is shown as it arrived.
-/// A bare `ipv4` is not enough to match: another deployment's name could carry
-/// that word without being one of these services.
-fn service_name(domain: &str) -> &str {
-  let lower = domain.to_ascii_lowercase();
-  if lower.contains("tsinghua-secure") {
-    "Tsinghua-Secure"
-  } else if lower.contains("tsinghua-ipv4") {
-    "Tsinghua-IPv4"
-  } else if lower.contains("tsinghua-ipv6") {
-    "Tsinghua-IPv6"
-  } else if lower.contains("tsinghua") {
-    // The bare service name, also seen with a `_new` suffix of its own.
-    "Tsinghua"
-  } else {
-    domain
-  }
-}
-
-/// The per-device list from `rad_user_info`.
-///
-/// The core hands the portal's JSON-in-a-string on as an object, keyed by
-/// session id. A device with no address at all is dropped (it cannot be shown),
-/// and the order is stable so the hover list does not jump around between
-/// polls: this machine, then devices with an IPv4 address, then IPv6-only ones.
-fn devices_from(detail: Option<&Value>, local4: &str, local6: &str) -> Vec<Device> {
-  let mut devices = Vec::new();
-  if let Some(map) = detail.and_then(Value::as_object) {
-    for (id, entry) in map {
-      let s = |k: &str| {
-        entry
-          .get(k)
-          .and_then(Value::as_str)
-          .unwrap_or("")
-          .trim()
-          .to_string()
-      };
-      let ip4 = norm_ip(&s("ip"));
-      let ip6 = norm_ip(&s("ip6"));
-      if ip4.is_empty() && ip6.is_empty() {
-        continue;
-      }
-      let local = (!local4.is_empty() && ip4 == local4) || (!local6.is_empty() && ip6 == local6);
-      devices.push(Device {
-        id: id.clone(),
-        ip4,
-        ip6,
-        os: s("os_name"),
-        class: s("class_name"),
-        local,
-      });
-    }
-  }
-  devices.sort_by(|a, b| {
-    b.local
-      .cmp(&a.local)
-      .then_with(|| a.ip4.is_empty().cmp(&b.ip4.is_empty()))
-      .then_with(|| a.id.cmp(&b.id))
-  });
-  devices
 }
 
 fn human(n: u64) -> String {
@@ -741,13 +570,8 @@ pub struct App {
   /// When the Activity's slow reads (theme, keep-alive state) are due again.
   #[cfg(target_os = "android")]
   next_local: Instant,
-  /// The addresses this machine holds on the current link. The portal row wins
-  /// while the portal answers; these fill in on mobile data, another network,
-  /// or a campus link without a session, where the portal has nothing to say.
-  local_ip4: String,
-  local_ip6: String,
   state: State,
-  info: Info,
+  info: PortalRows,
   /// When the last beat arrived. Only the track's amber colour reads it: the
   /// walk itself is free-running, so a poll or a link change cannot send the
   /// turtle back to the start.
@@ -1053,10 +877,8 @@ impl App {
       uplink: LinkKind::None,
       #[cfg(target_os = "android")]
       next_local: Instant::now(),
-      local_ip4: String::new(),
-      local_ip6: String::new(),
       state: State::Unknown,
-      info: Info::default(),
+      info: PortalRows::default(),
       last_heartbeat: None,
       walk: 0.0,
       walk_at: Instant::now(),
@@ -1180,7 +1002,7 @@ impl App {
     // Nothing is known about the link any more: the verdict belonged to a core
     // that is gone, so the page must not keep claiming a session.
     self.state = State::Unknown;
-    self.info = Info::default();
+    self.info = PortalRows::default();
     self.last_heartbeat = None;
     // Nothing is beating any more, so the turtle stops where it is rather than
     // walking on and pretending the core is alive.
@@ -1190,8 +1012,6 @@ impl App {
     // addresses would keep naming the network the stopped core last saw, and a
     // stale verdict would keep *Connect* lit for a service that is not there.
     self.uplink = LinkKind::None;
-    self.local_ip4.clear();
-    self.local_ip6.clear();
     self.env = LinkEnv::empty();
     if let Some(v) = stale
       && self.core_stale != Some(v)
@@ -2039,27 +1859,14 @@ impl App {
           // turtle kept jumping back to the start for each one.
           self.state = s;
         }
-        Ev::Info(v) => {
-          self.info = info_from(&v);
-        }
+        Ev::Info(rows) => self.info = rows,
         Ev::Link(link) => {
-          // The core's notice that the link moved. The addresses are always
-          // taken: they are what the IP row shows on a network the portal does
-          // not answer on. The account follows the transport only, and only on
-          // the way out: a link that comes back after `None` finds the rows
-          // already blank, and an answer that arrived while it was coming up
-          // was read on this new link, so wiping it would leave the page empty
-          // until the next poll. DHCP hands out v4 and v6 in separate steps
-          // and a roam or a renew changes the address on the same network, so
-          // those must not clear it either. The walk is not touched at all - it
-          // is the liveness pulse, not a progress bar.
-          let moved = self.uplink != LinkKind::None && link.kind != self.uplink;
+          // The core's notice of which transport and which addresses this machine
+          // is on. The transport is what the Link row shows; the addresses are
+          // not drawn from here - the IP rows come from `Ev::Info`, one snapshot
+          // with the account - but they are what the core's own decisions are
+          // made from, and the event still tells the window the link moved.
           self.uplink = link.kind;
-          self.local_ip4 = link.ip4.map(|ip| ip.to_string()).unwrap_or_default();
-          self.local_ip6 = link.ip6.map(|ip| ip.to_string()).unwrap_or_default();
-          if moved {
-            self.info = Info::default();
-          }
         }
         Ev::Beat => self.last_heartbeat = Some(Instant::now()),
         Ev::Log(line) => self.push_log(line),
@@ -2339,7 +2146,7 @@ impl App {
                 // is a leftover from the link just left, and the window's own
                 // 2 s read of the interface can be ahead of the core's clear.
                 if !self.info.service.is_empty() && self.uplink != LinkKind::None {
-                  let name = service_name(&self.info.service);
+                  let name = crate::srun::service_label(&self.info.service);
                   let tag = egui::RichText::new(name)
                     .monospace()
                     .color(ui.visuals().weak_text_color());
@@ -2350,20 +2157,13 @@ impl App {
                 }
               });
               ui.end_row();
-              // The portal's address while it has an answer, otherwise the one
-              // this machine holds on the current link: mobile data and other
-              // networks have no portal row, and "—" would hide the only
-              // address there is to copy.
-              let ip4 = if self.info.ip4.is_empty() {
-                self.local_ip4.clone()
-              } else {
-                self.info.ip4.clone()
-              };
-              let ip6 = if self.info.ip6.is_empty() {
-                self.local_ip6.clone()
-              } else {
-                self.info.ip6.clone()
-              };
+              // What the core says this machine's address is on this link: the
+              // portal's answer about the session, or - on a link with no campus
+              // portal - the address the machine holds. The window does not read
+              // the interface for this: two sources for one row is what let a
+              // cleared address come back as the one of the network just left.
+              let ip4 = self.info.ip4.map(|ip| ip.to_string()).unwrap_or_default();
+              let ip6 = self.info.ip6.map(|ip| ip.to_string()).unwrap_or_default();
               ui.label(t.ipv4);
               if address_cell(ui, private_value(&ip4, self.cfg.privacy), t) {
                 crate::clipboard::copy(ui.ctx(), &ip4);
@@ -3406,6 +3206,15 @@ fn devices_scroll_max(screen_h: f32, phone: bool) -> f32 {
   }
 }
 
+/// The address a device row shows: its IPv4 one when it has it, else its IPv6.
+fn device_address(device: &PortalDevice) -> String {
+  device
+    .ip4
+    .or(device.ip6)
+    .map(|ip| ip.to_string())
+    .unwrap_or_default()
+}
+
 /// Draw the dialog body: the title row with its close button, then the rows.
 ///
 /// The width is measured before anything is laid out. The title row, the rule
@@ -3413,7 +3222,7 @@ fn devices_scroll_max(screen_h: f32, phone: bool) -> f32 {
 /// bound to it once they sit in a sub-ui whose max rect *is* that width.
 fn devices_list(
   ui: &mut egui::Ui,
-  devices: &[Device],
+  devices: &[PortalDevice],
   n: usize,
   t: &Texts,
   open: &mut bool,
@@ -3433,7 +3242,8 @@ fn devices_list(
   let mut addr_w = 0.0_f32;
   let mut kind_w = 0.0_f32;
   for d in devices {
-    let addr = private_value(if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 }, privacy);
+    let shown = device_address(d);
+    let addr = private_value(&shown, privacy);
     let kind = &d.class;
     addr_w = addr_w.max(measure(addr, &mono).min(DEVICES_ADDR_MAX));
     kind_w = kind_w.max(measure(kind, &body).min(DEVICES_KIND_MAX));
@@ -3515,8 +3325,8 @@ fn devices_list(
               ui.allocate_exact_size(egui::vec2(DEVICES_ICON, DEVICES_ICON), egui::Sense::hover());
             paint_device_icon(ui.painter(), icon, device_kind(&d.os, &d.class), ink, bg);
             fixed_cell(ui, (&d.id, "addr"), addr_w, row_h, |ui| {
-              let raw = if d.ip4.is_empty() { &d.ip6 } else { &d.ip4 };
-              let addr = private_value(raw, privacy);
+              let raw = device_address(d);
+              let addr = private_value(&raw, privacy);
               // The mark is laid out first in a right-to-left row, so it sits on
               // the column's right edge; the address then gets what is left and
               // elides there (`truncate` shows the whole value on hover). It
@@ -3524,7 +3334,7 @@ fn devices_list(
               // way the status page's *Copy* button does.
               ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if copy_mark(ui, t).clicked() {
-                  *copy = Some(raw.to_string());
+                  *copy = Some(raw.clone());
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                   ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).truncate());
@@ -5381,67 +5191,6 @@ mod tests {
     );
   }
 
-  #[test]
-  fn placeholder_addresses_are_empty() {
-    assert_eq!(norm_ip("::"), "");
-    assert_eq!(norm_ip("  ::  "), "");
-    assert_eq!(norm_ip("0:0:0:0:0:0:0:0"), "");
-    assert_eq!(norm_ip("0.0.0.0"), "");
-    assert_eq!(norm_ip(""), "");
-    assert_eq!(norm_ip("2001:db8::abcd"), "2001:db8::abcd");
-    assert_eq!(norm_ip("192.0.2.10"), "192.0.2.10");
-  }
-
-  #[test]
-  fn info_from_normalizes_ips() {
-    // Documentation addresses (RFC 5737 / RFC 3849) and a made-up account.
-    let v: Value = serde_json::from_str(
-      r#"{"online_ip":"192.0.2.10","online_ip6":"::","bytes_in":1024,"user_name":"1234567890"}"#,
-    )
-    .unwrap();
-    let info = info_from(&v);
-    assert_eq!(info.ip4, "192.0.2.10");
-    assert_eq!(info.ip6, "", "`::` must not look copyable");
-    assert_eq!(info.name, "1234567890");
-
-    // Falls back to `ip` when no session address is reported.
-    let v: Value = serde_json::from_str(r#"{"ip":"198.51.100.7"}"#).unwrap();
-    assert_eq!(info_from(&v).ip4, "198.51.100.7");
-
-    // The portal's `domain` is the service the session rides on; it is shown
-    // beside the link kind, and absent when the answer does not name one.
-    let v: Value = serde_json::from_str(r#"{"domain":"PermitALL"}"#).unwrap();
-    assert_eq!(info_from(&v).service, "PermitALL");
-    let v: Value = serde_json::from_str(r#"{"user_name":"1234567890"}"#).unwrap();
-    assert_eq!(info_from(&v).service, "");
-
-    // A v6-only link answers with this machine's v6 address in `client_ip`: it
-    // belongs to the IPv6 row, and the IPv4 row keeps quiet rather than showing
-    // an address of the wrong family.
-    let v: Value =
-      serde_json::from_str(r#"{"client_ip":"2001:db8::7","online_ip":"2001:db8::7"}"#).unwrap();
-    let info = info_from(&v);
-    assert_eq!(info.ip4, "");
-    assert_eq!(info.ip6, "2001:db8::7");
-  }
-
-  /// The portal's `domain` is shown as the service it names: the deployment
-  /// suffix is dropped, and anything this app does not know stays as it arrived.
-  #[test]
-  fn the_campus_service_is_named_without_its_deployment_suffix() {
-    assert_eq!(service_name("tsinghua-secure_new"), "Tsinghua-Secure");
-    assert_eq!(service_name("Tsinghua-Secure"), "Tsinghua-Secure");
-    assert_eq!(service_name("tsinghua-ipv4_new"), "Tsinghua-IPv4");
-    assert_eq!(service_name("Tsinghua-IPv4"), "Tsinghua-IPv4");
-    assert_eq!(service_name("tsinghua-ipv6_new"), "Tsinghua-IPv6");
-    assert_eq!(service_name("tsinghua"), "Tsinghua");
-    assert_eq!(service_name("tsinghua_new"), "Tsinghua");
-    assert_eq!(service_name("PermitALL"), "PermitALL");
-    assert_eq!(service_name("default"), "default");
-    // A bare `ipv4` is another deployment's name, not one of these services.
-    assert_eq!(service_name("ipv4-only"), "ipv4-only");
-  }
-
   /// The walk is a full period long, wraps at the end, and a beat cannot
   /// restart it.
   #[test]
@@ -5541,53 +5290,6 @@ mod tests {
     assert!(shown.contains("/.config/thunet/config.json"), "{shown}");
   }
 
-  /// The account badge counts what the portal lists and marks this machine.
-  /// Documentation addresses (RFC 5737 / RFC 3849) and made-up session ids.
-  #[test]
-  fn the_account_lists_its_devices_with_this_machine_first() {
-    let v: Value = serde_json::from_str(
-      r#"{
-        "online_ip": "192.0.2.10", "online_ip6": "2001:db8::1",
-        "user_name": "1234567890", "bytes_in": 1, "bytes_out": 2,
-        "online_device_total": "3",
-        "online_device_detail": {
-          "1221087022": {"class_name": "", "ip": "198.51.100.7", "ip6": "::", "os_name": ""},
-          "1052067690": {"class_name": "Smartphones/PDAs/Tablets", "ip": "192.0.2.10",
-                         "ip6": "2001:db8::1", "os_name": "AndroidOS"},
-          "1222833864": {"class_name": "", "ip": "::", "ip6": "2001:db8::2", "os_name": ""}
-        }
-      }"#,
-    )
-    .unwrap();
-    let info = info_from(&v);
-    assert_eq!(info.devices_total, 3);
-    assert_eq!(info.devices.len(), 3);
-    // This machine first, then an IPv4 address, then IPv6-only.
-    assert!(info.devices[0].local);
-    assert_eq!(info.devices[0].ip4, "192.0.2.10");
-    assert_eq!(info.devices[0].os, "AndroidOS");
-    assert_eq!(info.devices[1].ip4, "198.51.100.7");
-    assert_eq!(info.devices[2].ip6, "2001:db8::2");
-    assert!(!info.devices[1].local);
-
-    // A device with no address at all cannot be shown and is dropped, while
-    // the portal's own total still says how many there are.
-    let v: Value = serde_json::from_str(
-      r#"{"online_device_total":"2","online_device_detail":{
-            "1":{"ip":"::","ip6":"::"},"2":{"ip":"192.0.2.11","ip6":"::"}}}"#,
-    )
-    .unwrap();
-    let info = info_from(&v);
-    assert_eq!(info.devices.len(), 1);
-
-    // An answer without the detail (an older core, or offline) still carries
-    // the count, and no list.
-    let v: Value = serde_json::from_str(r#"{"online_device_total":"2"}"#).unwrap();
-    let info = info_from(&v);
-    assert_eq!(info.devices_total, 2);
-    assert!(info.devices.is_empty());
-  }
-
   /// The dialog must be no wider than the columns it shows. A separator or a
   /// scroll area that quietly stretches it leaves the close button and the rule
   /// hanging in the middle of the dialog, which is exactly what happened while
@@ -5599,21 +5301,21 @@ mod tests {
     let t = crate::i18n::Lang::En.texts();
     // Documentation addresses (RFC 5737) of the same length as real ones.
     let devices = vec![
-      Device {
+      PortalDevice {
         id: "1".into(),
-        ip4: "192.0.2.191".into(),
+        ip4: Some("192.0.2.191".parse().unwrap()),
         os: "AndroidOS".into(),
         local: true,
         ..Default::default()
       },
-      Device {
+      PortalDevice {
         id: "2".into(),
-        ip4: "198.51.100.241".into(),
+        ip4: Some("198.51.100.241".parse().unwrap()),
         ..Default::default()
       },
-      Device {
+      PortalDevice {
         id: "3".into(),
-        ip4: "203.0.113.138".into(),
+        ip4: Some("203.0.113.138".parse().unwrap()),
         ..Default::default()
       },
     ];
@@ -5660,9 +5362,9 @@ mod tests {
   fn a_v6_address_does_not_stretch_the_device_list() {
     let t = crate::i18n::Lang::En.texts();
     // Documentation prefix (RFC 3849), full length, IPv6 only.
-    let devices = vec![Device {
+    let devices = vec![PortalDevice {
       id: "1".into(),
-      ip6: "2001:db8:3:801:809:ffff:ec18:d7a7".into(),
+      ip6: Some("2001:db8:3:801:809:ffff:ec18:d7a7".parse().unwrap()),
       local: true,
       ..Default::default()
     }];
@@ -5914,10 +5616,10 @@ mod tests {
     // `available_height()` and taking a fraction of it made the list converge
     // to its own size, and on a phone it shrank frame after frame.
     let t = crate::i18n::Lang::En.texts();
-    let devices: Vec<Device> = (0..20)
-      .map(|i| Device {
+    let devices: Vec<PortalDevice> = (0..20)
+      .map(|i| PortalDevice {
         id: i.to_string(),
-        ip4: format!("192.0.2.{}", i + 1),
+        ip4: Some(format!("192.0.2.{}", i + 1).parse().unwrap()),
         os: "AndroidOS".into(),
         ..Default::default()
       })
@@ -6779,9 +6481,12 @@ impl eframe::App for App {
         tip.push_str(" · ");
         tip.push_str(detail);
       }
-      if self.state == State::LoggedIn && !self.info.ip4.is_empty() {
-        tip.push_str(" · ");
-        tip.push_str(&dash(private_value(&self.info.ip4, self.cfg.privacy)));
+      if self.state == State::LoggedIn {
+        if let Some(ip4) = self.info.ip4 {
+          tip.push_str(" · ");
+          let ip4 = ip4.to_string();
+          tip.push_str(&dash(private_value(&ip4, self.cfg.privacy)));
+        }
       }
       self.tray.set_tooltip(&tip);
     }

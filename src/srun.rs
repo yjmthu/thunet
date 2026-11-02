@@ -1036,25 +1036,47 @@ pub fn link_up() -> bool {
 /// pair is what lets the link watch notice a move on a network that has no
 /// IPv4 at all.
 ///
-/// On Android the Activity writes the transport and the addresses it holds in
-/// one file (`files/link.txt`); that is the same answer the Link row shows, so
-/// the two can never describe different networks. The route lookup is only the
-/// fallback for a file this build cannot read.
+/// Both addresses come from the interface that carries the default route (see
+/// `link_imp::interface_addrs`), not from two separate route lookups: in the
+/// middle of a switch those two can land on two different connections, and the
+/// identity would then pair the new network's v4 with a v6 the old one still
+/// holds.
+///
+/// There is deliberately no route-lookup fallback on Windows. A route lookup
+/// answers from the kernel's source cache, and that cache was caught naming an
+/// address no interface held any more (right after a Wi-Fi reconnect); asking it
+/// would put the network this machine just left back on screen. When the adapter
+/// list cannot be read, the addresses are simply unknown.
+///
+/// On Android the Application pushes the transport and the addresses it holds
+/// over JNI - memory only, nothing on disk - and that push is the one answer
+/// this process uses for the link. A build that has not been pushed to yet
+/// reports no addresses rather than asking the route table for a second opinion.
 pub fn link_addrs() -> (Option<std::net::IpAddr>, Option<std::net::IpAddr>) {
   #[cfg(target_os = "android")]
-  if let Some((_, ip4, ip6)) = android_link() {
-    return (ip4, ip6);
-  }
+  return match crate::android::pushed_link() {
+    Some((_, ip4, ip6)) => (ip4, ip6),
+    // The Application pushes at start, before this core can run: nothing pushed
+    // means the addresses are not known yet, and guessing them from the route
+    // table would be a second, disagreeing answer.
+    None => (None, None),
+  };
+  #[cfg(windows)]
+  return match link_imp::interface_addrs() {
+    Some((ip4, ip6)) => (ip4.map(std::net::IpAddr::V4), ip6.map(std::net::IpAddr::V6)),
+    None => (None, None),
+  };
+  #[cfg(not(any(windows, target_os = "android")))]
   (link_id(), link_id6().map(std::net::IpAddr::V6))
 }
 
-/// Parse `files/link.txt`, written by the Android Activity.
+/// Turn the text the Android side pushes into a link.
 ///
 /// The first line is the transport, the next two are the addresses on it (empty
-/// when absent). `None` for a file this build does not understand, so the
-/// caller can fall back to the route table.
+/// when absent). `None` for a text this build does not understand, so the caller
+/// keeps what it had rather than inventing a link.
 #[cfg(any(target_os = "android", test))]
-pub(crate) fn parse_link_file(
+pub(crate) fn parse_link_text(
   text: &str,
 ) -> Option<(
   crate::proto::LinkKind,
@@ -1076,15 +1098,14 @@ pub(crate) fn parse_link_file(
   Some((kind, parse(lines.next()), parse(lines.next())))
 }
 
-/// The link the Activity last wrote, if the file is readable and understood.
+/// The Android link has one source and only one: the push.
 #[cfg(target_os = "android")]
 fn android_link() -> Option<(
   crate::proto::LinkKind,
   Option<std::net::IpAddr>,
   Option<std::net::IpAddr>,
 )> {
-  let text = std::fs::read_to_string(crate::config::dir().join("link.txt")).ok()?;
-  parse_link_file(&text)
+  crate::android::pushed_link()
 }
 
 /// The IPv6 counterpart of [`link_id`].
@@ -1324,6 +1345,116 @@ mod link_imp {
     up: bool,
   }
 
+  /// The addresses that belong to the interface carrying the default route.
+  ///
+  /// Both families from **one** interface, on purpose: two independent route
+  /// lookups can land on two different connections in the middle of a switch -
+  /// the new network's v4 and a v6 the network just left still holds - and the
+  /// link identity then names something that does not exist.
+  ///
+  /// `None` when the list cannot be read, so the caller can fall back to the
+  /// route lookups; an adapter whose media is down answers with no addresses at
+  /// all rather than with the cached ones.
+  pub fn interface_addrs() -> Option<(Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
+    let index = best_index()?;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024u32;
+    loop {
+      let mut buf = vec![0u8; size as usize];
+      let rc = unsafe {
+        GetAdaptersAddresses(
+          AF_UNSPEC as u32,
+          flags,
+          std::ptr::null(),
+          buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+          &mut size,
+        )
+      };
+      if rc == ERROR_BUFFER_OVERFLOW && size <= MAX_LIST_BYTES {
+        continue;
+      }
+      if rc != 0 {
+        return None;
+      }
+      let mut entry = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+      while !entry.is_null() {
+        let adapter = unsafe { &*entry };
+        let this = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+        if this == index {
+          if adapter.OperStatus != IfOperStatusUp {
+            return Some((None, None));
+          }
+          let mut v4: (Option<std::net::Ipv4Addr>, bool) = (None, false);
+          let mut v6: (Option<std::net::Ipv6Addr>, bool) = (None, false);
+          let mut node = adapter.FirstUnicastAddress;
+          while !node.is_null() {
+            let unicast = unsafe { &*node };
+            // `IpDadStatePreferred`: what the kernel would pick as a source. A
+            // deprecated or tentative one is only used when nothing better is
+            // listed (a privacy address on its way out is still routable).
+            let preferred = unicast.DadState as u32 == 4;
+            let ip = unsafe {
+              let sockaddr = unicast.Address.lpSockaddr;
+              if sockaddr.is_null() {
+                None
+              } else {
+                ucast_ip(&*sockaddr)
+              }
+            };
+            match ip {
+              Some(std::net::IpAddr::V4(ip)) if usable_v4(ip) => {
+                if v4.0.is_none() || (preferred && !v4.1) {
+                  v4 = (Some(ip), preferred);
+                }
+              }
+              Some(std::net::IpAddr::V6(ip)) if usable_v6(ip) => {
+                if v6.0.is_none() || (preferred && !v6.1) {
+                  v6 = (Some(ip), preferred);
+                }
+              }
+              _ => {}
+            }
+            node = unicast.Next;
+          }
+          return Some((v4.0, v6.0));
+        }
+        entry = adapter.Next;
+      }
+      return None;
+    }
+  }
+
+  /// The address inside a unicast entry's `SOCKADDR`.
+  unsafe fn ucast_ip(address: &SOCKADDR) -> Option<std::net::IpAddr> {
+    match address.sa_family {
+      AF_INET => {
+        let v4 = unsafe { &*(address as *const SOCKADDR as *const SOCKADDR_IN) };
+        let octets = unsafe { v4.sin_addr.S_un.S_addr }.to_ne_bytes();
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+      }
+      AF_INET6 => {
+        let v6 = unsafe { &*(address as *const SOCKADDR as *const SOCKADDR_IN6) };
+        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(unsafe {
+          v6.sin6_addr.u.Byte
+        })))
+      }
+      _ => None,
+    }
+  }
+
+  /// An address that names this machine on the network, not just on the wire:
+  /// no loopback, and no 169.254 self-assignment.
+  fn usable_v4(ip: std::net::Ipv4Addr) -> bool {
+    !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+  }
+
+  /// The same for v6, where `fe80::/10` is the self-assigned family.
+  fn usable_v6(ip: std::net::Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    let link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
+    !ip.is_loopback() && !ip.is_unspecified() && !link_local
+  }
+
   /// The details of the adapter with that index, or `None` when the list cannot
   /// be read (which is a different case from "not found" only for the log).
   fn adapter_info(index: u32) -> Option<Adapter> {
@@ -1478,9 +1609,10 @@ mod link_imp {
 }
 
 /// Android: a `NativeActivity` cannot reach `ConnectivityManager` without JNI,
-/// so the Activity answers the question and writes the transport and the
-/// addresses it holds to `files/link.txt`. Reading that file is cheaper than a
-/// JNI call and keeps the core free of a Java dependency.
+/// so `ThunetApp` (an `Application`, which exists even in a process started for
+/// the keep-alive service) answers the question and pushes the transport and
+/// the addresses it holds over JNI. Reading that is cheaper than a call out to
+/// Java, and the push wakes the core instead of it asking.
 #[cfg(target_os = "android")]
 mod link_imp {
   use crate::proto::LinkKind;
@@ -1488,17 +1620,9 @@ mod link_imp {
   pub fn link_kind() -> LinkKind {
     match super::android_link() {
       Some((kind, _, _)) => kind,
-      // Before the first write (the Activity registers its callback while the
-      // core is already probing) the route table still answers.
-      None => fallback(),
-    }
-  }
-
-  fn fallback() -> LinkKind {
-    if crate::srun::link_up() {
-      LinkKind::Other
-    } else {
-      LinkKind::None
+      // Nothing pushed yet: the transport is unknown, and the route table would
+      // be a second answer to a question this process has already answered.
+      None => LinkKind::None,
     }
   }
 }
@@ -1566,6 +1690,130 @@ fn expanded_device_detail(value: &Value) -> Option<Value> {
     .as_str()
     .and_then(|text| serde_json::from_str::<Value>(text).ok())
     .filter(Value::is_object)
+}
+
+/// An address the portal named, or `None` when the field is a placeholder.
+///
+/// The portal reports `0.0.0.0` / `::` for "nothing assigned", and those must
+/// not reach a copy button or a row that claims the machine holds them.
+fn portal_ip(text: &str) -> Option<std::net::IpAddr> {
+  let text = text.trim();
+  if text.is_empty() {
+    return None;
+  }
+  text
+    .parse::<std::net::IpAddr>()
+    .ok()
+    .filter(|ip| !ip.is_unspecified())
+}
+
+/// The device list as an object, whether the portal nested it as a JSON string
+/// or the core already expanded it.
+fn device_detail(answer: &Value) -> Option<Value> {
+  let value = answer.get("online_device_detail")?;
+  if value.is_object() {
+    return Some(value.clone());
+  }
+  expanded_device_detail(value)
+}
+
+/// Turn a portal answer into the rows the status page shows.
+///
+/// The answer names the caller in different fields: `online_ip`/`online_ip6`
+/// while a session exists, `client_ip` on the challenge, and `ip` in the seeds
+/// this client builds itself. Each family takes the first field that names an
+/// address of that family - a v6-only link answers with a v6 address in the
+/// field that has always meant "the address the portal sees".
+pub fn portal_rows(answer: &Value) -> crate::proto::PortalRows {
+  let text = |key: &str| answer.get(key).and_then(Value::as_str).unwrap_or("");
+  let mut ip4 = None;
+  let mut ip6 = None;
+  for key in ["online_ip", "online_ip6", "client_ip", "ip"] {
+    match portal_ip(text(key)) {
+      Some(std::net::IpAddr::V4(ip)) if ip4.is_none() => ip4 = Some(ip.into()),
+      Some(std::net::IpAddr::V6(ip)) if ip6.is_none() => ip6 = Some(ip.into()),
+      _ => {}
+    }
+  }
+
+  let mut devices = Vec::new();
+  if let Some(detail) = device_detail(answer).as_ref().and_then(Value::as_object) {
+    for (id, entry) in detail {
+      let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or("");
+      let device4 = portal_ip(field("ip"));
+      let device6 = portal_ip(field("ip6"));
+      // A device with no address at all cannot be shown.
+      if device4.is_none() && device6.is_none() {
+        continue;
+      }
+      devices.push(crate::proto::PortalDevice {
+        id: id.clone(),
+        ip4: device4,
+        ip6: device6,
+        os: field("os_name").trim().to_string(),
+        class: field("class_name").trim().to_string(),
+        local: (ip4.is_some() && device4 == ip4) || (ip6.is_some() && device6 == ip6),
+      });
+    }
+  }
+  // This machine first, then a v4 address, then v6-only ones, and the id keeps
+  // the order inside a group so the list does not jump around between polls.
+  devices.sort_by(|a, b| {
+    b.local
+      .cmp(&a.local)
+      .then_with(|| a.ip4.is_none().cmp(&b.ip4.is_none()))
+      .then_with(|| a.id.cmp(&b.id))
+  });
+  // The portal reports the total as a *string* and it can disagree with the
+  // detail: count what is listed, and fall back to its number only when there is
+  // no detail at all (offline, or an answer without the field).
+  let devices_total = if devices.is_empty() {
+    answer
+      .get("online_device_total")
+      .and_then(|n| {
+        n.as_str()
+          .and_then(|text| text.trim().parse().ok())
+          .or_else(|| n.as_u64().map(|n| n as usize))
+      })
+      .unwrap_or(0)
+  } else {
+    devices.len()
+  };
+
+  crate::proto::PortalRows {
+    ip4,
+    ip6,
+    bytes_in: answer.get("bytes_in").and_then(Value::as_u64).unwrap_or(0),
+    bytes_out: answer.get("bytes_out").and_then(Value::as_u64).unwrap_or(0),
+    name: text("user_name").to_string(),
+    service: text("domain").to_string(),
+    devices,
+    devices_total,
+  }
+}
+
+/// The service behind a session, as the status row shows it.
+///
+/// The portal's `domain` names the campus service a session belongs to, and a
+/// deployment appends a suffix of its own (`tsinghua-secure_new`, and a
+/// `tsinghua-ipv4_new` that was `tsinghua-ipv4` before it). The suffix is not
+/// what the user is reading for, and a rename should not look like a new
+/// service: the campus names are matched in full, and anything else
+/// (`PermitALL`, a policy name this app has not seen) is shown as it arrived.
+pub fn service_label(domain: &str) -> &str {
+  let lower = domain.to_ascii_lowercase();
+  if lower.contains("tsinghua-secure") {
+    "Tsinghua-Secure"
+  } else if lower.contains("tsinghua-ipv4") {
+    "Tsinghua-IPv4"
+  } else if lower.contains("tsinghua-ipv6") {
+    "Tsinghua-IPv6"
+  } else if lower.contains("tsinghua") {
+    // The bare service name, also seen with a `_new` suffix of its own.
+    "Tsinghua"
+  } else {
+    domain
+  }
 }
 
 #[cfg(test)]
@@ -1667,6 +1915,134 @@ mod tests {
     assert_eq!(seen_address(&v), None);
     let v: Value = serde_json::from_str(r#"{"errno":1}"#).unwrap();
     assert_eq!(seen_address(&v), None);
+  }
+
+  /// The portal reports `::` / `0.0.0.0` when nothing is assigned: those must
+  /// not look like an address a copy button could hand out.
+  #[test]
+  fn placeholder_addresses_are_empty() {
+    assert_eq!(portal_ip("::"), None);
+    assert_eq!(portal_ip("  ::  "), None);
+    assert_eq!(portal_ip("0:0:0:0:0:0:0:0"), None);
+    assert_eq!(portal_ip("0.0.0.0"), None);
+    assert_eq!(portal_ip(""), None);
+    assert_eq!(
+      portal_ip("2001:db8::abcd"),
+      Some("2001:db8::abcd".parse().unwrap())
+    );
+    assert_eq!(portal_ip("192.0.2.10"), Some("192.0.2.10".parse().unwrap()));
+    // A field that is not an address at all is no address either.
+    assert_eq!(portal_ip("unknown"), None);
+  }
+
+  /// The rows take each family from the field that names it, and the answer is
+  /// the only thing that decides what the status page shows.
+  #[test]
+  fn the_rows_name_each_family_from_the_field_that_carries_it() {
+    // Documentation addresses (RFC 5737 / RFC 3849) and a made-up account.
+    let v: Value = serde_json::from_str(
+      r#"{"online_ip":"192.0.2.10","online_ip6":"::","bytes_in":1024,"user_name":"1234567890"}"#,
+    )
+    .unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.ip4, Some("192.0.2.10".parse().unwrap()));
+    assert_eq!(rows.ip6, None, "`::` must not look copyable");
+    assert_eq!(rows.name, "1234567890");
+    assert_eq!(rows.bytes_in, 1024);
+
+    // Falls back to `ip` when no session address is reported (a seed of ours).
+    let v: Value = serde_json::from_str(r#"{"ip":"198.51.100.7"}"#).unwrap();
+    assert_eq!(portal_rows(&v).ip4, Some("198.51.100.7".parse().unwrap()));
+
+    // A v6-only link answers with this machine's v6 address in `client_ip`: it
+    // belongs to the IPv6 row, and the IPv4 row keeps quiet rather than showing
+    // an address of the wrong family.
+    let v: Value =
+      serde_json::from_str(r#"{"client_ip":"2001:db8::7","online_ip":"2001:db8::7"}"#).unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.ip4, None);
+    assert_eq!(rows.ip6, Some("2001:db8::7".parse().unwrap()));
+
+    // The portal's `domain` is the service the session rides on; it is shown
+    // beside the link kind, and absent when the answer does not name one.
+    let v: Value = serde_json::from_str(r#"{"domain":"PermitALL"}"#).unwrap();
+    assert_eq!(portal_rows(&v).service, "PermitALL");
+    let v: Value = serde_json::from_str(r#"{"user_name":"1234567890"}"#).unwrap();
+    assert_eq!(portal_rows(&v).service, "");
+  }
+
+  /// The portal's `domain` is shown as the service it names: the deployment
+  /// suffix is dropped, and anything this app does not know stays as it arrived.
+  #[test]
+  fn the_campus_service_is_named_without_its_deployment_suffix() {
+    assert_eq!(service_label("tsinghua-secure_new"), "Tsinghua-Secure");
+    assert_eq!(service_label("Tsinghua-Secure"), "Tsinghua-Secure");
+    assert_eq!(service_label("tsinghua-ipv4_new"), "Tsinghua-IPv4");
+    assert_eq!(service_label("Tsinghua-IPv4"), "Tsinghua-IPv4");
+    assert_eq!(service_label("tsinghua-ipv6_new"), "Tsinghua-IPv6");
+    assert_eq!(service_label("tsinghua"), "Tsinghua");
+    assert_eq!(service_label("tsinghua_new"), "Tsinghua");
+    assert_eq!(service_label("PermitALL"), "PermitALL");
+    assert_eq!(service_label("default"), "default");
+    // A bare `ipv4` is another deployment's name, not one of these services.
+    assert_eq!(service_label("ipv4-only"), "ipv4-only");
+  }
+
+  /// The account badge counts what the portal lists and marks this machine.
+  /// Documentation addresses (RFC 5737 / RFC 3849) and made-up session ids.
+  #[test]
+  fn the_account_lists_its_devices_with_this_machine_first() {
+    let v: Value = serde_json::from_str(
+      r#"{
+        "online_ip": "192.0.2.10", "online_ip6": "2001:db8::1",
+        "user_name": "1234567890", "bytes_in": 1, "bytes_out": 2,
+        "online_device_total": "3",
+        "online_device_detail": {
+          "1221087022": {"class_name": "", "ip": "198.51.100.7", "ip6": "::", "os_name": ""},
+          "1052067690": {"class_name": "Smartphones/PDAs/Tablets", "ip": "192.0.2.10",
+                         "ip6": "2001:db8::1", "os_name": "AndroidOS"},
+          "1222833864": {"class_name": "", "ip": "::", "ip6": "2001:db8::2", "os_name": ""}
+        }
+      }"#,
+    )
+    .unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.devices_total, 3);
+    assert_eq!(rows.devices.len(), 3);
+    // This machine first, then an IPv4 address, then IPv6-only.
+    assert!(rows.devices[0].local);
+    assert_eq!(rows.devices[0].ip4, Some("192.0.2.10".parse().unwrap()));
+    assert_eq!(rows.devices[0].os, "AndroidOS");
+    assert_eq!(rows.devices[1].ip4, Some("198.51.100.7".parse().unwrap()));
+    assert_eq!(rows.devices[2].ip6, Some("2001:db8::2".parse().unwrap()));
+    assert!(!rows.devices[1].local);
+
+    // A device with no address at all cannot be shown and is dropped, while
+    // the portal's own total still says how many there are.
+    let v: Value = serde_json::from_str(
+      r#"{"online_device_total":"2","online_device_detail":{
+            "1":{"ip":"::","ip6":"::"},"2":{"ip":"192.0.2.11","ip6":"::"}}}"#,
+    )
+    .unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.devices.len(), 1);
+
+    // An answer without the detail (an older core, or offline) still carries
+    // the count, and no list.
+    let v: Value = serde_json::from_str(r#"{"online_device_total":"2"}"#).unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.devices_total, 2);
+    assert!(rows.devices.is_empty());
+
+    // The detail arrives as a JSON string as often as not; both shapes read the
+    // same, because the core expands the string before it publishes and the
+    // answer may also arrive expanded.
+    let v: Value =
+      serde_json::from_str(r#"{"online_device_detail":"{\"1\":{\"ip\":\"192.0.2.12\"}}"}"#)
+        .unwrap();
+    let rows = portal_rows(&v);
+    assert_eq!(rows.devices.len(), 1);
+    assert_eq!(rows.devices[0].ip4, Some("192.0.2.12".parse().unwrap()));
   }
 
   #[test]
@@ -1948,22 +2324,22 @@ mod tests {
   /// the core can publish them as one fact.
   #[test]
   fn the_activity_link_file_carries_the_addresses() {
-    let (kind, ip4, ip6) = parse_link_file("wlan\n192.0.2.10\n2001:db8::7\n").unwrap();
+    let (kind, ip4, ip6) = parse_link_text("wlan\n192.0.2.10\n2001:db8::7\n").unwrap();
     assert_eq!(kind, crate::proto::LinkKind::Wlan);
     assert_eq!(ip4.map(|ip| ip.to_string()).as_deref(), Some("192.0.2.10"));
     assert_eq!(ip6.map(|ip| ip.to_string()).as_deref(), Some("2001:db8::7"));
 
-    let (kind, ip4, ip6) = parse_link_file("none\n\n\n").unwrap();
+    let (kind, ip4, ip6) = parse_link_text("none\n\n\n").unwrap();
     assert_eq!(kind, crate::proto::LinkKind::None);
     assert!(ip4.is_none() && ip6.is_none());
 
     // A one-line file from before the addresses were added still names the
     // transport.
-    let (kind, ip4, ip6) = parse_link_file("mobile\n").unwrap();
+    let (kind, ip4, ip6) = parse_link_text("mobile\n").unwrap();
     assert_eq!(kind, crate::proto::LinkKind::Mobile);
     assert!(ip4.is_none() && ip6.is_none());
 
-    assert!(parse_link_file("garbage\n").is_none());
-    assert!(parse_link_file("").is_none());
+    assert!(parse_link_text("garbage\n").is_none());
+    assert!(parse_link_text("").is_none());
   }
 }

@@ -17,7 +17,7 @@ use crate::config::CoreConfig;
 use crate::i18n::Lang;
 use crate::ipc::Sink;
 use crate::logline::Line;
-use crate::proto::{Cmd, Ev, Failure, LinkEnv, LinkKind, LinkState, Portal, ToastKind};
+use crate::proto::{Cmd, Ev, Failure, LinkEnv, LinkKind, LinkState, Portal, PortalRows, ToastKind};
 use crate::session::{Session, State};
 use crate::srun::{NetCause, NetError, Probe};
 
@@ -48,6 +48,11 @@ const STATUS_LOG_REPEAT: Duration = Duration::from_secs(600);
 /// A DHCP renew or a Wi-Fi roam flips the local address for about a second;
 /// acting on that took the window offline and started a fresh login for
 /// nothing.
+///
+/// The published link waits the same time before it names a new address: one
+/// reading of the kernel's route table in the middle of a switch still names
+/// the network this machine is leaving, and showing it was the flash of an old
+/// address after the rows had already been cleared.
 const LINK_SETTLE: Duration = Duration::from_millis(1500);
 
 /// Polls owed to a link that just came up, and the gap between them.
@@ -60,6 +65,11 @@ const LINK_SETTLE: Duration = Duration::from_millis(1500);
 /// the normal cadence instead of polling forever.
 const LINK_CATCHUP_POLLS: u8 = 5;
 const LINK_CATCHUP_STEP: Duration = Duration::from_secs(2);
+
+/// How long one pass of the core loop sleeps when nothing is due. Deadlines are
+/// read from the clock at the top of each pass, so this is the granularity of
+/// every timer here; a link change wakes it early.
+const LOOP_TICK: Duration = Duration::from_millis(400);
 
 /// How long the core keeps trying to establish a session when nothing keeps it
 /// online afterwards, measured in time the link is actually usable.
@@ -210,6 +220,20 @@ fn await_request<T: Send + 'static>(
       }
       Err(RecvTimeoutError::Disconnected) => return Err(()),
     }
+  }
+}
+
+/// The rows with no session behind them: whatever address the page is showing,
+/// and nothing else.
+///
+/// Used wherever a session ends without the link doing anything - a logout, a
+/// portal that stopped answering, a network with no campus portal. The address
+/// is the current link's and only the link replaces it, so this leaves it alone.
+fn rows_without_session(link: (Option<std::net::IpAddr>, Option<std::net::IpAddr>)) -> PortalRows {
+  PortalRows {
+    ip4: link.0,
+    ip6: link.1,
+    ..PortalRows::default()
   }
 }
 
@@ -490,9 +514,21 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   // What the red banner shows, so the same failure is not re-announced and a
   // routine success (a status refresh) never wipes a rejection still true.
   let mut banner: Option<Failure> = None;
-  // Link watch: `link_up()` costs a route lookup, so it can run every second.
-  // A rising edge (network just became usable) retries immediately instead of
-  // waiting out a backoff, which makes login start ~1 s after Wi-Fi connects.
+  // The portal rows the window is showing, kept in step with every `Ev::Info`
+  // below. A link that moves without changing the transport has to keep the
+  // account and the traffic of that answer while dropping the addresses in it,
+  // and this is the only place that has them.
+  let mut shown_info = PortalRows::default();
+  // Link watch: `link_kind()` and `link_addrs()` walk the interface list and
+  // the routing table, which is too much to ask sixty times a minute - and on a
+  // phone that is a wakeup per second for a fact that moves a few times a day.
+  // The OS reports the moves (Windows route/interface notifications, the Android
+  // push), so this runs when one arrives and otherwise on the backstop below. A
+  // rising edge (network just became usable) still retries immediately instead
+  // of waiting out a backoff, so login starts as soon as Wi-Fi connects.
+  // What the window has been told about the link. Published from this loop with
+  // the rows it belongs to, so the two can never be read as separate facts.
+  let mut shown_link: Option<LinkState> = None;
   let mut next_link_check = Instant::now();
   let mut link_ready = false;
   // What the last network probe saw, and the portal address whose route the link
@@ -550,67 +586,14 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
   tx.send(Ev::Log(Line::debug(format!("lang: start {lang:?}"))))
     .ok();
 
-  // The physical link is published from its own thread, not from this loop: a
-  // status poll or a probe can hold the loop for seconds, and the window must
-  // not keep showing the link it just left while it waits. `Sink` is the
-  // thread-safe hub handle, so the thread shares nothing with the loop below,
-  // which keeps only the consequences of a move (socket pool, verdict).
-  {
-    let link_tx = tx.clone();
-    let generation = link_gen.clone();
-    std::thread::spawn(move || {
-      let mut last: Option<LinkState> = None;
-      loop {
-        let kind = crate::srun::link_kind();
-        let id = if kind != LinkKind::None {
-          crate::srun::link_addrs()
-        } else {
-          (None, None)
-        };
-        let state = LinkState {
-          kind,
-          ip4: id.0,
-          ip6: id.1,
-        };
-        if last != Some(state) {
-          // The transport is what the account and the heartbeat hang on; a
-          // changed address on the same one is a DHCP renew, a roam to the
-          // same network or an IPv6 privacy address, and it must not look like
-          // a new link. Every address change is still published, because it is
-          // what the IP row shows, and it still abandons the requests that
-          // were sent from the address that is gone.
-          //
-          // The rows are blanked on the way *out* of a link, not on the way in:
-          // the departure already blanked them, and an answer fetched while
-          // the new link was coming up is about that new link. Blanking on the
-          // arrival wiped such an answer half a second later, and the page sat
-          // empty until the next poll.
-          let moved = last.is_some_and(|l| l.kind != LinkKind::None && l.kind != kind);
-          last = Some(state);
-          generation.fetch_add(1, Ordering::Release);
-          let families = match (state.ip4.is_some(), state.ip6.is_some()) {
-            (true, true) => "v4+v6",
-            (true, false) => "v4",
-            (false, true) => "v6",
-            (false, false) => "no address",
-          };
-          link_tx
-            .send(Ev::Log(Line::debug(format!(
-              "link: {:?} ({families})",
-              state.kind
-            ))))
-            .ok();
-          link_tx.send(Ev::Link(state)).ok();
-          if moved {
-            // Keep the cached answer in step: a frontend that attaches later
-            // must not replay the account of the link just left.
-            link_tx.send(Ev::Info(serde_json::json!({}))).ok();
-          }
-        }
-        std::thread::sleep(Duration::from_millis(1000));
-      }
-    });
-  }
+  // The link is read and published here, in the same loop that decides what the
+  // rows say. Two publishers were the problem: the link went out first and the
+  // rows a pass later, so the page could read "no link" above an address. One
+  // writer means the two are one statement, and the window draws them as one.
+  // Waiting for the change is the watcher's job, so this costs no polling.
+  let watcher = crate::linkwatch::Watcher::new();
+  #[cfg(target_os = "android")]
+  crate::android::install_waker(watcher.clone());
 
   // All state news goes through here, because `last_state` is what the window
   // has actually been told. `refresh()` and `ensure_online()` change the state
@@ -625,7 +608,21 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     }};
   }
 
+  // Every portal answer goes out through here, so the copy this loop keeps
+  // cannot drift from the one the window holds: the rows are one snapshot of
+  // account, traffic and address, written by one place.
+  macro_rules! send_info {
+    ($value:expr) => {{
+      let value = $value;
+      shown_info = value.clone();
+      tx.send(Ev::Info(value)).ok();
+    }};
+  }
+
   loop {
+    // The mark comes first: anything the OS reports from here on has to end
+    // this pass's sleep, not the one after it.
+    let link_seen = watcher.generation();
     let t = lang.texts();
     while let Ok(c) = rx.try_recv() {
       match c {
@@ -650,7 +647,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                 // This answer is a poll as much as the scheduled one: measure the
                 // next poll from here, or it lands right behind this one.
                 last_status = Instant::now();
-                tx.send(Ev::Info(v)).ok();
+                send_info!(crate::srun::portal_rows(&v));
                 true
               } else {
                 false
@@ -721,6 +718,16 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                       // The gateway starts intercepting again, so the link's verdict
                       // changes with the session and must be re-derived.
                       force_env = true;
+                      // The session those rows described is over. The address this
+                      // machine holds is the link's, so it stays; the account, the
+                      // service, the traffic and the devices were the portal's
+                      // answer about a session that no longer exists, and without
+                      // this the page kept them until the next poll - up to ten
+                      // seconds after the user pressed Disconnect.
+                      send_info!(rows_without_session((shown_info.ip4, shown_info.ip6)));
+                      // Ask at once so the rows are refilled by an answer about
+                      // the link rather than left at the seed.
+                      force_status = true;
                       tx.send(Ev::Log(Line::info(format!("logout: {m}")))).ok();
                       tx.send(Ev::Notify {
                         msg: t.disconnected.into(),
@@ -740,7 +747,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                 } else {
                   // Same as above: a fresh answer restarts the poll schedule.
                   last_status = Instant::now();
-                  tx.send(Ev::Info(v)).ok();
+                  send_info!(crate::srun::portal_rows(&v));
                   send_state!();
                   tx.send(Ev::Log(Line::info("not connected"))).ok();
                   tx.send(Ev::Notify {
@@ -785,7 +792,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                 // refresh was followed by another answer seconds later and the
                 // progress line restarted twice in a row.
                 last_status = Instant::now();
-                tx.send(Ev::Info(v)).ok();
+                send_info!(crate::srun::portal_rows(&v));
                 send_state!();
                 // A refresh proves the portal answers, not that the stored
                 // password is right: a rejection stays on screen through it,
@@ -1182,8 +1189,15 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
     // It runs unconditionally: the same route lookup is also what notices that
     // the machine moved to a different network while a session was up, which
     // used to go unseen because the probe did not run while online.
-    if Instant::now() >= next_link_check {
-      next_link_check = Instant::now() + Duration::from_secs(1);
+    //
+    // A move being held for `LINK_SETTLE` is the one deadline the backstop
+    // cannot cover: it was started by an event, and waiting out the backstop
+    // would hold a Wi-Fi switch for half a minute.
+    let settle_due = pending_link
+      .as_ref()
+      .is_some_and(|(_, since)| since.elapsed() >= LINK_SETTLE);
+    if Instant::now() >= next_link_check || settle_due {
+      next_link_check = Instant::now() + crate::linkwatch::PERIOD;
       // A route is not a link: a driver can keep one on an adapter whose media
       // went away. Gating the identity on the interface's own state is what
       // clears the rows when the cable is out while the address is still cached.
@@ -1193,6 +1207,42 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       } else {
         (None, None)
       };
+      let state = LinkState {
+        kind,
+        ip4: id.0,
+        ip6: id.1,
+      };
+      // The link decides the address; what the session hangs on is the address
+      // *the portal sees*, which is the route source below. So this step only
+      // moves the addresses: the account and the traffic stay until that key
+      // changes.
+      if shown_link != Some(state) {
+        shown_link = Some(state);
+        link_gen.fetch_add(1, Ordering::Release);
+        let families = match (state.ip4.is_some(), state.ip6.is_some()) {
+          (true, true) => "v4+v6",
+          (true, false) => "v4",
+          (false, true) => "v6",
+          (false, false) => "no address",
+        };
+        tx.send(Ev::Log(Line::debug(format!(
+          "link: {:?} ({families})",
+          state.kind
+        ))))
+        .ok();
+        tx.send(Ev::Link(state)).ok();
+        let mut rows = shown_info.clone();
+        rows.ip4 = state.ip4;
+        rows.ip6 = state.ip6;
+        if state.ip4.is_none() && state.ip6.is_none() {
+          // No address at all means there is no address the portal could see,
+          // so nothing a session could hang on.
+          rows = PortalRows::default();
+        }
+        if rows != shown_info {
+          send_info!(rows);
+        }
+      }
       // Read before the settle below decides what to blank: whether this is a
       // new transport is what makes the rows describe a link that is gone.
       let kind_changed = last_link_kind != Some(kind);
@@ -1202,10 +1252,8 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       // is up the move waits for LINK_SETTLE; with nothing to protect it is
       // taken at once, so a fresh link still logs in within the first second.
       let settled = if id == last_link {
-        // A blip that came back: a DHCP renew or a Wi-Fi roam flips the local
-        // address for a second. The link is the one it was, so nothing has to be
-        // re-decided - but the rows were blanked when the address wobbled, so
-        // ask again now instead of waiting out the poll period.
+        // A blip that came back: the link is the one it was, so nothing has to
+        // be re-decided - but the rows may have been told to ask again.
         if pending_link.take().is_some() {
           force_status = true;
         }
@@ -1231,32 +1279,9 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       };
       if settled {
         last_link = id;
-        // A different path: whatever the last probes concluded, this is a new
-        // question.
-        // The portal's answer belonged to the link just left: its address is
-        // gone, so neither the session nor its absence is known any more.
-        // Whatever the next poll finds is an answer about the new link.
-        //
-        // Only a new transport makes that true. A new address on the same one
-        // is a DHCP step (v4, then v6, then another lease), and blanking on
-        // each of those made one Wi-Fi switch flash the account between the
-        // real name and `-` several times. The poll below still runs at once,
-        // so a genuinely different network's answer replaces the rows within
-        // a second or two.
-        if kind_changed && session.state == State::LoggedIn {
-          session.state = State::Unknown;
-          tx.send(Ev::Log(Line::warn("link changed, no answer yet")))
-            .ok();
-        }
-        // A poll in flight when the link moved would answer about the old one;
-        // now that the move is certain, blank the rows once more so that answer
-        // cannot land as if it described this link.
-        if kind_changed {
-          tx.send(Ev::Info(serde_json::json!({}))).ok();
-        }
-        // The answer the window is showing belongs to the link that just went:
-        // ask again now, so the session found on the new one is not held back by
-        // the offline poll period.
+        // The answer the window is showing belongs to the address this machine no
+        // longer holds: ask again now, so the session found on the new one is not
+        // held back by the offline poll period.
         force_status = true;
         // The new link's first answer can arrive before the portal's own row
         // does; keep asking for a few seconds so the account row fills without
@@ -1290,36 +1315,29 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           force_env = true;
         }
       }
-      // The link facts themselves are published by the thread above; here only
-      // their consequences for this loop. The path block below covers a changed
+      // The link facts themselves are published above; here only their
+      // consequences for this loop. The path block below covers a changed
       // address; this covers a changed transport.
       if kind_changed {
         last_link_kind = Some(kind);
         session.reset_pool();
         force_env = true;
       }
-      // The portal rows were read on one path to the portal: the default-route
-      // address, plus the local address this machine reaches the portal from
-      // (a tunnel changes the second without touching the first). They are
-      // blanked when the transport changes, or when the route toward the portal
-      // moves *without* the default address moving - that is the tunnel case
-      // which would otherwise keep showing another link's service. A new
-      // default address on the same transport is a DHCP step - v4 first and v6
-      // a second later, a renew, a privacy address - and blanking there cleared
-      // the rows once per step, so one Wi-Fi switch looked like several
-      // refreshes. The pool is still reset: its sockets are bound to the
-      // address that is gone.
+      // What the rows say about the session is the portal's own word, kept
+      // verbatim: nothing here invents or retires it on an address change. A
+      // moved path only means the answer is stale for the *poll* below.
       let path = (id, portal_route);
       if path != info_path {
-        let id_moved = info_path.0 != id;
         let route_moved = info_path.1 != portal_route;
         info_path = path;
         session.reset_pool();
-        let tunneled = route_moved && !id_moved;
-        if kind_changed || tunneled {
-          tx.send(Ev::Info(serde_json::json!({}))).ok();
-          // Families, not addresses: a log line gets pasted into an issue, and the
-          // address is the one thing there that identifies the machine.
+        if route_moved {
+          force_status = true;
+          if session.state == State::LoggedIn {
+            session.state = State::Unknown;
+          }
+          // Families, not addresses: a log line gets pasted into an issue, and
+          // the address is the one thing there that identifies the machine.
           let families = match (path.0.0.is_some(), path.0.1.is_some()) {
             (true, true) => "v4+v6",
             (true, false) => "v4",
@@ -1328,7 +1346,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           };
           let route = if path.1.is_some() { "known" } else { "unknown" };
           tx.send(Ev::Log(Line::debug(format!(
-            "portal rows: cleared, the path to the portal changed ({families}, route {route})"
+            "link changed, asking the portal again ({families}, route {route})"
           ))))
           .ok();
         }
@@ -1379,12 +1397,13 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
           portal_addr = Some(addr);
           if route != portal_route {
             portal_route = route;
-            // The path the portal is reached on is what its rows belong to; the
-            // probe can move that path too, not only the link watch.
+            // The path the portal is reached on moved - a tunnel appeared, or the
+            // name resolved somewhere else. The rows keep the portal's own word
+            // and the poll below re-asks on this path; nothing is invented here.
             if info_path.1 != route {
               info_path.1 = route;
-              tx.send(Ev::Info(serde_json::json!({}))).ok();
               session.reset_pool();
+              force_status = true;
             }
           }
         }
@@ -1422,6 +1441,17 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
         // is about the account rather than the link, so it stays.
         if !env.portal_answers() && matches!(banner, Some(Failure::Network(_))) {
           set_banner(&tx, &mut banner, None);
+        }
+        if !env.portal_answers() {
+          // No campus portal behind this link, so no answer is coming: the rows
+          // say what the machine holds and nothing about a session. Published
+          // with the verdict - the event that established it - rather than with
+          // every reading of the interface, which is what used to put the
+          // address of the link this machine had just left on screen.
+          let rows = rows_without_session((shown_info.ip4, shown_info.ip6));
+          if rows != shown_info {
+            send_info!(rows);
+          }
         }
         last_env = env.clone();
         tx.send(Ev::Env(env)).ok();
@@ -1719,7 +1749,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
                   session.state = State::Unknown;
                   tx.send(Ev::Log(Line::warn("portal not answering, no answer yet")))
                     .ok();
-                  tx.send(Ev::Info(serde_json::json!({}))).ok();
+                  send_info!(rows_without_session((shown_info.ip4, shown_info.ip6)));
                 }
               }
             }
@@ -1776,7 +1806,7 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
               // "already online" notice - this session *is* the account's session.
               set_banner(&tx, &mut banner, None);
             }
-            tx.send(Ev::Info(v)).ok();
+            send_info!(crate::srun::portal_rows(&v));
           }
         } else {
           // The link moved while the poll was in flight; its answer would
@@ -1804,12 +1834,28 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
       tx.send(Ev::Log(Line::debug(format!("state: {:?}", session.state))))
         .ok();
     }
+    // The account row is the portal's own word and nothing else, so it is emptied
+    // in exactly three places: the link is gone (above, no address at all), the
+    // machine is not logged in (here), or an answer names nobody (the answer
+    // itself, which is what replaces these rows anyway). A new address is a
+    // question for the portal, not a reason to hide what it last said.
+    if session.state == State::LoggedOut && !shown_info.name.is_empty() {
+      send_info!(rows_without_session((shown_info.ip4, shown_info.ip6)));
+    }
 
     for w in session.take_warnings() {
       tx.send(Ev::Log(w)).ok();
     }
 
-    std::thread::sleep(Duration::from_millis(400));
+    // Wait for the next tick, or until the OS says the link moved.
+    //
+    // Waking early only moves the link check forward, so a change becomes a
+    // pass at once instead of up to a tick later; the tick stays because every
+    // other deadline in this loop (polls, backoff, command handling) is read
+    // from the clock on each pass.
+    if watcher.wait_since(link_seen, LOOP_TICK) {
+      next_link_check = Instant::now();
+    }
   }
 }
 
@@ -1928,6 +1974,26 @@ mod tests {
     assert!(!crate::srun::is_os_service("tsinghua"));
     assert!(!crate::srun::is_os_service("tsinghua-ipv4_new"));
     assert!(!crate::srun::is_os_service(""));
+  }
+
+  /// A link with no campus portal behind it has no answer to wait for, so the
+  /// rows it gets carry the address the machine holds and nothing else - no
+  /// account, no traffic, and no guess about a session.
+  #[test]
+  fn a_link_without_a_portal_shows_its_own_address_only() {
+    // Documentation addresses (RFC 5737 / RFC 3849).
+    let v4: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+    let v6: std::net::IpAddr = "2001:db8::7".parse().unwrap();
+    let rows = rows_without_session((Some(v4), Some(v6)));
+    assert_eq!(rows.ip4, Some(v4));
+    assert_eq!(rows.ip6, Some(v6));
+    assert!(rows.name.is_empty());
+    assert_eq!(rows.bytes_in, 0);
+    assert_eq!(rows.devices_total, 0);
+    // A link with an address of one family only says just that.
+    let rows = rows_without_session((None, Some(v6)));
+    assert_eq!(rows.ip4, None);
+    assert_eq!(rows.ip6, Some(v6));
   }
 
   #[test]

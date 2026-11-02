@@ -261,6 +261,67 @@ pub struct LinkState {
   pub ip6: Option<std::net::IpAddr>,
 }
 
+/// The portal's account of the session this machine is on, as the status page
+/// shows it.
+///
+/// The core builds this from the portal's answer (`srun::portal_rows`) instead
+/// of handing the JSON on: which field names the caller, which placeholder means
+/// "no address", which `domain` is which campus service - all of that is
+/// protocol knowledge, and one copy of it lives next to the request that reads
+/// it. It is also what makes "does this answer still describe this link"
+/// answerable in one place: an answer that does not keeps its account and
+/// traffic and loses its addresses.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalRows {
+  /// The address the portal sees this machine at, per family. `None` when the
+  /// portal named none, or when the answer described a link that is gone.
+  #[serde(default)]
+  pub ip4: Option<std::net::IpAddr>,
+  #[serde(default)]
+  pub ip6: Option<std::net::IpAddr>,
+  #[serde(default)]
+  pub bytes_in: u64,
+  #[serde(default)]
+  pub bytes_out: u64,
+  /// The account the portal says owns the session on that address. Empty when
+  /// there is no session: the portal's "nobody logged in" answer names none.
+  #[serde(default)]
+  pub name: String,
+  /// The service behind the session (the portal's `domain`), as it arrived.
+  /// [`crate::srun::service_label`] turns it into the name the row shows.
+  #[serde(default)]
+  pub service: String,
+  /// The account's online devices. Empty when the portal reports no detail
+  /// (offline, or an answer without the field).
+  #[serde(default)]
+  pub devices: Vec<PortalDevice>,
+  /// How many devices the account has online: the listed ones when there is a
+  /// detail, otherwise the portal's own total.
+  #[serde(default)]
+  pub devices_total: usize,
+}
+
+/// One device the account has online, as `/cgi-bin/rad_user_info` lists it.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalDevice {
+  /// Portal session id. Only keeps the order stable inside a group.
+  #[serde(default)]
+  pub id: String,
+  #[serde(default)]
+  pub ip4: Option<std::net::IpAddr>,
+  #[serde(default)]
+  pub ip6: Option<std::net::IpAddr>,
+  #[serde(default)]
+  pub os: String,
+  /// The portal's own device class, e.g. `Smartphones/PDAs/Tablets`.
+  #[serde(default)]
+  pub class: String,
+  /// This is the machine the window runs on, judged by the session's own
+  /// addresses: it is listed first and marked.
+  #[serde(default)]
+  pub local: bool,
+}
+
 /// The core's own state, as reported by [`Cmd::CoreInfo`].
 ///
 /// The same value is embedded in the `core` half of an [`Ev::Status`] dump, so
@@ -369,11 +430,18 @@ impl std::fmt::Display for Failure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Ev {
   State(State),
-  Info(Value),
+  /// What the core says about the machine on this link, in the shape the status
+  /// page draws: the address, the account, the traffic, the devices. One
+  /// snapshot written by one place, so a row cannot disagree with another (and
+  /// an address cannot outlive the session that named it). Replayed to a
+  /// frontend that attaches late, after the link it belongs to.
+  Info(PortalRows),
   /// The physical link the core is using and the addresses on it. Sent whenever
   /// that changes, and replayed to a frontend that attaches late. The window
-  /// draws the Link and address rows from this and never reads the interface
-  /// itself.
+  /// draws the Link row from this and never reads the interface itself; the
+  /// addresses in it are what the core's own decisions are made from, and the
+  /// IP rows are drawn from [`Ev::Info`] instead, so the two are published
+  /// together and cannot contradict each other.
   Link(LinkState),
   /// One status poll finished, whether or not the portal answered. The window
   /// walks the turtle from this beat; [`Ev::Info`] carries what the answer

@@ -249,13 +249,12 @@ public class ThunetApp extends Application {
       }
     }
     try {
-      java.io.FileWriter writer =
-          new java.io.FileWriter(new java.io.File(getFilesDir(), "link.txt"), false);
-      writer.write(kind + "\n" + ip4 + "\n" + ip6 + "\n");
-      writer.close();
+      // The only way the Rust side learns this: the push itself is what wakes
+      // the core, so nothing has to look at the interface or the file system.
+      Native.setLink(kind + "\n" + ip4 + "\n" + ip6 + "\n");
       Log.i(Wake.TAG, "link: now " + kind);
     } catch (Throwable ignored) {
-      // The Rust side then falls back to the route table.
+      // The library is not loaded yet: the next network change pushes again.
     }
   }
 }

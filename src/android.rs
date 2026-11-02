@@ -226,6 +226,67 @@ fn jstring(env: &mut jni::JNIEnv, value: &jni::objects::JString) -> Option<Strin
   Some(value.to_string_lossy().into_owned())
 }
 
+/// The link facts `ThunetApp` last pushed: transport, then the addresses it
+/// holds on that transport.
+///
+/// The push happens when the network changes, so a lock costs nothing there;
+/// the read happens on the pass a push wakes up. Nothing is written to disk and
+/// nothing is asked of the route table: in this process the Application has
+/// already pushed before the core runs, so the memory here is the whole answer.
+type Link = (
+  crate::proto::LinkKind,
+  Option<std::net::IpAddr>,
+  Option<std::net::IpAddr>,
+);
+static PUSHED_LINK: std::sync::RwLock<Option<Link>> = std::sync::RwLock::new(None);
+
+/// What the Application last pushed, if anything.
+pub(crate) fn pushed_link() -> Option<Link> {
+  PUSHED_LINK.read().ok().and_then(|slot| *slot)
+}
+
+/// The waiters a push has to wake: the core loop sits in
+/// `linkwatch::Watcher::wait_since`, which would otherwise only come back on its
+/// timeout.
+static WAKER: std::sync::OnceLock<crate::linkwatch::Watcher> = std::sync::OnceLock::new();
+
+/// Let the pushes from now on reach `watcher`. Called by the core once, where
+/// the watcher is made; a second caller is a second core, which cannot happen.
+pub(crate) fn install_waker(watcher: crate::linkwatch::Watcher) {
+  let _ = WAKER.set(watcher);
+}
+
+/// `Native.setLink(text)`: the transport and the addresses this process uses.
+///
+/// Called from `ThunetApp` on every network change, including the ones that
+/// happen while only the keep-alive service is running and no window exists.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yjmthu_thunet_Native_setLink(
+  mut env: jni::JNIEnv,
+  _class: jni::objects::JClass,
+  text: jni::objects::JString,
+) {
+  let Some(text) = jstring(&mut env, &text) else {
+    return;
+  };
+  let Some(link) = crate::srun::parse_link_text(&text) else {
+    return;
+  };
+  let changed = PUSHED_LINK
+    .read()
+    .map(|slot| *slot != Some(link))
+    .unwrap_or(true);
+  if let Ok(mut slot) = PUSHED_LINK.write() {
+    *slot = Some(link);
+  }
+  // A callback fires for reasons that do not change what we asked for - a
+  // WiFi scan result, a second address on the same transport - so only a real
+  // difference is worth waking two threads for.
+  if changed && let Some(watcher) = WAKER.get() {
+    watcher.wake();
+  }
+}
+
 /// `Native.autofillResult(user, pass)`: the service filled the virtual form.
 ///
 /// Either argument is null when the service did not touch that field, which is

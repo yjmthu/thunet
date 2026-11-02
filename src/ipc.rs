@@ -208,7 +208,7 @@ struct Shared {
   state: Option<crate::session::State>,
   env: Option<crate::proto::LinkEnv>,
   link: Option<crate::proto::LinkState>,
-  info: Option<serde_json::Value>,
+  info: Option<crate::proto::PortalRows>,
   error: Option<Failure>,
 }
 
@@ -287,8 +287,9 @@ impl Hub {
     if let Some(env) = shared.env.clone() {
       backlog.push(Ev::Env(env));
     }
-    // Before the info: the window clears the portal rows when the link moves,
-    // so a replayed answer has to land after the link it belongs to.
+    // Before the info, in the order the core published them: the link is what
+    // the rows are read on, and a frontend should see the two in the order they
+    // were decided rather than the other way round.
     if let Some(link) = shared.link {
       backlog.push(Ev::Link(link));
     }
@@ -1669,7 +1670,10 @@ mod tests {
       ip4: Some("192.0.2.10".parse().unwrap()),
       ip6: None,
     }));
-    hub.publish(Ev::Info(serde_json::json!({"user_name": "alice"})));
+    hub.publish(Ev::Info(crate::proto::PortalRows {
+      name: "alice".into(),
+      ..crate::proto::PortalRows::default()
+    }));
     hub.publish(Ev::Log(Line::info("first")));
     hub.publish(Ev::Error(Some(Failure::Text("boom".into()))));
 
@@ -1680,7 +1684,7 @@ mod tests {
     assert!(matches!(backlog[0], Ev::State(State::LoggedIn)));
     assert!(matches!(&backlog[1], Ev::Env(env) if env.portal_answers()));
     assert!(matches!(&backlog[2], Ev::Link(link) if link.kind == LinkKind::Wlan));
-    assert!(matches!(&backlog[3], Ev::Info(v) if v.get("user_name").is_some()));
+    assert!(matches!(&backlog[3], Ev::Info(v) if v.name == "alice"));
     assert!(matches!(&backlog[4], Ev::Error(Some(Failure::Text(e))) if e == "boom"));
     assert!(matches!(backlog.last(), Some(Ev::Log(_))));
   }
