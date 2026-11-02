@@ -80,7 +80,7 @@ The window has exactly two pages, switched with the gear in the top-right corner
 | Coloured dot + label | Whether the link reaches the internet: `Online`, `Offline`, or `Unknown` while no core answers. The hover text spells out, in one sentence, what stands behind that word — `Signed in on the campus network: the portal reports a session for this address`, `Not signed in on the campus network: the portal answers, but no session exists for this address` — and the other cases the same way: an OS-owned 802.1X session, no link at all, a link nothing answers on, another network's portal page, and the two online cases (no login needed, not the campus network) |
 | `Account` | The account the portal reports for the current session. A `-` stands there while the account has no session. The superscript count beside it is the number of devices the account has online across the campus network; clicking it opens the *Online devices* list, one row per device, with an icon per device and a dot on the machine the window runs on. The whole portal block is blanked as soon as the link changes, so the previous link's account, service and traffic are never shown under the new interface |
 | `Link` | Which interface carries the default route: `Ethernet` / `WLAN` / `Mobile data` (Android cellular) / `USB tethering` (a phone sharing its connection over USB), or `-` when there is no route at all, which is the same placeholder the rest of the column uses for a value that does not exist. Beside it, the campus service the session belongs to rides as a quiet tag (a dimmer shade than the link kind) whenever the portal names one: `Tsinghua-Secure` (802.1X, owned by the OS), `Tsinghua-IPv4`, `Tsinghua-IPv6`, `Tsinghua`, or the access policy of a wired link (`PermitALL`). Deployment suffixes such as `tsinghua-secure_new` are dropped so a rename does not look like a new service, and the raw value is on hover. With a cable and Wi-Fi both up the link kind is the one the OS actually routes on — the first thing to look at when a session appears to come and go |
-| `IPv4` / `IPv6` | The address this machine holds on the network it is using, each with a **Copy** button: the one the portal reports while a session is up, otherwise the local address of the current link (mobile data, another Wi-Fi, or a campus link still waiting for a login). `-` when there is no link at all |
+| `IPv4` / `IPv6` | The address this machine holds on the network it is using, each with a **Copy** button: the one the portal reports while a session is up, otherwise the local address of the current link (mobile data, another Wi-Fi, or a campus link still waiting for a login). `-` when there is no link at all. The IPv6 half only ever shows an address this machine itself holds (a link-local `fe80::` one is not one) and never the portal's word, which is IPv4-only: an empty cell means the operating system has no IPv6 address on that link even when the `Link` line says `v4+v6`, because families there are counted from the route the kernel has. The common cause is a Linux connection configured to ignore IPv6 — see [The IPv6 row is empty](#the-ipv6-row-is-empty) |
 | `Session traffic` | Bytes downloaded / uploaded during this session, as `↓ 1.2 GB` / `↑ 3.4 MB`. While the portal reports no session for this address the numbers are unknown and both counters read `↓ - B` / `↑ - B`: the arrows and the unit stay, so the row keeps its shape and never claims a session that has moved nothing |
 | `Service` | Whether a core is answering, with its version and uptime; it turns to `not running` as soon as the core is stopped. The button beside it stops or starts that process — like `thunet service stop`, it never closes the window. In a portable setup the row is called `Core`, says `runs in this window`, and has no button: there the core is a thread of the window and cannot outlive it |
 | **Connect** / **Disconnect** / **Refresh** | Manual actions; only the ones that make sense are enabled |
@@ -223,6 +223,44 @@ The one exception is a portable setup (`--state-dir` / `THUNET_STATE_DIR`), wher
 | The window disappeared | It is in the tray. Click the tray icon (or use `Show window` in its menu). |
 | The app crashed | Read `crash.log` next to `config.json` (see [Where your data lives](#6-where-your-data-lives)). The app has no console, so that file is the only record. |
 | A command prints nothing in PowerShell | The binary has no console and PowerShell does not wait for it. Use `cmd /c thunet status` or `Start-Process -Wait thunet`. |
+
+### The IPv6 row is empty
+
+`IPv6` prints the address this machine would use as a source for the internet, so an empty cell means the operating system holds no usable global address on that link: `fe80::` does not count, and the portal never contributes one because `rad_user_info` only knows IPv4. The `Link` line above can still say `v4+v6` — families are counted from the route the kernel has, and a router advertisement installs a default route whether or not it hands out an address.
+
+Two machines on the same cable can disagree. Windows asks for an address over DHCPv6 out of the box; an Ubuntu install provisioned by cloud-init commonly ends up with a `/etc/netplan/50-cloud-init.yaml` that carries `dhcp4: true` only, and netplan then writes `ipv6.method: ignore` into the NetworkManager connection — it takes the router's default route and asks for no address.
+
+Check which of the two this machine is:
+
+```bash
+ip -6 addr show dev enp0s31f6
+nmcli -g ipv6.method,ipv6.addr-gen-mode con show netplan-enp0s31f6
+```
+
+`ignore` is the answer. Ask for an address with a second netplan file: netplan merges the files in name order and the later one wins for the keys it sets, so the cloud-init file stays untouched.
+
+```bash
+sudo vim /etc/netplan/60-ipv6.yaml
+```
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp0s31f6:
+      dhcp4: true
+      dhcp6: true
+      accept-ra: true
+```
+
+```bash
+sudo chmod 600 /etc/netplan/60-ipv6.yaml
+sudo netplan try
+```
+
+`netplan try` reverts on its own after two minutes unless the configuration is accepted, which is what makes it safe to run over ssh on the link being reconfigured. Once `ip -6 addr` shows an address, the row fills in on the next status poll; **Refresh** asks now instead of waiting.
+
+Nothing here is campus-specific: a link with no global IPv6 address shows an empty cell, and the session does not depend on it either way.
 
 ## 5. Command line
 
