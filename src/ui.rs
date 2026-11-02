@@ -6616,26 +6616,32 @@ fn traffic_job(
   bytes: Option<u64>,
   arrow_color: egui::Color32,
 ) -> egui::text::LayoutJob {
-  let font = egui::TextStyle::Body.resolve(ui.style());
+  let body = egui::TextStyle::Body.resolve(ui.style());
   let mut job = egui::text::LayoutJob::default();
-  let add = |job: &mut egui::text::LayoutJob, text: &str, color: egui::Color32| {
-    job.append(
-      text,
-      0.0,
-      egui::TextFormat {
-        font_id: font.clone(),
-        color,
-        ..Default::default()
-      },
-    );
+  let text_format = |font: egui::FontId, color: egui::Color32| egui::TextFormat {
+    font_id: font,
+    color,
+    ..Default::default()
   };
-  add(&mut job, arrow, arrow_color);
+  job.append(arrow, 0.0, text_format(body.clone(), arrow_color));
   // `None` is a session the portal does not report. The unit stays so the
-  // count still reads as a byte count, one the portal has not filled in - the
-  // row never collapses to a bare dash and never shows a zero it cannot stand
-  // behind.
-  let amount = bytes.map_or_else(|| format!("{NO_VALUE} B"), human);
-  add(&mut job, &format!(" {amount}"), ui.visuals().text_color());
+  // count still reads as a byte count, one the portal has not filled in. The
+  // placeholder itself takes the monospace font the other empty cells use -
+  // the account, the link and the address rows are all monospace, and the body
+  // font's shorter hyphen read as a second, different dash beside them. A
+  // number the portal did report keeps the body font, like the arrows.
+  let (amount, font) = match bytes {
+    Some(n) => (human(n), body),
+    None => (
+      format!("{NO_VALUE} B"),
+      egui::TextStyle::Monospace.resolve(ui.style()),
+    ),
+  };
+  job.append(
+    &format!(" {amount}"),
+    0.0,
+    text_format(font, ui.visuals().text_color()),
+  );
   job
 }
 
