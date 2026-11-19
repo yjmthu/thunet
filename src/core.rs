@@ -1548,10 +1548,21 @@ pub fn worker(cfg: CoreConfig, rx: Receiver<Cmd>, tx: Sink) {
             t.no_login_needed.to_string(),
             "skipped: this is not the campus network".to_string(),
           ),
-          _ => (
-            t.network_unreachable.to_string(),
-            "skipped: neither the probes nor the portal answered".to_string(),
-          ),
+          _ => {
+            // Neither the probes nor the portal answered. That is a fact about
+            // the moment, not about the link: a machine that has just
+            // associated already holds an address, and the gateway starts
+            // letting it through a few seconds later without the interface,
+            // the routes or the OS's own connectivity state moving at all. A
+            // request is the only witness there is, so the next attempt asks
+            // again instead of repeating this answer for ever - the skip's own
+            // delay is the cadence.
+            force_env = true;
+            (
+              t.network_unreachable.to_string(),
+              "skipped: neither the probes nor the portal answered".to_string(),
+            )
+          }
         };
         skip = Some((text, log, Duration::from_secs(60), ToastKind::Info));
       } else if last_env.internet && !session_lost {
